@@ -1827,7 +1827,7 @@ static void halbtc8723b1ant_TdmaDurationAdjustForAcl(
 			if (dn <= 0)
 				dn = 0;
 
-			if (up >= n) { /*  if 連續 n 個2秒 retry count為0, 則調寬WiFi duration */
+			if (up >= n) { /*  if retry count is 0 for n consecutive 2-second periods, widen the WiFi duration */
 				WaitCount = 0;
 				n = 3;
 				up = 0;
@@ -1846,13 +1846,13 @@ static void halbtc8723b1ant_TdmaDurationAdjustForAcl(
 			if (up <= 0)
 				up = 0;
 
-			if (dn == 2) { /*  if 連續 2 個2秒 retry count< 3, 則調窄WiFi duration */
+			if (dn == 2) { /*  if retry count < 3 for 2 consecutive 2-second periods, narrow the WiFi duration */
 				if (WaitCount <= 2)
-					m++; /*  避免一直在兩個level中來回 */
+					m++; /*  avoid bouncing between two levels */
 				else
 					m = 1;
 
-				if (m >= 20) /* m 最大值 = 20 ' 最大120秒 recheck是否調整 WiFi duration. */
+				if (m >= 20) /* m max = 20, at most 120 seconds before rechecking whether to adjust the WiFi duration. */
 					m = 20;
 
 				n = 3*m;
@@ -1862,13 +1862,13 @@ static void halbtc8723b1ant_TdmaDurationAdjustForAcl(
 				result = -1;
 				BTC_PRINT(BTC_MSG_ALGORITHM, ALGO_TRACE_FW_DETAIL, ("[BTCoex], Decrease wifi duration for retryCounter<3!!\n"));
 			}
-		} else { /* retry count > 3, 只要1次 retry count > 3, 則調窄WiFi duration */
+		} else { /* retry count > 3, a single retry count > 3 narrows the WiFi duration */
 			if (WaitCount == 1)
-				m++; /*  避免一直在兩個level中來回 */
+				m++; /*  avoid bouncing between two levels */
 			else
 				m = 1;
 
-			if (m >= 20) /* m 最大值 = 20 ' 最大120秒 recheck是否調整 WiFi duration. */
+			if (m >= 20) /* m max = 20, at most 120 seconds before rechecking whether to adjust the WiFi duration. */
 				m = 20;
 
 			n = 3*m;
