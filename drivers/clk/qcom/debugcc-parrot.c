@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2022, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022, 2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "clk: %s: " fmt, __func__
@@ -1568,7 +1568,7 @@ static int clk_debug_parrot_probe(struct platform_device *pdev)
 	for (i = 0; i < ARRAY_SIZE(debugcc_parrot_hws); i++) {
 		clk = devm_clk_register(&pdev->dev, debugcc_parrot_hws[i]);
 		if (IS_ERR(clk)) {
-			dev_err(&pdev->dev, "Unable to register %s, err:(%d)\n",
+			dev_err(&pdev->dev, "Unable to register %s, err:(%ld)\n",
 				clk_hw_get_name(debugcc_parrot_hws[i]),
 				PTR_ERR(clk));
 			return PTR_ERR(clk);
@@ -1611,4 +1611,4 @@ static int __init clk_debug_parrot_init(void)
 fs_initcall(clk_debug_parrot_init);
 
 MODULE_DESCRIPTION("QTI DEBUG CC PARROT Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

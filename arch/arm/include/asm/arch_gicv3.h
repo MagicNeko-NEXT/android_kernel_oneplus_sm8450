@@ -64,12 +64,6 @@ CPUIF_MAP(ICC_AP1R3, ICC_AP1R3_EL1)
 
 /* Low-level accessors */
 
-static inline void gic_write_eoir(u32 irq)
-{
-	write_sysreg(irq, ICC_EOIR1);
-	isb();
-}
-
 static inline void gic_write_dir(u32 val)
 {
 	write_sysreg(val, ICC_DIR);
@@ -256,6 +250,11 @@ static inline void gic_arch_enable_irqs(void)
 {
 	/* Should not get called. */
 	WARN_ON_ONCE(true);
+}
+
+static inline bool gic_has_relaxed_pmr_sync(void)
+{
+	return false;
 }
 
 #endif /* !__ASSEMBLY__ */

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2021-2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2021-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "%s:%s " fmt, KBUILD_MODNAME, __func__
@@ -31,15 +31,14 @@ int buffer_overflow_check(char *buf, int offset, int buf_size)
 static int fetch_and_populate_trip_data(char *buf, struct thermal_zone_device *tz,
 		int idx, int offset, size_t size, bool is_hyst)
 {
-	int ret = 0, temp;
+	int trip_temp;
 
 	if (!is_hyst)
-		ret = tz->ops->get_trip_temp(tz, idx, &temp);
+		trip_temp = tz->trips[idx].temperature;
 	else
-		ret = tz->ops->get_trip_hyst(tz, idx, &temp);
-	if (ret)
-		return ret;
-	offset += scnprintf(buf + offset, size - offset, "%d ", temp);
+		trip_temp = tz->trips[idx].hysteresis;
+
+	offset += scnprintf(buf + offset, size - offset, "%d ", trip_temp);
 
 	return offset;
 }
@@ -52,7 +51,7 @@ static int fetch_and_populate_trips(char *config_buf, struct thermal_zone_device
 	int buf1_offset = 0, buf2_offset = 0;
 	char *buf_temp = NULL, *buf_hyst = NULL;
 
-	buf_size = tz->trips * UINT_MAX_CHARACTER;
+	buf_size = tz->num_trips * UINT_MAX_CHARACTER;
 	buf_temp = kzalloc(buf_size, GFP_KERNEL);
 	buf_hyst = kzalloc(buf_size, GFP_KERNEL);
 	if (!buf_hyst || !buf_temp) {
@@ -61,7 +60,7 @@ static int fetch_and_populate_trips(char *config_buf, struct thermal_zone_device
 		return -ENOMEM;
 	}
 
-	for (i = 0; i < tz->trips; i++) {
+	for (i = 0; i < tz->num_trips; i++) {
 		ret = fetch_and_populate_trip_data(buf_temp, tz, i, buf1_offset,
 				buf_size, false);
 		if (ret < 0)
@@ -69,7 +68,7 @@ static int fetch_and_populate_trips(char *config_buf, struct thermal_zone_device
 
 		buf1_offset = ret;
 
-		if (!tz->ops->get_trip_hyst)
+		if (!tz->trips)
 			continue;
 
 		ret = fetch_and_populate_trip_data(buf_hyst, tz, i, buf2_offset,
@@ -116,7 +115,7 @@ static int fetch_and_populate_cdevs(char *config_buf, struct thermal_zone_device
 		mutex_unlock(&tz->lock);
 		return offset;
 	}
-	buf_size = (buf_size + tz->trips) * THERMAL_NAME_LENGTH;
+	buf_size = (buf_size + tz->num_trips) * THERMAL_NAME_LENGTH;
 	buf_cdev =  kzalloc(buf_size, GFP_KERNEL);
 	buf_cdev_upper = kzalloc(buf_size, GFP_KERNEL);
 	buf_cdev_lower = kzalloc(buf_size, GFP_KERNEL);
@@ -128,12 +127,12 @@ static int fetch_and_populate_cdevs(char *config_buf, struct thermal_zone_device
 		return -ENOMEM;
 	}
 
-	for (i = 0; i < tz->trips; i++) {
+	for (i = 0; i < tz->num_trips; i++) {
 		bool first_entry = true;
 		bool no_cdevs = true;
 
 		list_for_each_entry(instance, &tz->thermal_instances, tz_node) {
-			if (!instance->cdev || instance->trip != i)
+			if (!instance->cdev || instance->trip != &tz->trips[i])
 				continue;
 
 			no_cdevs = false;
@@ -146,11 +145,11 @@ static int fetch_and_populate_cdevs(char *config_buf, struct thermal_zone_device
 				buf1_offset += scnprintf(
 						buf_cdev_upper + buf1_offset,
 						buf_size - buf1_offset,
-						" %d", instance->upper);
+						" %ld", instance->upper);
 				buf2_offset += scnprintf(
 						buf_cdev_lower + buf2_offset,
 						buf_size - buf2_offset,
-						" %d", instance->lower);
+						" %ld", instance->lower);
 			} else {
 				buf_offset += scnprintf(
 						buf_cdev + buf_offset,
@@ -159,11 +158,11 @@ static int fetch_and_populate_cdevs(char *config_buf, struct thermal_zone_device
 				buf1_offset += scnprintf(
 						buf_cdev_upper + buf1_offset,
 						buf_size - buf1_offset,
-						"+%d", instance->upper);
+						"+%ld", instance->upper);
 				buf2_offset += scnprintf(
 						buf_cdev_lower + buf2_offset,
 						buf_size - buf2_offset,
-						"+%d", instance->lower);
+						"+%ld", instance->lower);
 			}
 		}
 
@@ -184,7 +183,7 @@ static int fetch_and_populate_cdevs(char *config_buf, struct thermal_zone_device
 	}
 	mutex_unlock(&tz->lock);
 
-	ret = buffer_overflow_check(buf_cdev, offset, PAGE_SIZE-offset);
+	ret = buffer_overflow_check(buf_cdev, offset, PAGE_SIZE - offset);
 	if (ret)
 		goto config_exit;
 	offset += scnprintf(config_buf + offset, PAGE_SIZE - offset,
@@ -232,12 +231,14 @@ ssize_t thermal_dbgfs_config_read(struct file *file, char __user *buf,
 				-15, "algo_type", tz->governor->name);
 	offset += scnprintf(config_buf + offset, PAGE_SIZE - offset, "%*s%s\n",
 				-15, "mode",
-				(tz->mode == THERMAL_DEVICE_DISABLED)?"disabled":"enabled");
+				(tz->mode == THERMAL_DEVICE_DISABLED) ? "disabled" : "enabled");
 	offset += scnprintf(config_buf + offset, PAGE_SIZE - offset, "%*s%d\n",
-				-15, "polling_delay", tz->polling_delay);
+				-15, "polling_delay",
+				jiffies_to_msecs(tz->polling_delay_jiffies));
 	offset += scnprintf(config_buf + offset, PAGE_SIZE - offset, "%*s%d\n",
-				-15, "passive_delay", tz->passive_delay);
-	if (!tz->trips || !tz->ops->get_trip_temp) {
+				-15, "passive_delay",
+				jiffies_to_msecs(tz->passive_delay_jiffies));
+	if (!tz->num_trips || !tz->trips) {
 		if (offset >= PAGE_SIZE) {
 			pr_err("%s sensor config rule length is more than buffer size\n",
 					tz->type);
@@ -287,12 +288,12 @@ static ssize_t thermal_dbgfs_config_write(struct file *file,
 	if (copy_from_user(sensor_name, user_buf, count))
 		return -EFAULT;
 
-	if (sscanf(sensor_name, "%20[^\n\t ]", tzone_sensor_name) != 1)
+	if (sscanf(sensor_name, "%19[^\n\t ]", tzone_sensor_name) != 1)
 		return -EINVAL;
 
 	tz = thermal_zone_get_zone_by_name((const char *)tzone_sensor_name);
 	if (IS_ERR(tz)) {
-		pr_err("No thermal zone for sensor:%s. err:%d\n",
+		pr_err("No thermal zone for sensor:%s. err:%ld\n",
 					tzone_sensor_name, PTR_ERR(tz));
 		return PTR_ERR(tz);
 	}
@@ -336,5 +337,5 @@ static void thermal_config_exit(void)
 
 module_init(thermal_config_init);
 module_exit(thermal_config_exit);
-MODULE_DESCRIPTION("ThermalZone config debug driver");
-MODULE_LICENSE("GPL v2");
+MODULE_DESCRIPTION("Thermal Zone config debug driver");
+MODULE_LICENSE("GPL");

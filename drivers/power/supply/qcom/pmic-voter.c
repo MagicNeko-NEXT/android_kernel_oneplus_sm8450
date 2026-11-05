@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2015-2017, 2019-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/debugfs.h>
@@ -438,7 +439,7 @@ int vote(struct votable *votable, const char *client_str, bool enabled, int val)
 
 	if ((votable->votes[client_id].enabled == enabled) &&
 		(votable->votes[client_id].value == val)) {
-		pr_debug("%s: %s,%d same vote %s of val=%d\n",
+		pr_debug("%s: %s,%d same voting %s of val=%d\n",
 				votable->name,
 				client_str, client_id,
 				enabled ? "on" : "off",
@@ -450,7 +451,7 @@ int vote(struct votable *votable, const char *client_str, bool enabled, int val)
 	votable->votes[client_id].value = val;
 
 	if (similar_vote && votable->voted_on) {
-		pr_debug("%s: %s,%d Ignoring similar vote %s of val=%d\n",
+		pr_debug("%s: %s,%d Ignoring similar voting %s of val=%d\n",
 			votable->name,
 			client_str, client_id, enabled ? "on" : "off", val);
 		goto out;
@@ -482,7 +483,7 @@ int vote(struct votable *votable, const char *client_str, bool enabled, int val)
 			|| (effective_result != votable->effective_result)) {
 		votable->effective_client_id = effective_id;
 		votable->effective_result = effective_result;
-		pr_debug("%s: effective vote is now %d voted by %s,%d\n",
+		pr_debug("%s: effective voting is now %d voted by %s,%d\n",
 			votable->name, effective_result,
 			get_client_str(votable, effective_id),
 			effective_id);
@@ -575,8 +576,7 @@ int rerun_election(struct votable *votable)
 struct votable *find_votable(const char *name)
 {
 	unsigned long flags;
-	struct votable *v;
-	bool found = false;
+	struct votable *v = NULL;
 
 	if (!name)
 		return NULL;
@@ -587,17 +587,14 @@ struct votable *find_votable(const char *name)
 
 	list_for_each_entry(v, &votable_list, list) {
 		if (strcmp(v->name, name) == 0) {
-			found = true;
-			break;
+			spin_unlock_irqrestore(&votable_list_slock, flags);
+			return v;
 		}
 	}
 out:
 	spin_unlock_irqrestore(&votable_list_slock, flags);
 
-	if (found)
-		return v;
-	else
-		return NULL;
+	return NULL;
 }
 
 static int force_active_get(void *data, u64 *val)
@@ -782,18 +779,10 @@ struct votable *create_votable(const char *name,
 		return ERR_PTR(-EEXIST);
 	}
 
-	votable->force_val_ent = debugfs_create_u32("force_val",
-					S_IFREG | 0644,
-					votable->root,
-					&(votable->force_val));
-
-	if (!votable->force_val_ent) {
-		pr_err("Couldn't create force_val dbg file for %s\n", name);
-		debugfs_remove_recursive(votable->root);
-		kfree(votable->name);
-		kfree(votable);
-		return ERR_PTR(-EEXIST);
-	}
+	debugfs_create_u32("force_val",
+			S_IFREG | 0644,
+			votable->root,
+			&(votable->force_val));
 
 	votable->force_active_ent = debugfs_create_file("force_active",
 					S_IFREG | 0444,

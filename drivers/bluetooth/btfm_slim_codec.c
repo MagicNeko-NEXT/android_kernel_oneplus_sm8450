@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/init.h>
@@ -95,7 +96,7 @@ static void btfm_slim_codec_remove(struct snd_soc_component *codec)
 static int btfm_slim_dai_startup(struct snd_pcm_substream *substream,
 		struct snd_soc_dai *dai)
 {
-	int ret;
+	int ret = -1;
 	struct btfmslim *btfmslim = snd_soc_component_get_drvdata(dai->component);
 
 	BTFMSLIM_DBG("substream = %s  stream = %d dai->name = %s",
@@ -130,10 +131,6 @@ static void btfm_slim_dai_shutdown(struct snd_pcm_substream *substream,
 		ch = btfmslim->rx_chs;
 		rxport = 1;
 		break;
-	case BTFM_BT_SPLIT_A2DP_SLIM_TX:
-		ch = btfmslim->tx_chs;
-		rxport = 0;
-		break;
 	case BTFM_SLIM_NUM_CODEC_DAIS:
 	default:
 		BTFMSLIM_ERR("dai->id is invalid:%d", dai->id);
@@ -164,7 +161,6 @@ static int btfm_slim_dai_hw_params(struct snd_pcm_substream *substream,
 	btfmslim = snd_soc_component_get_drvdata(dai->component);
 	btfmslim->bps = params_width(params);
 	btfmslim->direction = substream->stream;
-	btfmslim->dai_id = dai->id;
 	BTFMSLIM_DBG("dai->name = %s DAI-ID %x rate %d bps %d num_ch %d",
 		dai->name, dai->id, params_rate(params), params_width(params),
 		params_channels(params));
@@ -174,7 +170,8 @@ static int btfm_slim_dai_hw_params(struct snd_pcm_substream *substream,
 static int btfm_slim_dai_prepare(struct snd_pcm_substream *substream,
 	struct snd_soc_dai *dai)
 {
-	int i, ret = -EINVAL;
+	int ret = -EINVAL;
+	int i = 0;
 	struct btfmslim_ch *ch;
 	uint8_t rxport, nchan = 1;
 	struct btfmslim *btfmslim;
@@ -202,10 +199,6 @@ static int btfm_slim_dai_prepare(struct snd_pcm_substream *substream,
 	case BTFM_BT_SPLIT_A2DP_SLIM_RX:
 		ch = btfmslim->rx_chs;
 		rxport = 1;
-		break;
-	case BTFM_BT_SPLIT_A2DP_SLIM_TX:
-		ch = btfmslim->tx_chs;
-		rxport = 0;
 		break;
 	case BTFM_SLIM_NUM_CODEC_DAIS:
 	default:
@@ -264,9 +257,9 @@ static int btfm_slim_dai_set_channel_map(struct snd_soc_dai *dai,
 		i++, rx_chs++) {
 		/* Set Rx Channel number from machine driver and
 		 * get channel handler from slimbus driver
-		*/
+		 */
 		rx_chs->ch = *(uint8_t *)(rx_slot + i);
-		BTFMSLIM_DBG("    %d\t%s\t%d\t%x\t%d\t%x", rx_chs->id,
+		BTFMSLIM_DBG("    %d\t%s\t%d\t%x", rx_chs->id,
 			rx_chs->name, rx_chs->port, rx_chs->ch);
 	}
 
@@ -275,9 +268,9 @@ static int btfm_slim_dai_set_channel_map(struct snd_soc_dai *dai,
 		i++, tx_chs++) {
 		/* Set Tx Channel number from machine driver and
 		 * get channel handler from slimbus driver
-		*/
+		 */
 		tx_chs->ch = *(uint8_t *)(tx_slot + i);
-	BTFMSLIM_DBG("    %d\t%s\t%d\t%x\t%d\t%x", tx_chs->id,
+		BTFMSLIM_DBG("    %d\t%s\t%d\t%x", tx_chs->id,
 			tx_chs->name, tx_chs->port, tx_chs->ch);
 	}
 
@@ -298,8 +291,8 @@ static int btfm_slim_dai_get_channel_map(struct snd_soc_dai *dai,
 	switch (dai->id) {
 	case BTFM_FM_SLIM_TX:
 		num = 2;
+		fallthrough;
 	case BTFM_BT_SCO_SLIM_TX:
-	case BTFM_BT_SPLIT_A2DP_SLIM_TX:
 		if (!tx_slot || !tx_num) {
 			BTFMSLIM_ERR("Invalid tx_slot %p or tx_num %p",
 				tx_slot, tx_num);
@@ -362,7 +355,7 @@ static int btfm_slim_dai_get_channel_map(struct snd_soc_dai *dai,
 	return 0;
 }
 
-static struct snd_soc_dai_ops btfmslim_dai_ops = {
+static const struct snd_soc_dai_ops btfmslim_dai_ops = {
 	.startup = btfm_slim_dai_startup,
 	.shutdown = btfm_slim_dai_shutdown,
 	.hw_params = btfm_slim_dai_hw_params,
@@ -386,7 +379,7 @@ static struct snd_soc_dai_driver btfmslim_dai[] = {
 		},
 		.ops = &btfmslim_dai_ops,
 	},
-	{	/* Bluetooth SCO voice uplink: bt -> modem */
+	{	/* Bluetooth SCO voice uplink: bt -> lpass */
 		.name = "btfm_bt_sco_slim_tx",
 		.id = BTFM_BT_SCO_SLIM_TX,
 		.capture = {
@@ -394,16 +387,17 @@ static struct snd_soc_dai_driver btfmslim_dai[] = {
 			/* 8 KHz or 16 KHz */
 			.rates = SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000
 				| SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000
-				| SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000,
+				| SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000
+				| SNDRV_PCM_RATE_192000,
 			.formats = SNDRV_PCM_FMTBIT_S16_LE, /* 16 bits */
-			.rate_max = 96000,
+			.rate_max = 192000,
 			.rate_min = 8000,
 			.channels_min = 1,
 			.channels_max = 1,
 		},
 		.ops = &btfmslim_dai_ops,
 	},
-	{	/* Bluetooth SCO voice downlink: modem -> bt or A2DP Playback */
+	{	/* Bluetooth SCO voice downlink: lpass -> bt or A2DP Playback */
 		.name = "btfm_bt_sco_a2dp_slim_rx",
 		.id = BTFM_BT_SCO_A2DP_SLIM_RX,
 		.playback = {
@@ -411,9 +405,10 @@ static struct snd_soc_dai_driver btfmslim_dai[] = {
 			/* 8/16/44.1/48/88.2/96 Khz */
 			.rates = SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000
 				| SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000
-				| SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000,
+				| SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000
+				| SNDRV_PCM_RATE_192000,
 			.formats = SNDRV_PCM_FMTBIT_S16_LE, /* 16 bits */
-			.rate_max = 96000,
+			.rate_max = 192000,
 			.rate_min = 8000,
 			.channels_min = 1,
 			.channels_max = 1,
@@ -429,21 +424,6 @@ static struct snd_soc_dai_driver btfmslim_dai[] = {
 			.formats = SNDRV_PCM_FMTBIT_S16_LE, /* 16 bits */
 			.rate_max = 48000,
 			.rate_min = 48000,
-			.channels_min = 1,
-			.channels_max = 1,
-		},
-		.ops = &btfmslim_dai_ops,
-	},
-	{	/* Bluetooth Split A2DP sink: bt -> adsp */
-		.name = "btfm_bt_split_a2dp_slim_tx",
-		.id = BTFM_BT_SPLIT_A2DP_SLIM_TX,
-		.capture = {
-			.stream_name = "A2DP Tx Capture",
-			.rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000
-				| SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000,
-			.formats = SNDRV_PCM_FMTBIT_S16_LE, /* 16 bits */
-			.rate_max = 96000,
-			.rate_min = 44100,
 			.channels_min = 1,
 			.channels_max = 1,
 		},
@@ -471,7 +451,6 @@ int btfm_slim_register_codec(struct btfmslim *btfm_slim)
 		btfmslim_dai, ARRAY_SIZE(btfmslim_dai));
 	if (ret)
 		BTFMSLIM_ERR("failed to register codec (%d)", ret);
-
 	return ret;
 }
 
@@ -483,4 +462,4 @@ void btfm_slim_unregister_codec(struct device *dev)
 }
 
 MODULE_DESCRIPTION("BTFM Slimbus Codec driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

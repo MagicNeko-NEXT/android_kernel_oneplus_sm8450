@@ -2,7 +2,8 @@
 /*
  * Copyright (C) 2011 Google, Inc.
  * Copyright (C) 2019 Linaro Ltd.
- * Copyright (c) 2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef _QCOM_DMA_HEAP_PRIV_H
@@ -10,6 +11,23 @@
 
 #include <linux/dma-heap.h>
 #include <linux/list.h>
+#include <linux/fs.h>
+
+#include <linux/mem-buf-exporter.h>
+
+void qcom_store_dma_buf_fops(struct file *file);
+
+static inline struct dma_buf *qcom_dma_buf_export(struct dma_buf_export_info *exp_info,
+						  struct mem_buf_dma_buf_ops *ops)
+{
+	struct dma_buf *dmabuf;
+
+	dmabuf = mem_buf_dma_buf_export(exp_info, ops);
+	if (!IS_ERR(dmabuf))
+		qcom_store_dma_buf_fops(dmabuf->file);
+
+	return dmabuf;
+}
 
 /**
  * struct heap_helper_buffer - helper buffer metadata
@@ -41,12 +59,5 @@ struct heap_helper_buffer {
 
 	void (*free)(struct heap_helper_buffer *buffer);
 };
-
-
-void qcom_init_heap_helper_buffer(struct heap_helper_buffer *buffer,
-				  void (*free)(struct heap_helper_buffer *));
-
-struct dma_buf *qcom_heap_helper_export_dmabuf(struct heap_helper_buffer *buffer,
-					       int fd_flags);
 
 #endif /* _QCOM_DMA_HEAP_PRIV_H */

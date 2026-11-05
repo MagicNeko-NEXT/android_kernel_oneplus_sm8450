@@ -12,6 +12,7 @@
  * Copyright (C) 2011 Google, Inc.
  *
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/list.h>
@@ -329,7 +330,7 @@ int dynamic_page_pool_init_shrinker(void)
 	if (registered)
 		return 0;
 
-	ret = register_shrinker(&pool_shrinker);
+	ret = register_shrinker(&pool_shrinker, "dynamic_page_pool");
 	if (ret)
 		return ret;
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  *
  */
 
@@ -12,8 +13,9 @@
 #include <linux/interrupt.h>
 #include <linux/ratelimit.h>
 
-#include <linux/gunyah/gh_msgq.h>
 #include <linux/gunyah/gh_errno.h>
+#include <linux/gunyah/gh_msgq.h>
+#include <linux/gunyah.h>
 #include "hcall_msgq.h"
 
 /* HVC call specific mask: 0 to 31 */
@@ -102,7 +104,7 @@ static irqreturn_t gh_msgq_rx_isr(int irq, void *dev)
 	cap_table_entry->rx_empty = false;
 	spin_unlock(&cap_table_entry->rx_lock);
 
-	wake_up_interruptible(&cap_table_entry->rx_wq);
+	wake_up(&cap_table_entry->rx_wq);
 
 	return IRQ_HANDLED;
 }
@@ -159,28 +161,10 @@ static int __gh_msgq_recv(struct gh_msgq_cap_table *cap_table_entry,
 	return ret;
 }
 
-/**
- * gh_msgq_recv: Receive a message from the client running on a different VM
- * @client_desc: The client descriptor that was obtained via gh_msgq_register()
- * @buff: Pointer to the buffer where the received data must be placed
- * @buff_size: The size of the buffer space available
- * @recv_size: The actual amount of data that is copied into buff
- * @flags: Optional flags to pass to receive the data. For the list of flags,
- *         see linux/gunyah/gh_msgq.h
- *
- * The function returns 0 if the data is successfully received and recv_size
- * would contain the actual amount of data copied into buff.
- * It returns -EINVAL if the caller passes invalid arguments, -EAGAIN
- * if the message queue is not yet ready to communicate, and -EPERM if the
- * caller doesn't have permissions to receive the data. In all these failure
- * cases, recv_size is unmodified.
- *
- * Note: this function may sleep and should not be called from interrupt
- *       context
- */
-int gh_msgq_recv(void *msgq_client_desc,
+static int gh_msgq_recv_state(void *msgq_client_desc,
 			void *buff, size_t buff_size,
-			size_t *recv_size, unsigned long flags)
+			size_t *recv_size, unsigned long flags,
+			int state)
 {
 	struct gh_msgq_desc *client_desc = msgq_client_desc;
 	struct gh_msgq_cap_table *cap_table_entry;
@@ -216,9 +200,10 @@ int gh_msgq_recv(void *msgq_client_desc,
 
 	spin_unlock(&cap_table_entry->cap_entry_lock);
 
-	if (wait_event_interruptible(cap_table_entry->rx_wq,
-				cap_table_entry->rx_cap_id != GH_CAPID_INVAL))
-		return -ERESTARTSYS;
+	ret = wait_event_state(cap_table_entry->rx_wq,
+				cap_table_entry->rx_cap_id != GH_CAPID_INVAL, state);
+	if (ret)
+		return ret;
 
 	spin_lock(&cap_table_entry->cap_entry_lock);
 
@@ -235,16 +220,17 @@ int gh_msgq_recv(void *msgq_client_desc,
 		if (cap_table_entry->rx_empty && (flags & GH_MSGQ_NONBLOCK))
 			return -EAGAIN;
 
-		if (wait_event_interruptible(cap_table_entry->rx_wq,
-					!cap_table_entry->rx_empty))
-			return -ERESTARTSYS;
+		ret = wait_event_state(cap_table_entry->rx_wq,
+					!cap_table_entry->rx_empty, state);
+		if (ret)
+			return ret;
 
 		ret = __gh_msgq_recv(cap_table_entry, buff, buff_size,
 					recv_size, flags);
 	} while (ret == -EAGAIN);
 
 	if (!ret)
-		print_hex_dump_debug("gh_msgq_recv: ", DUMP_PREFIX_OFFSET,
+		print_hex_dump_debug(__func__, DUMP_PREFIX_OFFSET,
 				     4, 1, buff, *recv_size, false);
 
 	return ret;
@@ -253,7 +239,50 @@ err:
 	spin_unlock(&cap_table_entry->cap_entry_lock);
 	return ret;
 }
-EXPORT_SYMBOL(gh_msgq_recv);
+
+/**
+ * gh_msgq_recv: Receive a message from the client running on a different VM
+ * @client_desc: The client descriptor that was obtained via gh_msgq_register()
+ * @buff: Pointer to the buffer where the received data must be placed
+ * @buff_size: The size of the buffer space available
+ * @recv_size: The actual amount of data that is copied into buff
+ * @flags: Optional flags to pass to receive the data. For the list of flags,
+ *         see linux/gunyah/gh_msgq.h
+ *
+ * The function returns 0 if the data is successfully received and recv_size
+ * would contain the actual amount of data copied into buff.
+ * It returns -EINVAL if the caller passes invalid arguments, -EAGAIN
+ * if the message queue is not yet ready to communicate, and -EPERM if the
+ * caller doesn't have permissions to receive the data. In all these failure
+ * cases, recv_size is unmodified.
+ *
+ * Note: this function may sleep and should not be called from interrupt
+ *       context
+ */
+int gh_msgq_recv(void *msgq_client_desc,
+			void *buff, size_t buff_size,
+			size_t *recv_size, unsigned long flags)
+{
+	return gh_msgq_recv_state(msgq_client_desc, buff, buff_size,
+				  recv_size, flags, TASK_INTERRUPTIBLE);
+}
+EXPORT_SYMBOL_GPL(gh_msgq_recv);
+
+/*
+ * Similar to gh_msgq_recv, but will not be interrupted unless killed,
+ * see wait_event_killable.
+ *
+ * This is useful for processes which can't handle signals generated
+ * by freezeing-of-tasks during suspend.
+ */
+int gh_msgq_recv_killable(void *msgq_client_desc,
+			void *buff, size_t buff_size,
+			size_t *recv_size, unsigned long flags)
+{
+	return gh_msgq_recv_state(msgq_client_desc, buff, buff_size,
+				  recv_size, flags, TASK_KILLABLE);
+}
+EXPORT_SYMBOL_GPL(gh_msgq_recv_killable);
 
 static int __gh_msgq_send(struct gh_msgq_cap_table *cap_table_entry,
 				void *buff, size_t size, u64 tx_flags)
@@ -376,7 +405,7 @@ err:
 	spin_unlock(&cap_table_entry->cap_entry_lock);
 	return ret;
 }
-EXPORT_SYMBOL(gh_msgq_send);
+EXPORT_SYMBOL_GPL(gh_msgq_send);
 
 /**
  * gh_msgq_register: Register as a client to the use the message queue
@@ -440,7 +469,7 @@ void *gh_msgq_register(int label)
 
 	return client_desc;
 }
-EXPORT_SYMBOL(gh_msgq_register);
+EXPORT_SYMBOL_GPL(gh_msgq_register);
 
 /**
  * gh_msgq_unregister: Unregister as a client to the use the message queue
@@ -480,7 +509,7 @@ int gh_msgq_unregister(void *msgq_client_desc)
 
 	return 0;
 }
-EXPORT_SYMBOL(gh_msgq_unregister);
+EXPORT_SYMBOL_GPL(gh_msgq_unregister);
 
 int gh_msgq_populate_cap_info(int label, u64 cap_id, int direction, int irq)
 {
@@ -500,7 +529,16 @@ int gh_msgq_populate_cap_info(int label, u64 cap_id, int direction, int irq)
 	spin_lock(&gh_msgq_cap_list_lock);
 	list_for_each_entry(tmp_entry, &gh_msgq_cap_list, entry) {
 		if (label == tmp_entry->label) {
-			cap_table_entry = tmp_entry;
+			if (direction == GH_MSGQ_DIRECTION_TX &&
+				tmp_entry->tx_cap_id == GH_CAPID_INVAL) {
+				cap_table_entry = tmp_entry;
+			} else if (direction == GH_MSGQ_DIRECTION_RX &&
+				tmp_entry->rx_cap_id == GH_CAPID_INVAL) {
+				cap_table_entry = tmp_entry;
+			} else {
+				spin_unlock(&gh_msgq_cap_list_lock);
+				return -EINVAL;
+			}
 			break;
 		}
 	}
@@ -537,7 +575,7 @@ int gh_msgq_populate_cap_info(int label, u64 cap_id, int direction, int irq)
 		cap_table_entry->rx_irq = irq;
 		spin_unlock(&cap_table_entry->cap_entry_lock);
 
-		wake_up_interruptible(&cap_table_entry->rx_wq);
+		wake_up(&cap_table_entry->rx_wq);
 	} else {
 		pr_err("%s: Invalid direction passed\n", __func__);
 		ret = -EINVAL;
@@ -561,7 +599,7 @@ err:
 	kfree(cap_table_entry);
 	return ret;
 }
-EXPORT_SYMBOL(gh_msgq_populate_cap_info);
+EXPORT_SYMBOL_GPL(gh_msgq_populate_cap_info);
 
 /**
  * gh_msgq_reset_cap_info: Reset the msgq cap info
@@ -635,56 +673,7 @@ int gh_msgq_reset_cap_info(enum gh_msgq_label label, int direction, int *irq)
 err_unlock:
 	return ret;
 }
-EXPORT_SYMBOL(gh_msgq_reset_cap_info);
-
-static int gh_msgq_probe_direction(struct platform_device *pdev, int label,
-				   int direction, int idx)
-{
-	int irq, ret;
-	u64 capid;
-
-	irq = platform_get_irq(pdev, idx);
-	if (irq < 0) {
-		dev_err(&pdev->dev, "Failed to get the IRQ%d. ret: %d\n",
-			idx, irq);
-		return irq;
-	}
-
-	ret = of_property_read_u64_index(pdev->dev.of_node, "reg", idx, &capid);
-	if (ret) {
-		dev_err(&pdev->dev, "Failed to get capid[%d]\n", idx);
-		return ret;
-	}
-
-	return gh_msgq_populate_cap_info(label, capid, direction, irq);
-}
-
-int gh_msgq_probe(struct platform_device *pdev, int label)
-{
-	int ret, idx = 0;
-	struct device_node *node = pdev->dev.of_node;
-	bool duplex;
-
-	duplex = of_property_read_bool(node, "qcom,is-full-duplex");
-
-	if (duplex || of_property_read_bool(node, "qcom,is-sender")) {
-		ret = gh_msgq_probe_direction(pdev, label, GH_MSGQ_DIRECTION_TX,
-					      idx);
-		if (ret)
-			return ret;
-		idx++;
-	}
-
-	if (duplex || of_property_read_bool(node, "qcom,is-receiver")) {
-		ret = gh_msgq_probe_direction(pdev, label, GH_MSGQ_DIRECTION_RX,
-					      idx);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
-}
-EXPORT_SYMBOL(gh_msgq_probe);
+EXPORT_SYMBOL_GPL(gh_msgq_reset_cap_info);
 
 static void gh_msgq_cleanup(void)
 {
@@ -700,17 +689,17 @@ static void gh_msgq_cleanup(void)
 	spin_unlock(&gh_msgq_cap_list_lock);
 }
 
-static int __init gh_msgq_init(void)
+static int __init ghd_msgq_init(void)
 {
 	return 0;
 }
-module_init(gh_msgq_init);
+module_init(ghd_msgq_init);
 
-static void __exit gh_msgq_exit(void)
+static void __exit ghd_msgq_exit(void)
 {
 	gh_msgq_cleanup();
 }
-module_exit(gh_msgq_exit);
+module_exit(ghd_msgq_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. Gunyah Message Queue Driver");

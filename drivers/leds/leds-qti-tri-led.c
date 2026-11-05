@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2018-2019, 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022, 2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/bitops.h>
@@ -545,7 +546,7 @@ static int qpnp_tri_led_parse_dt(struct qpnp_tri_led_chip *chip)
 							child_node->name;
 
 		led->pwm_dev =
-			devm_of_pwm_get(chip->dev, child_node, NULL);
+			devm_fwnode_pwm_get(chip->dev, of_fwnode_handle(child_node), NULL);
 		if (IS_ERR(led->pwm_dev)) {
 			rc = PTR_ERR(led->pwm_dev);
 			if (rc != -EPROBE_DEFER)
@@ -647,5 +648,5 @@ static struct platform_driver qpnp_tri_led_driver = {
 module_platform_driver(qpnp_tri_led_driver);
 
 MODULE_DESCRIPTION("QTI TRI_LED driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_SOFTDEP("pre: pwm-qti-lpg");

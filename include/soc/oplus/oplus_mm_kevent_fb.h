@@ -1,1 +1,1 @@
-../../../../gki-modules/oplus/kernel/multimedia/feedback/oplus_mm_kevent_fb.h
+../../../../sm8450-modules/oplus/kernel/multimedia/feedback/common/oplus_mm_kevent_fb.h

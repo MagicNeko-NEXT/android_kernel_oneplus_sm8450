@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2019-2021, The Linux Foundation. All rights reserved. */
-/* Copyright (c) 2022, Qualcomm Innovation Center, Inc. All rights reserved. */
+/* Copyright (c) 2019-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+ */
 
 #define pr_fmt(fmt) "PM8008: %s: " fmt, __func__
 
@@ -20,6 +21,7 @@
 #include <linux/regulator/machine.h>
 #include <linux/regulator/of_regulator.h>
 #include <linux/string.h>
+#include "internal.h"
 
 #define pm8008_err(reg, message, ...) \
 	pr_err("%s: " message, (reg)->rdesc.name, ##__VA_ARGS__)
@@ -31,22 +33,13 @@
 #define VSET_STEP_MV			8
 #define VSET_STEP_UV			(VSET_STEP_MV * 1000)
 
-#define REVID_BASE			0x100
 #define MISC_BASE			0x900
-#define MBG_BASE			0x2c00
-
-#define REVID_PERPH_SUBTYPE		(REVID_BASE + 0x5)
-#define PM8010_REV_v1_0		0x10
-#define PM8010_PERPH_SUBTYPE		0x41
 
 #define MISC_CHIP_ENABLE_REG		(MISC_BASE + 0x50)
 #define CHIP_ENABLE_BIT			BIT(0)
 
 #define MISC_SHUTDOWN_CTRL_REG		(MISC_BASE + 0x59)
 #define IGNORE_LDO_OCP_SHUTDOWN		BIT(3)
-
-#define MBG_MODE_CTRL_REG		(MBG_BASE + 0x44)
-#define FORCE_MBG_OK_BIT		BIT(1)
 
 #define LDO_ENABLE_REG(base)		(base + 0x46)
 #define ENABLE_BIT			BIT(7)
@@ -97,7 +90,6 @@ struct pm8008_chip {
 	bool			framework_enabled;
 	bool			aggr_enabled;
 	bool			suspended;
-	bool			force_mbg_ok;
 };
 
 struct reg_init_data {
@@ -197,7 +189,7 @@ static int pm8008_write(struct regmap *regmap, u16 reg, const u8 *val,
 {
 	int rc;
 
-	pr_debug("Writing 0x%02x to 0x%04x\n", val, reg);
+	pr_debug("Writing 0x%02x to 0x%04x\n", *val, reg);
 	rc = regmap_bulk_write(regmap, reg, val, count);
 	if (rc < 0)
 		pr_err("failed to write 0x%04x\n", reg);
@@ -240,20 +232,6 @@ static int pm8008_chip_aggregate(struct pm8008_chip *chip)
 
 	chip->aggr_enabled = enable;
 	pm8008_debug(chip, "chip %s\n", enable ? "enabled" : "disabled");
-
-	/*
-	 * Force MBG_OK for PM8010 v1.0 chip to prevent its LDOs from being
-	 * disabled due to transients from other regulators.
-	 */
-
-	if (chip->force_mbg_ok) {
-		rc = pm8008_masked_write(chip->regmap, MBG_MODE_CTRL_REG,
-			FORCE_MBG_OK_BIT, enable ? FORCE_MBG_OK_BIT : 0);
-		if (rc < 0) {
-			pm8008_err(chip, "Failed to write 0x2c44 register rc=%d\n", rc);
-			return rc;
-		}
-	}
 
 	return 0;
 }
@@ -596,7 +574,7 @@ static int pm8008_regulator_set_load(struct regulator_dev *rdev, int load_uA)
 	return pm8008_regulator_set_mode(rdev, mode);
 }
 
-static struct regulator_ops pm8008_regulator_ops = {
+static const struct regulator_ops pm8008_regulator_ops = {
 	.enable			= pm8008_regulator_enable,
 	.disable		= pm8008_regulator_disable,
 	.is_enabled		= pm8008_regulator_is_enabled,
@@ -697,7 +675,7 @@ static int pm8008_register_ldo(struct pm8008_regulator *pm8008_reg,
 
 	/* get regulator data */
 	for (i = 0; i < PM8008_MAX_LDO; i++)
-		if (strstr(name, reg_data[i].name))
+		if (strnstr(name, reg_data[i].name, strlen(name)))
 			break;
 
 	if (i == PM8008_MAX_LDO) {
@@ -887,7 +865,7 @@ static int pm8008_parse_regulator(struct regmap *regmap, struct device *dev)
 		return rc;
 	}
 
-	chip = regulator_get_drvdata(en_supply);
+	chip = rdev_get_drvdata(en_supply->rdev);
 	if (!chip) {
 		dev_err(dev, "failed to get pm8008_en supply data\n");
 		return -ENODATA;
@@ -992,7 +970,7 @@ static int pm8008_chip_is_enabled(struct regulator_dev *rdev)
 	return chip->framework_enabled;
 }
 
-static struct regulator_ops pm8008_chip_ops = {
+static const struct regulator_ops pm8008_chip_ops = {
 	.enable = pm8008_chip_enable,
 	.disable = pm8008_chip_disable,
 	.is_enabled = pm8008_chip_is_enabled,
@@ -1063,7 +1041,6 @@ static irqreturn_t pm8008_ocp_irq(int irq, void *_chip)
 static int pm8008_chip_probe(struct platform_device *pdev)
 {
 	int rc = 0;
-	u8 subtype, rev1;
 	struct pm8008_chip *chip;
 
 	chip = devm_kzalloc(&pdev->dev, sizeof(*chip), GFP_KERNEL);
@@ -1084,21 +1061,6 @@ static int pm8008_chip_probe(struct platform_device *pdev)
 		pr_err("Failed to register chip enable regulator rc=%d\n", rc);
 		return rc;
 	}
-
-	rc = pm8008_read(chip->regmap, REVID_BASE, &rev1, 1);
-	if (rc < 0) {
-		pm8008_err(chip, "failed to get chip version rc=%d\n", rc);
-		return rc;
-	}
-
-	rc = pm8008_read(chip->regmap, REVID_PERPH_SUBTYPE, &subtype, 1);
-	if (rc < 0) {
-		pm8008_err(chip, "failed to get chip subtype rc=%d\n", rc);
-		return rc;
-	}
-
-	if (subtype == PM8010_PERPH_SUBTYPE && rev1 == PM8010_REV_v1_0)
-		chip->force_mbg_ok = true;
 
 	chip->ocp_irq = of_irq_get_byname(chip->dev->of_node, "ocp");
 	if (chip->ocp_irq < 0) {
@@ -1210,4 +1172,4 @@ static void __exit pm8008_regulator_exit(void)
 module_exit(pm8008_regulator_exit);
 
 MODULE_DESCRIPTION("QPNP PM8008 PMIC Regulator Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

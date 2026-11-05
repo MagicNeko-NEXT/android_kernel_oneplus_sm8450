@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2013-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt)	"%s: " fmt, __func__
@@ -333,4 +334,4 @@ int of_batterydata_read_soh_aged_profiles(
 	return 0;
 }
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

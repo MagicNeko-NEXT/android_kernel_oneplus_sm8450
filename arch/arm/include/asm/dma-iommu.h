@@ -11,7 +11,6 @@
 struct dma_iommu_mapping {
 	/* iommu specific data */
 	struct iommu_domain	*domain;
-	const struct dma_map_ops *ops;
 
 	unsigned long		**bitmaps;	/* array of bitmaps */
 	unsigned int		nr_bitmaps;	/* nr of elements in array */
@@ -25,7 +24,7 @@ struct dma_iommu_mapping {
 };
 
 struct dma_iommu_mapping *
-arm_iommu_create_mapping(struct bus_type *bus, dma_addr_t base, u64 size);
+arm_iommu_create_mapping(const struct bus_type *bus, dma_addr_t base, u64 size);
 
 void arm_iommu_release_mapping(struct dma_iommu_mapping *mapping);
 

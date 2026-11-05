@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (C) 2015 Srinivas Kandagatla <srinivas.kandagatla@linaro.org>
+ * Copyright (c) 2021,2024-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/clk.h>
@@ -12,6 +13,8 @@
 #include <linux/mod_devicetable.h>
 #include <linux/nvmem-provider.h>
 #include <linux/platform_device.h>
+#include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
 #include <linux/property.h>
 #include <linux/regulator/consumer.h>
 
@@ -20,7 +23,7 @@
 
 /* Amount of time required to hold charge to blow fuse in micro-seconds */
 #define QFPROM_FUSE_BLOW_POLL_US	100
-#define QFPROM_FUSE_BLOW_TIMEOUT_US	1000
+#define QFPROM_FUSE_BLOW_TIMEOUT_US	10000
 
 #define QFPROM_BLOW_STATUS_OFFSET	0x048
 #define QFPROM_BLOW_STATUS_BUSY		0x1
@@ -45,11 +48,13 @@ MODULE_PARM_DESC(read_raw_data, "Read raw instead of corrected data");
  * @qfprom_blow_timer_value: The timer value of qfprom when doing efuse blow.
  * @qfprom_blow_set_freq:    The frequency required to set when we start the
  *                           fuse blowing.
+ * @qfprom_blow_uV:          LDO voltage to be set when doing efuse blow
  */
 struct qfprom_soc_data {
 	u32 accel_value;
 	u32 qfprom_blow_timer_value;
 	u32 qfprom_blow_set_freq;
+	int qfprom_blow_uV;
 };
 
 /**
@@ -64,8 +69,6 @@ struct qfprom_soc_data {
  * @secclk:       Clock supply.
  * @vcc:          Regulator supply.
  * @soc_data:     Data that for things that varies from SoC to SoC.
- * @keepout:   Optional array of keepout ranges (sorted ascending by start).
- * @nkeepout:  Number of elements in the keepout array.
  */
 struct qfprom_priv {
 	void __iomem *qfpraw;
@@ -76,8 +79,6 @@ struct qfprom_priv {
 	struct clk *secclk;
 	struct regulator *vcc;
 	const struct qfprom_soc_data *soc_data;
-	const struct nvmem_keepout *keepout;
-	unsigned int nkeepout;
 };
 
 /**
@@ -94,19 +95,6 @@ struct qfprom_touched_values {
 };
 
 /**
- * struct nvmem_keepout - NVMEM register keepout range.
- *
- * @start:     The first byte offset to avoid.
- * @end:       One beyond the last byte offset to avoid.
- * @value:     The byte to fill reads with for this region.
- */
-struct nvmem_keepout {
-	unsigned int start;
-	unsigned int end;
-	unsigned char value;
-};
-
-/**
  * struct qfprom_soc_compatible_data - Data matched against the SoC
  * compatible string.
  *
@@ -116,6 +104,83 @@ struct nvmem_keepout {
 struct qfprom_soc_compatible_data {
 	const struct nvmem_keepout *keepout;
 	unsigned int nkeepout;
+};
+
+static const struct nvmem_keepout sc7180_qfprom_keepout[] = {
+	{.start = 0x128, .end = 0x148},
+	{.start = 0x220, .end = 0x228}
+};
+
+static const struct qfprom_soc_compatible_data sc7180_qfprom = {
+	.keepout = sc7180_qfprom_keepout,
+	.nkeepout = ARRAY_SIZE(sc7180_qfprom_keepout)
+};
+
+static const struct nvmem_keepout sc7280_qfprom_keepout[] = {
+	{.start = 0x128, .end = 0x148},
+	{.start = 0x238, .end = 0x248}
+};
+
+static const struct qfprom_soc_compatible_data sc7280_qfprom = {
+	.keepout = sc7280_qfprom_keepout,
+	.nkeepout = ARRAY_SIZE(sc7280_qfprom_keepout)
+};
+
+static const struct nvmem_keepout sun_qfprom_keepout[] = {
+	{.start = 0x20, .end = 0x24},
+	{.start = 0x28, .end = 0x30},
+	{.start = 0x34, .end = 0x40},
+	{.start = 0x58, .end = 0x60},
+	{.start = 0x68, .end = 0x70},
+	{.start = 0x78, .end = 0x80},
+	{.start = 0x90, .end = 0x100},
+	{.start = 0x150, .end = 0x200},
+	{.start = 0x238, .end = 0x300},
+	{.start = 0x330, .end = 0x400},
+	{.start = 0x4e8, .end = 0x500},
+	{.start = 0x550, .end = 0x600},
+	{.start = 0x608, .end = 0x610},
+	{.start = 0x618, .end = 0x630},
+	{.start = 0x638, .end = 0x700},
+	{.start = 0x738, .end = 0x73c},
+	{.start = 0x74c, .end = 0x770},
+	{.start = 0x900, .end = 0x948},
+	{.start = 0xbf0, .end = 0xcf0},
+	{.start = 0xd00, .end = 0x1000},
+};
+
+static const struct qfprom_soc_compatible_data sun_qfprom = {
+	 .keepout = sun_qfprom_keepout,
+	 .nkeepout = ARRAY_SIZE(sun_qfprom_keepout)
+};
+
+static const struct nvmem_keepout tuna_qfprom_keepout[] = {
+	{.start = 0x20, .end = 0x24},
+	{.start = 0x28, .end = 0x30},
+	{.start = 0x34, .end = 0x40},
+	{.start = 0x58, .end = 0x60},
+	{.start = 0x68, .end = 0x70},
+	{.start = 0x78, .end = 0x80},
+	{.start = 0x90, .end = 0x100},
+	{.start = 0x150, .end = 0x200},
+	{.start = 0x238, .end = 0x300},
+	{.start = 0x330, .end = 0x400},
+	{.start = 0x4e8, .end = 0x500},
+	{.start = 0x550, .end = 0x600},
+	{.start = 0x608, .end = 0x610},
+	{.start = 0x618, .end = 0x630},
+	{.start = 0x638, .end = 0x700},
+	{.start = 0x738, .end = 0x73c},
+	{.start = 0x74c, .end = 0x770},
+	{.start = 0x900, .end = 0x948},
+	{.start = 0x950, .end = 0x958},
+	{.start = 0xbf0, .end = 0xcf0},
+	{.start = 0xd00, .end = 0x1000},
+};
+
+static const struct qfprom_soc_compatible_data tuna_qfprom = {
+	.keepout = tuna_qfprom_keepout,
+	.nkeepout = ARRAY_SIZE(tuna_qfprom_keepout)
 };
 
 static const struct nvmem_keepout ravelin_qfprom_keepout[] = {
@@ -199,6 +264,9 @@ static void qfprom_disable_fuse_blowing(const struct qfprom_priv *priv,
 	writel(old->timer_val, priv->qfpconf + QFPROM_BLOW_TIMER_OFFSET);
 	writel(old->accel_val, priv->qfpconf + QFPROM_ACCEL_OFFSET);
 
+	dev_pm_genpd_set_performance_state(priv->dev, 0);
+	pm_runtime_put(priv->dev);
+
 	/*
 	 * This may be a shared rail and may be able to run at a lower rate
 	 * when we're not blowing fuses.  At the moment, the regulator framework
@@ -237,6 +305,7 @@ static int qfprom_enable_fuse_blowing(const struct qfprom_priv *priv,
 				      struct qfprom_touched_values *old)
 {
 	int ret;
+	int qfprom_blow_uV = priv->soc_data->qfprom_blow_uV;
 
 	ret = clk_prepare_enable(priv->secclk);
 	if (ret) {
@@ -252,13 +321,13 @@ static int qfprom_enable_fuse_blowing(const struct qfprom_priv *priv,
 	}
 
 	/*
-	 * Hardware requires 1.8V min for fuse blowing; this may be
-	 * a rail shared do don't specify a max--regulator constraints
-	 * will handle.
+	 * Hardware requires a minimum voltage for fuse blowing.
+	 * This may be a shared rail so don't specify a maximum.
+	 * Regulator constraints will cap to the actual maximum.
 	 */
-	ret = regulator_set_voltage(priv->vcc, 1800000, INT_MAX);
+	ret = regulator_set_voltage(priv->vcc, qfprom_blow_uV, INT_MAX);
 	if (ret) {
-		dev_err(priv->dev, "Failed to set 1.8 voltage\n");
+		dev_err(priv->dev, "Failed to set %duV\n", qfprom_blow_uV);
 		goto err_clk_rate_set;
 	}
 
@@ -267,6 +336,13 @@ static int qfprom_enable_fuse_blowing(const struct qfprom_priv *priv,
 		dev_err(priv->dev, "Failed to enable regulator\n");
 		goto err_clk_rate_set;
 	}
+
+	ret = pm_runtime_resume_and_get(priv->dev);
+	if (ret < 0) {
+		dev_err(priv->dev, "Failed to enable power-domain\n");
+		goto err_reg_enable;
+	}
+	dev_pm_genpd_set_performance_state(priv->dev, INT_MAX);
 
 	old->timer_val = readl(priv->qfpconf + QFPROM_BLOW_TIMER_OFFSET);
 	old->accel_val = readl(priv->qfpconf + QFPROM_ACCEL_OFFSET);
@@ -277,6 +353,8 @@ static int qfprom_enable_fuse_blowing(const struct qfprom_priv *priv,
 
 	return 0;
 
+err_reg_enable:
+	regulator_disable(priv->vcc);
 err_clk_rate_set:
 	clk_set_rate(priv->secclk, old->clk_rate);
 err_clk_prepared:
@@ -285,7 +363,7 @@ err_clk_prepared:
 }
 
 /**
- * qfprom_efuse_reg_write() - Write to fuses.
+ * qfprom_reg_write() - Write to fuses.
  * @context: Our driver data.
  * @reg:     The offset to write at.
  * @_val:    Pointer to data to write.
@@ -295,8 +373,8 @@ err_clk_prepared:
  *
  * Return: 0 or -err.
  */
-static int __qfprom_reg_write(void *context, unsigned int reg, void *_val,
-				size_t bytes)
+static int qfprom_reg_write(void *context, unsigned int reg, void *_val,
+			    size_t bytes)
 {
 	struct qfprom_priv *priv = context;
 	struct qfprom_touched_values old;
@@ -359,7 +437,7 @@ exit_enabled_fuse_blowing:
 	return ret;
 }
 
-static int __qfprom_reg_read(void *context,
+static int qfprom_reg_read(void *context,
 			unsigned int reg, void *_val, size_t bytes)
 {
 	struct qfprom_priv *priv = context;
@@ -389,160 +467,30 @@ static int __qfprom_reg_read(void *context,
 	return 0;
 }
 
-static int qfprom_access_with_keepouts(void *context, unsigned int offset, void *_val,
-					size_t bytes, int write)
+static void qfprom_runtime_disable(void *data)
 {
-	unsigned int end = offset + bytes;
-	unsigned int kend, ksize;
-	struct qfprom_priv *priv = context;
-	const struct nvmem_keepout *keepout = priv->keepout;
-	const struct nvmem_keepout *keepoutend = keepout + priv->nkeepout;
-	int rc;
-
-	/*
-	 * Skip all keepouts before the range being accessed.
-	 * Keepouts are sorted.
-	 */
-	while ((keepout < keepoutend) && (keepout->end <= offset))
-		keepout++;
-
-	while ((offset < end) && (keepout < keepoutend)) {
-		/* Access the valid portion before the keepout. */
-		if (offset < keepout->start) {
-			kend = min(end, keepout->start);
-			ksize = kend - offset;
-			if (write)
-				rc = __qfprom_reg_write(context, offset, _val, ksize);
-			else
-				rc = __qfprom_reg_read(context, offset, _val, ksize);
-
-			if (rc)
-				return rc;
-
-			offset += ksize;
-			_val += ksize;
-		}
-
-		/*
-		 * Now we're aligned to the start of this keepout zone. Go
-		 * through it.
-		 */
-		kend = min(end, keepout->end);
-		ksize = kend - offset;
-		if (!write)
-			memset(_val, keepout->value, ksize);
-
-		_val += ksize;
-		offset += ksize;
-		keepout++;
-	}
-
-	/*
-	 * If we ran out of keepouts but there's still stuff to do, send it
-	 * down directly
-	 */
-	if (offset < end) {
-		ksize = end - offset;
-		if (write)
-			return __qfprom_reg_write(context, offset, _val, ksize);
-		else
-			return __qfprom_reg_read(context, offset, _val, ksize);
-	}
-
-	return 0;
-}
-
-static int qfprom_reg_read(void *context, unsigned int reg, void *_val,
-				size_t bytes)
-{
-	struct qfprom_priv *priv = context;
-
-	if (!priv->nkeepout)
-		return __qfprom_reg_read(context, reg, _val, bytes);
-
-	return qfprom_access_with_keepouts(context, reg, _val, bytes, false);
-}
-
-static int qfprom_reg_write(void *context, unsigned int reg, void *_val,
-				size_t bytes)
-{
-	struct qfprom_priv *priv = context;
-
-	if (!priv->nkeepout)
-		return __qfprom_reg_write(context, reg, _val, bytes);
-
-	return qfprom_access_with_keepouts(context, reg, _val, bytes, true);
-}
-
-static int qfprom_validate_keepouts(struct nvmem_config *econfig)
-{
-	unsigned int cur = 0;
-	struct qfprom_priv *priv = econfig->priv;
-	const struct nvmem_keepout *keepout = priv->keepout;
-	const struct nvmem_keepout *keepoutend = keepout + priv->nkeepout;
-	int word_size;
-	int stride;
-
-	word_size = econfig->word_size ?: 1;
-	stride = econfig->stride ?: 1;
-
-	while (keepout < keepoutend) {
-		/* Ensure keepouts are sorted and don't overlap. */
-		if (keepout->start < cur) {
-			dev_err(priv->dev,
-				"Keepout regions aren't sorted or overlap.\n");
-
-			return -ERANGE;
-		}
-
-		if (keepout->end < keepout->start) {
-			dev_err(priv->dev,
-				"Invalid keepout region.\n");
-
-			return -EINVAL;
-		}
-
-		/*
-		 * Validate keepouts (and holes between) don't violate
-		 * word_size constraints.
-		 */
-		if ((keepout->end - keepout->start < word_size) ||
-		    ((keepout->start != cur) &&
-		     (keepout->start - cur < word_size))) {
-
-			dev_err(priv->dev,
-				"Keepout regions violate word_size constraints.\n");
-
-			return -ERANGE;
-		}
-
-		/* Validate keepouts don't violate stride (alignment). */
-		if (!IS_ALIGNED(keepout->start, stride) ||
-		    !IS_ALIGNED(keepout->end, stride)) {
-
-			dev_err(priv->dev,
-				"Keepout regions violate stride.\n");
-
-			return -EINVAL;
-		}
-
-		cur = keepout->end;
-		keepout++;
-	}
-
-	return 0;
+	pm_runtime_disable(data);
 }
 
 static const struct qfprom_soc_data qfprom_7_8_data = {
 	.accel_value = 0xD10,
 	.qfprom_blow_timer_value = 25,
 	.qfprom_blow_set_freq = 4800000,
+	.qfprom_blow_uV = 1800000,
+};
+
+static const struct qfprom_soc_data qfprom_7_15_data = {
+	.accel_value = 0xD08,
+	.qfprom_blow_timer_value = 24,
+	.qfprom_blow_set_freq = 4800000,
+	.qfprom_blow_uV = 1900000,
 };
 
 static int qfprom_probe(struct platform_device *pdev)
 {
 	struct nvmem_config econfig = {
 		.name = "qfprom",
+		.add_legacy_fixed_of_cells = true,
 		.stride = 1,
 		.word_size = 1,
 		.id = NVMEM_DEVID_AUTO,
@@ -560,8 +508,7 @@ static int qfprom_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	/* The corrected section is always provided */
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	priv->qfpcorrected = devm_ioremap_resource(dev, res);
+	priv->qfpcorrected = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(priv->qfpcorrected))
 		return PTR_ERR(priv->qfpcorrected);
 
@@ -572,14 +519,8 @@ static int qfprom_probe(struct platform_device *pdev)
 	priv->dev = dev;
 	soc_data = device_get_match_data(dev);
 	if (soc_data) {
-		priv->keepout = soc_data->keepout;
-		priv->nkeepout = soc_data->nkeepout;
-	}
-
-	if (priv->nkeepout) {
-		ret = qfprom_validate_keepouts(&econfig);
-		if (ret)
-			return ret;
+		econfig.keepout = soc_data->keepout;
+		econfig.nkeepout = soc_data->nkeepout;
 	}
 
 	/*
@@ -594,12 +535,10 @@ static int qfprom_probe(struct platform_device *pdev)
 		priv->qfpraw = devm_ioremap_resource(dev, res);
 		if (IS_ERR(priv->qfpraw))
 			return PTR_ERR(priv->qfpraw);
-		res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
-		priv->qfpconf = devm_ioremap_resource(dev, res);
+		priv->qfpconf = devm_platform_ioremap_resource(pdev, 2);
 		if (IS_ERR(priv->qfpconf))
 			return PTR_ERR(priv->qfpconf);
-		res = platform_get_resource(pdev, IORESOURCE_MEM, 3);
-		priv->qfpsecurity = devm_ioremap_resource(dev, res);
+		priv->qfpsecurity = devm_platform_ioremap_resource(pdev, 3);
 		if (IS_ERR(priv->qfpsecurity))
 			return PTR_ERR(priv->qfpsecurity);
 
@@ -611,23 +550,26 @@ static int qfprom_probe(struct platform_device *pdev)
 
 		if (major_version == 7 && minor_version == 8)
 			priv->soc_data = &qfprom_7_8_data;
+		else if (major_version == 7 && minor_version == 15)
+			priv->soc_data = &qfprom_7_15_data;
 
 		priv->vcc = devm_regulator_get(&pdev->dev, "vcc");
 		if (IS_ERR(priv->vcc))
 			return PTR_ERR(priv->vcc);
 
 		priv->secclk = devm_clk_get(dev, "core");
-		if (IS_ERR(priv->secclk)) {
-			ret = PTR_ERR(priv->secclk);
-			if (ret != -EPROBE_DEFER)
-				dev_err(dev, "Error getting clock: %d\n", ret);
-			return ret;
-		}
+		if (IS_ERR(priv->secclk))
+			return dev_err_probe(dev, PTR_ERR(priv->secclk), "Error getting clock\n");
 
 		/* Only enable writing if we have SoC data. */
 		if (priv->soc_data)
 			econfig.reg_write = qfprom_reg_write;
 	}
+
+	pm_runtime_enable(dev);
+	ret = devm_add_action_or_reset(dev, qfprom_runtime_disable, dev);
+	if (ret)
+		return ret;
 
 	nvmem = devm_nvmem_register(dev, &econfig);
 
@@ -636,6 +578,11 @@ static int qfprom_probe(struct platform_device *pdev)
 
 static const struct of_device_id qfprom_of_match[] = {
 	{ .compatible = "qcom,qfprom",},
+	{ .compatible = "qcom,sc7180-qfprom", .data = &sc7180_qfprom},
+	{ .compatible = "qcom,sc7280-qfprom", .data = &sc7280_qfprom},
+	{ .compatible = "qcom,sun-qfprom",    .data = &sun_qfprom},
+	{ .compatible = "qcom,tuna-qfprom",    .data = &tuna_qfprom},
+	{ .compatible = "qcom,kera-qfprom",    .data = &tuna_qfprom},
 	{ .compatible = "qcom,ravelin-qfprom", .data = &ravelin_qfprom},
 	{ .compatible = "qcom,parrot-qfprom", .data = &parrot_qfprom},
 	{/* sentinel */},

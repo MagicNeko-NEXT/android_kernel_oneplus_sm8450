@@ -7,6 +7,7 @@
  * Copyright (C) 2012, 2019 Linaro Ltd.
  * Author: <benjamin.gaignard@linaro.org> for ST-Ericsson.
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/cma.h>
@@ -23,7 +24,6 @@
 #include <linux/sched/signal.h>
 #include <linux/list.h>
 
-#include "qcom_dma_heap_priv.h"
 #include "qcom_cma_heap.h"
 #include "qcom_sg_ops.h"
 
@@ -52,8 +52,8 @@ static void cma_heap_free(struct qcom_sg_buffer *buffer)
 /* dmabuf heap CMA operations functions */
 struct dma_buf *cma_heap_allocate(struct dma_heap *heap,
 				  unsigned long len,
-				  unsigned long fd_flags,
-				  unsigned long heap_flags)
+				  u32 fd_flags,
+				  u64 heap_flags)
 {
 	struct cma_heap *cma_heap;
 	struct qcom_sg_buffer *helper_buffer;
@@ -81,7 +81,7 @@ struct dma_buf *cma_heap_allocate(struct dma_heap *heap,
 	helper_buffer->uncached = cma_heap->uncached;
 	helper_buffer->free = cma_heap_free;
 
-	cma_pages = cma_alloc(cma_heap->cma, nr_pages, align, GFP_KERNEL);
+	cma_pages = cma_alloc(cma_heap->cma, nr_pages, align, false);
 	if (!cma_pages)
 		goto free_buf;
 
@@ -90,10 +90,10 @@ struct dma_buf *cma_heap_allocate(struct dma_heap *heap,
 		struct page *page = cma_pages;
 
 		while (nr_clear_pages > 0) {
-			void *vaddr = kmap_atomic(page);
+			void *vaddr = kmap_local_page(page);
 
 			memset(vaddr, 0, PAGE_SIZE);
-			kunmap_atomic(vaddr);
+			kunmap_local(vaddr);
 			/*
 			 * Avoid wasting time zeroing memory if the process
 			 * has been killed by SIGKILL
@@ -130,7 +130,7 @@ struct dma_buf *cma_heap_allocate(struct dma_heap *heap,
 	exp_info.size = helper_buffer->len;
 	exp_info.flags = fd_flags;
 	exp_info.priv = helper_buffer;
-	dmabuf = mem_buf_dma_buf_export(&exp_info, &qcom_sg_buf_ops);
+	dmabuf = qcom_dma_buf_export(&exp_info, &qcom_sg_buf_ops);
 	if (IS_ERR(dmabuf)) {
 		ret = PTR_ERR(dmabuf);
 		goto vmperm_release;

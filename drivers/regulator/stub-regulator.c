@@ -118,7 +118,7 @@ static int regulator_stub_is_enabled(struct regulator_dev *rdev)
 	return vreg->enabled;
 }
 
-static struct regulator_ops regulator_stub_ops = {
+static const struct regulator_ops regulator_stub_ops = {
 	.enable			= regulator_stub_enable,
 	.disable		= regulator_stub_disable,
 	.is_enabled		= regulator_stub_is_enabled,
@@ -241,5 +241,5 @@ static void __exit regulator_stub_exit(void)
 }
 module_exit(regulator_stub_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("stub regulator driver");

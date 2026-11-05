@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2025, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/cpu.h>
 #include <linux/cpuidle.h>
+#include <linux/cpumask.h>
 #include <linux/cpu_pm.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -19,11 +21,15 @@
 #include <linux/tick.h>
 #include <linux/time64.h>
 
+#if defined(_TRACE_HOOK_PM_DOMAIN_H)
 #include <trace/hooks/pm_domain.h>
+#endif
+
 #define CREATE_TRACE_POINTS
 #include "trace-cluster-lpm.h"
 #include "qcom-lpm.h"
 
+static DEFINE_PER_CPU(ktime_t, cpu_next_wakeup);
 LIST_HEAD(cluster_dev_list);
 
 static struct lpm_cluster *to_cluster(struct generic_pm_domain *genpd)
@@ -47,6 +53,12 @@ static enum hrtimer_restart clusttimer_fn(struct hrtimer *h)
 						struct lpm_cluster, histtimer);
 
 	cluster_gov->history_invalid = true;
+	cluster_gov->htmr_wkup = true;
+	cluster_gov->predicted = false;
+	cluster_gov->restrict_idx = -1;
+	cluster_gov->pred_residency = 0;
+	cluster_gov->is_timer_expired = true;
+	cluster_gov->is_timer_queued = false;
 
 	return HRTIMER_NORESTART;
 }
@@ -55,10 +67,9 @@ static enum hrtimer_restart clusttimer_fn(struct hrtimer *h)
  * clusttimer_start()  - Programs the hrtimer with given timer value
  * @time_ns:      Value to be program
  */
-static void clusttimer_start(struct lpm_cluster *cluster_gov, uint32_t time_us)
+static void clusttimer_start(struct lpm_cluster *cluster_gov, u64 time_ns)
 {
 	struct hrtimer *timer = &cluster_gov->histtimer;
-	uint64_t time_ns = time_us * NSEC_PER_USEC;
 	ktime_t clust_ktime = ns_to_ktime(time_ns);
 
 	timer->function = clusttimer_fn;
@@ -89,11 +100,12 @@ static void cluster_predict(struct lpm_cluster *cluster_gov)
 	int64_t cur_time = ktime_to_us(cluster_gov->now);
 	uint64_t avg_residency = 0;
 
-	cluster_gov->pred_wakeup = KTIME_MAX;
-	cluster_gov->predicted = false;
-
 	if (prediction_disabled)
 		return;
+
+	cluster_gov->pred_wakeup = KTIME_MAX;
+	cluster_gov->predicted = false;
+	cluster_gov->pred_residency = 0;
 
 	/*
 	 * Samples are marked invalid when woken-up due to timer,
@@ -101,7 +113,6 @@ static void cluster_predict(struct lpm_cluster *cluster_gov)
 	 */
 	if (cluster_gov->history_invalid) {
 		cluster_gov->history_invalid = false;
-		cluster_gov->htmr_wkup = true;
 		return;
 	}
 
@@ -113,7 +124,7 @@ static void cluster_predict(struct lpm_cluster *cluster_gov)
 	if (cluster_gov->nsamp == MAXSAMPLES) {
 		for (i = 0; i < MAXSAMPLES; i++) {
 			if ((cur_time - cluster_gov->history[i].entry_time)
-					> CLUST_SMPL_INVLD_TIME)
+					> cluster_gov->samples_invalid_time)
 				cluster_gov->nsamp--;
 		}
 	}
@@ -130,38 +141,42 @@ static void cluster_predict(struct lpm_cluster *cluster_gov)
 		for (i = 0; i < MAXSAMPLES; i++)
 			avg_residency += cluster_gov->history[i].residency;
 		do_div(avg_residency, MAXSAMPLES);
-		cluster_gov->pred_wakeup = ktime_add_us(avg_residency,
-							cluster_gov->now);
+		cluster_gov->pred_residency = avg_residency;
 		cluster_gov->predicted = true;
+
+		if (avg_residency * NSEC_PER_USEC <=
+			genpd->states[genpd->state_count - 1].residency_ns)
+			cluster_gov->restrict_idx = genpd->state_count - 1;
+		else
+			cluster_gov->restrict_idx = -1;
+
 		return;
 	}
 
 	/*
 	 * Find the number of premature exits for each of the mode,
-	 * excluding clockgating mode, and they are more than fifty
-	 * percent restrict that and deeper modes.
+	 * and if they are more than fifty percent restrict that and
+	 * deeper modes.
 	 */
-	for (j = 1; j < genpd->state_count; j++) {
+	for (j = 0; j < genpd->state_count; j++) {
 		uint32_t count = 0;
-		u32 residency = genpd->states[j].residency_ns;
 
-		avg_residency = 0;
 		for (i = 0; i < MAXSAMPLES; i++) {
 
 			if ((cluster_gov->history[i].mode == j) &&
-			    (cluster_gov->history[i].residency <
-					do_div(residency, NSEC_PER_USEC))) {
+			    (cluster_gov->history[i].residency * NSEC_PER_USEC <
+			     genpd->states[j].residency_ns)) {
 				count++;
 				avg_residency +=
 					cluster_gov->history[i].residency;
 			}
 		}
 
-		if (count > PRED_PREMATURE_CNT) {
+		if (count >= cluster_gov->pred_premature_cnt) {
 			do_div(avg_residency, count);
-			cluster_gov->pred_wakeup = ktime_add_us(cluster_gov->now,
-								avg_residency);
+			cluster_gov->pred_residency = avg_residency;
 			cluster_gov->predicted = true;
+			cluster_gov->restrict_idx = j;
 			return;
 		}
 	}
@@ -186,6 +201,8 @@ static void clear_cluster_history(struct lpm_cluster *cluster_gov)
 	cluster_gov->nsamp = 0;
 	cluster_gov->history_invalid = false;
 	cluster_gov->htmr_wkup = false;
+	cluster_gov->predicted = false;
+	cluster_gov->restrict_idx = -1;
 }
 
 /**
@@ -196,20 +213,17 @@ static void clear_cluster_history(struct lpm_cluster *cluster_gov)
 static void update_cluster_history(struct lpm_cluster *cluster_gov)
 {
 	bool tmr = false;
-	uint32_t residency = 0;
+	u64 residency = 0;
 	struct generic_pm_domain *genpd = cluster_gov->genpd;
 	int idx = genpd->state_idx, samples_idx = cluster_gov->samples_idx;
+	struct lpm_cluster *gov;
 
-	if (prediction_disabled)
+	if (prediction_disabled || cluster_gov->entry_idx != idx)
 		return;
 
-	if ((cluster_gov->entry_idx == -1) || (cluster_gov->entry_idx == idx)) {
-		residency = ktime_sub(cluster_gov->now, cluster_gov->entry_time);
-		residency = ktime_to_us(residency);
-		cluster_gov->history[samples_idx].entry_time =
-					ktime_to_us(cluster_gov->entry_time);
-	} else
-		return;
+	residency = ktime_sub(cluster_gov->now, cluster_gov->entry_time);
+	residency = ktime_to_us(residency);
+	cluster_gov->history[samples_idx].entry_time = ktime_to_us(cluster_gov->entry_time);
 
 	if (cluster_gov->htmr_wkup) {
 		if (!samples_idx)
@@ -235,6 +249,21 @@ static void update_cluster_history(struct lpm_cluster *cluster_gov)
 		samples_idx = 0;
 
 	cluster_gov->samples_idx = samples_idx;
+
+	if (residency * NSEC_PER_USEC < genpd->states[idx].residency_ns)
+		return;
+
+	if (num_possible_cpus() == cpumask_weight(genpd->cpus) &&
+	    idx == genpd->state_count - 1) {
+		clear_cpu_predict_history();
+		list_for_each_entry(gov, &cluster_dev_list, list) {
+			if (!gov->initialized)
+				continue;
+
+			clear_cluster_history(gov);
+		}
+		return;
+	}
 }
 
 /**
@@ -245,30 +274,80 @@ static void update_cluster_history(struct lpm_cluster *cluster_gov)
  *			structure.
  * @cluster_gov:  cluster's lpm data structure
  */
-static void cluster_power_down(struct lpm_cluster *cluster_gov)
+static int cluster_power_down(struct lpm_cluster *cluster_gov)
 {
 	struct generic_pm_domain *genpd = cluster_gov->genpd;
+	struct genpd_governor_data *gd = genpd->gd;
 	int idx = genpd->state_idx;
 	uint32_t residency;
+	s64 cpus_qos;
+	int i;
 
 	if (idx < 0)
-		return;
+		return 0;
 
 	cluster_gov->entry_time = cluster_gov->now;
 	cluster_gov->entry_idx = idx;
-	trace_cluster_pred_select(genpd->state_idx, genpd->next_wakeup,
-				  0, cluster_gov->predicted, cluster_gov->next_wakeup);
-	if (idx >= genpd->state_count - 1) {
-		clear_cpu_predict_history();
-		clear_cluster_history(cluster_gov);
-		return;
-	}
-	if (ktime_compare(cluster_gov->next_wakeup, cluster_gov->pred_wakeup))
-		return;
+	trace_cluster_pred_select(genpd->state_idx, gd->next_wakeup, cluster_gov->restrict_idx,
+				  cluster_gov->predicted, cluster_gov->pred_residency);
 
-	residency = genpd->states[idx + 1].residency_ns;
-	do_div(residency, NSEC_PER_USEC);
-	clusttimer_start(cluster_gov, residency + PRED_TIMER_ADD);
+	cpus_qos = get_cpus_qos(cluster_gov->genpd->cpus);
+	for (i = 0; i < genpd->state_count; i++) {
+		if (idx == i &&
+		    cpus_qos < genpd->states[i].power_on_latency_ns)
+			return -1;
+	}
+
+	if (cluster_gov->use_bias_timer &&
+	    num_possible_cpus() != cpumask_weight(cluster_gov->genpd->cpus)) {
+		if (!cluster_gov->is_timer_expired && !cluster_gov->is_timer_queued) {
+			cluster_gov->need_timer_requeue = false;
+			clusttimer_cancel(cluster_gov);
+			clusttimer_start(cluster_gov, NSEC_PER_MSEC *
+					 CLUST_BIAS_TIME_MSEC);
+			cluster_gov->is_timer_queued = true;
+			return -1;
+		}
+		if (cluster_gov->is_timer_queued) {
+			cluster_gov->need_timer_requeue = true;
+			return -1;
+		}
+
+		cluster_gov->htmr_wkup = false;
+		cluster_gov->is_timer_expired = false;
+
+		if (cluster_gov->need_timer_requeue) {
+			cluster_gov->need_timer_requeue = false;
+			clusttimer_cancel(cluster_gov);
+			clusttimer_start(cluster_gov, NSEC_PER_MSEC *
+					 CLUST_BIAS_TIME_MSEC);
+			cluster_gov->is_timer_queued = true;
+			return -1;
+		}
+
+		return 0;
+	}
+
+	if ((idx == genpd->state_count - 1 && cluster_gov->restrict_idx == -1) ||
+	    !cluster_gov->predicted)
+		return 0;
+
+	if (cluster_gov->pred_wakeup != KTIME_MAX &&
+	    ktime_before(cluster_gov->next_wakeup, cluster_gov->pred_wakeup))
+		return 0;
+
+	if (!cluster_gov->is_timer_expired)
+		clusttimer_cancel(cluster_gov);
+
+	if (idx != genpd->state_count - 1)
+		residency = genpd->states[idx + 1].residency_ns;
+	else
+		residency = genpd->states[idx].residency_ns;
+
+	clusttimer_start(cluster_gov, residency + PRED_TIMER_ADD * NSEC_PER_USEC);
+	cluster_gov->is_timer_expired = false;
+
+	return 0;
 }
 
 /**
@@ -286,7 +365,7 @@ static int cluster_power_cb(struct notifier_block *nb,
 	struct generic_pm_domain *pd = cluster_gov->genpd;
 	struct genpd_power_state *state = &pd->states[pd->state_idx];
 	struct lpm_cpu *cpu_gov;
-	int cpu;
+	int cpu, ret;
 	u32 *suspend_param = state->data;
 
 	switch (action) {
@@ -301,6 +380,12 @@ static int cluster_power_cb(struct notifier_block *nb,
 		cluster_predict(cluster_gov);
 		break;
 	case GENPD_NOTIFY_PRE_OFF:
+		if (!pd->gd)
+			return NOTIFY_BAD;
+
+		if (!cpumask_intersects(cluster_gov->genpd->cpus, cpu_online_mask))
+			return NOTIFY_OK;
+
 		if (!cluster_gov->state_allowed[pd->state_idx])
 			return NOTIFY_BAD;
 
@@ -319,7 +404,14 @@ static int cluster_power_cb(struct notifier_block *nb,
 		}
 
 		cluster_gov->now = ktime_get();
-		cluster_power_down(cluster_gov);
+		ret = cluster_power_down(cluster_gov);
+		if (ret)
+			return NOTIFY_BAD;
+
+		if (cluster_gov->restrict_idx != -1 &&
+		    pd->state_idx >= cluster_gov->restrict_idx)
+			return NOTIFY_BAD;
+
 		break;
 	case GENPD_NOTIFY_OFF:
 		trace_cluster_enter(raw_smp_processor_id(), pd->state_idx, *suspend_param);
@@ -344,7 +436,7 @@ ktime_t get_cluster_sleep_time(struct lpm_cluster *cluster_gov)
 
 	next_wakeup = KTIME_MAX;
 	for_each_cpu_and(cpu, genpd->cpus, cpu_online_mask) {
-		next_cpu_wakeup = cluster_gov->cpu_next_wakeup[cpu];
+		next_cpu_wakeup = per_cpu(cpu_next_wakeup, cpu);
 		if (ktime_before(next_cpu_wakeup, next_wakeup))
 			next_wakeup = next_cpu_wakeup;
 	}
@@ -362,14 +454,36 @@ ktime_t get_cluster_sleep_time(struct lpm_cluster *cluster_gov)
 static void update_cluster_next_wakeup(struct lpm_cluster *cluster_gov)
 {
 	cluster_gov->next_wakeup = get_cluster_sleep_time(cluster_gov);
-	if (cluster_gov->pred_wakeup) {
-		if (ktime_before(cluster_gov->pred_wakeup,
-				cluster_gov->next_wakeup))
-			cluster_gov->next_wakeup = cluster_gov->pred_wakeup;
-	}
 
-	dev_pm_genpd_set_next_wakeup(cluster_gov->dev,
-				     cluster_gov->next_wakeup);
+	if (ktime_before(cluster_gov->next_wakeup, ktime_get()))
+		cluster_gov->next_wakeup = KTIME_MAX;
+
+	dev_pm_genpd_set_next_wakeup(cluster_gov->dev, cluster_gov->next_wakeup);
+}
+
+/**
+ * cluster_gov_reflect() - This will be called when cpu exiting lpm to update
+ *			   its cluster governor.
+ * @cpu_gov: CPU's lpm data structure.
+ */
+static void cluster_gov_reflect(struct lpm_cpu *cpu_gov)
+{
+	struct generic_pm_domain *genpd;
+	struct lpm_cluster *cluster_gov;
+	int cpu = cpu_gov->cpu;
+
+	list_for_each_entry(cluster_gov, &cluster_dev_list, list) {
+		if (!cluster_gov->initialized)
+			continue;
+
+		genpd = cluster_gov->genpd;
+		if (cpumask_test_cpu(cpu, genpd->cpus)) {
+			spin_lock(&cluster_gov->lock);
+			if (cluster_gov->is_timer_queued)
+				cluster_gov->need_timer_requeue = true;
+			spin_unlock(&cluster_gov->lock);
+		}
+	}
 }
 
 /**
@@ -377,7 +491,7 @@ static void update_cluster_next_wakeup(struct lpm_cluster *cluster_gov)
  *			   its next wakeup value to corresponding cluster domain device.
  * @cpu_gov: CPU's lpm data structure.
  */
-void update_cluster_select(struct lpm_cpu *cpu_gov)
+static void update_cluster_select(struct lpm_cpu *cpu_gov)
 {
 	struct generic_pm_domain *genpd;
 	struct lpm_cluster *cluster_gov;
@@ -391,13 +505,14 @@ void update_cluster_select(struct lpm_cpu *cpu_gov)
 		if (cpumask_test_cpu(cpu, genpd->cpus)) {
 			spin_lock(&cluster_gov->lock);
 			cluster_gov->now = cpu_gov->now;
-			cluster_gov->cpu_next_wakeup[cpu] = cpu_gov->next_wakeup;
+			per_cpu(cpu_next_wakeup, cpu) = cpu_gov->next_wakeup;
 			update_cluster_next_wakeup(cluster_gov);
 			spin_unlock(&cluster_gov->lock);
 		}
 	}
 }
 
+#if defined(_TRACE_HOOK_PM_DOMAIN_H)
 static void android_vh_allow_domain_state(void *unused,
 					  struct generic_pm_domain *genpd,
 					  uint32_t idx, bool *allow)
@@ -409,6 +524,28 @@ static void android_vh_allow_domain_state(void *unused,
 
 	*allow = cluster_gov->state_allowed[idx];
 }
+#endif
+
+static void cluster_gov_disable(void)
+{
+#if defined(_TRACE_HOOK_PM_DOMAIN_H)
+	unregister_trace_android_vh_allow_domain_state(android_vh_allow_domain_state, NULL);
+#endif
+}
+
+static void cluster_gov_enable(void)
+{
+#if defined(_TRACE_HOOK_PM_DOMAIN_H)
+	register_trace_android_vh_allow_domain_state(android_vh_allow_domain_state, NULL);
+#endif
+}
+
+struct cluster_governor gov_ops = {
+	.select = update_cluster_select,
+	.enable = cluster_gov_enable,
+	.disable = cluster_gov_disable,
+	.reflect = cluster_gov_reflect,
+};
 
 static int lpm_cluster_gov_remove(struct platform_device *pdev)
 {
@@ -422,16 +559,16 @@ static int lpm_cluster_gov_remove(struct platform_device *pdev)
 	cluster_gov->genpd->flags &= ~GENPD_FLAG_MIN_RESIDENCY;
 	remove_cluster_sysfs_nodes(cluster_gov);
 	dev_pm_genpd_remove_notifier(cluster_gov->dev);
-	list_del(&cluster_gov->list);
 
 	return 0;
 }
 
 static int lpm_cluster_gov_probe(struct platform_device *pdev)
 {
-	int ret;
-	int i;
+	struct device_node *dn = pdev->dev.of_node;
 	struct lpm_cluster *cluster_gov;
+	static bool gov_ops_registered;
+	int ret, i;
 
 	cluster_gov = devm_kzalloc(&pdev->dev,
 				   sizeof(struct lpm_cluster),
@@ -439,9 +576,25 @@ static int lpm_cluster_gov_probe(struct platform_device *pdev)
 	if (!cluster_gov)
 		return -ENOMEM;
 
+	ret = of_property_read_u32(dn, "qcom,pred-prem-cnt",
+				   &cluster_gov->pred_premature_cnt);
+	if (ret)
+		cluster_gov->pred_premature_cnt = PRED_PREMATURE_CNT;
+
+	ret = of_property_read_u32(dn, "qcom,sample-invalid-time",
+				   &cluster_gov->samples_invalid_time);
+	if (ret)
+		cluster_gov->samples_invalid_time = CLUST_SMPL_INVLD_TIME;
+
+	cluster_gov->use_bias_timer = of_property_read_bool(dn,
+					"qcom,use-cluster-bias-timer");
+
 	spin_lock_init(&cluster_gov->lock);
 	cluster_gov->dev = &pdev->dev;
 	cluster_gov->pred_wakeup = KTIME_MAX;
+	cluster_gov->pred_residency = 0;
+	cluster_gov->predicted = false;
+	cluster_gov->restrict_idx = -1;
 	pm_runtime_enable(&pdev->dev);
 	hrtimer_init(&cluster_gov->histtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	cluster_gov->genpd = pd_to_genpd(cluster_gov->dev->pm_domain);
@@ -465,6 +618,11 @@ static int lpm_cluster_gov_probe(struct platform_device *pdev)
 	for (i = 0; i < cluster_gov->genpd->state_count; i++)
 		cluster_gov->state_allowed[i] = true;
 
+	if (!gov_ops_registered) {
+		register_cluster_governor_ops(&gov_ops);
+		gov_ops_registered = true;
+	}
+
 	return 0;
 }
 
@@ -483,36 +641,12 @@ static struct platform_driver qcom_cluster_lpm_driver = {
 	},
 };
 
-static void cluster_gov_disable(void)
-{
-#if defined(_TRACE_HOOK_PM_DOMAIN_H)
-	unregister_trace_android_vh_allow_domain_state(android_vh_allow_domain_state, NULL);
-#endif
-	platform_driver_unregister(&qcom_cluster_lpm_driver);
-}
-
-static void cluster_gov_enable(void)
-{
-#if defined(_TRACE_HOOK_PM_DOMAIN_H)
-	register_trace_android_vh_allow_domain_state(android_vh_allow_domain_state, NULL);
-#endif
-	platform_driver_register(&qcom_cluster_lpm_driver);
-}
-
-struct cluster_governor gov_ops = {
-	.select = update_cluster_select,
-	.enable = cluster_gov_enable,
-	.disable = cluster_gov_disable,
-};
-
 void qcom_cluster_lpm_governor_deinit(void)
 {
-	unregister_cluster_governor_ops(&gov_ops);
+	 platform_driver_unregister(&qcom_cluster_lpm_driver);
 }
 
 int qcom_cluster_lpm_governor_init(void)
 {
-	register_cluster_governor_ops(&gov_ops);
-
-	return 0;
+	return platform_driver_register(&qcom_cluster_lpm_driver);
 }

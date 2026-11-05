@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  *
  */
 
@@ -1650,6 +1650,8 @@ static struct qcom_icc_node qns_mem_noc_hf = {
 	.id = SLAVE_MNOC_HF_MEM_NOC,
 	.channels = 2,
 	.buswidth = 32,
+	.init_peak = INT_MAX,
+	.init_avg  = INT_MAX,
 	.noc_ops = &qcom_qnoc4_ops,
 	.num_links = 1,
 	.links = { MASTER_MNOC_HF_MEM_NOC },
@@ -1844,7 +1846,6 @@ static struct qcom_icc_bcm bcm_mc0 = {
 static struct qcom_icc_bcm bcm_mm0 = {
 	.name = "MM0",
 	.voter_idx = 0,
-	.keepalive_early = true,
 	.num_nodes = 1,
 	.nodes = { &qns_mem_noc_hf },
 };
@@ -2406,7 +2407,7 @@ static int qnoc_probe(struct platform_device *pdev)
 
 	ret = qcom_icc_rpmh_probe(pdev);
 	if (ret)
-		dev_err(&pdev->dev, "failed to register ICC provider\n");
+		dev_err_probe(&pdev->dev, ret, "failed to register ICC provider\n");
 	else
 		dev_err(&pdev->dev, "Registered RAVELIN ICC\n");
 
@@ -2448,7 +2449,7 @@ static struct platform_driver qnoc_driver = {
 	.driver = {
 		.name = "qnoc-ravelin",
 		.of_match_table = qnoc_of_match,
-		.sync_state = qcom_icc_rpmh_sync_state,
+		.sync_state = icc_sync_state,
 	},
 };
 
@@ -2459,4 +2460,4 @@ static int __init qnoc_driver_init(void)
 core_initcall(qnoc_driver_init);
 
 MODULE_DESCRIPTION("Ravelin NoC driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

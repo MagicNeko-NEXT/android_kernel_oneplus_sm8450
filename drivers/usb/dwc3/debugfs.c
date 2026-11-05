@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/**
+/*
  * debugfs.c - DesignWare USB3 DRD Controller DebugFS file
  *
  * Copyright (C) 2010-2011 Texas Instruments Incorporated - https://www.ti.com
@@ -88,6 +88,9 @@ static const struct debugfs_reg32 dwc3_regs[] = {
 	dump_register(GPRTBIMAP_HS1),
 	dump_register(GPRTBIMAP_FS0),
 	dump_register(GPRTBIMAP_FS1),
+	dump_register(GUCTL2),
+	dump_register(VER_NUMBER),
+	dump_register(VER_TYPE),
 
 	dump_register(GUSB2PHYCFG(0)),
 	dump_register(GUSB2PHYCFG(1)),
@@ -229,6 +232,8 @@ static const struct debugfs_reg32 dwc3_regs[] = {
 	dump_register(GEVNTCOUNT(0)),
 
 	dump_register(GHWPARAMS8),
+	dump_register(GUCTL3),
+	dump_register(GFLADJ),
 	dump_register(DCFG),
 	dump_register(DCTL),
 	dump_register(DEVTEN),
@@ -397,6 +402,7 @@ static int dwc3_mode_show(struct seq_file *s, void *unused)
 	struct dwc3		*dwc = s->private;
 	unsigned long		flags;
 	u32			reg;
+	u32			mode;
 	int			ret;
 
 	ret = pm_runtime_resume_and_get(dwc->dev);
@@ -407,18 +413,15 @@ static int dwc3_mode_show(struct seq_file *s, void *unused)
 	reg = dwc3_readl(dwc->regs, DWC3_GCTL);
 	spin_unlock_irqrestore(&dwc->lock, flags);
 
-	switch (DWC3_GCTL_PRTCAP(reg)) {
+	mode = DWC3_GCTL_PRTCAP(reg);
+	switch (mode) {
 	case DWC3_GCTL_PRTCAP_HOST:
-		seq_puts(s, "host\n");
-		break;
 	case DWC3_GCTL_PRTCAP_DEVICE:
-		seq_puts(s, "device\n");
-		break;
 	case DWC3_GCTL_PRTCAP_OTG:
-		seq_puts(s, "otg\n");
+		seq_printf(s, "%s\n", dwc3_mode_string(mode));
 		break;
 	default:
-		seq_printf(s, "UNKNOWN %08x\n", DWC3_GCTL_PRTCAP(reg));
+		seq_printf(s, "UNKNOWN %08x\n", mode);
 	}
 
 	pm_runtime_put_sync(dwc->dev);
@@ -981,25 +984,23 @@ static const struct dwc3_ep_file_map dwc3_ep_file_map[] = {
 	{ "GDBGEPINFO", &dwc3_ep_info_register_fops, },
 };
 
-static void dwc3_debugfs_create_endpoint_files(struct dwc3_ep *dep,
-		struct dentry *parent)
+void dwc3_debugfs_create_endpoint_dir(struct dwc3_ep *dep)
 {
+	struct dentry		*dir;
 	int			i;
 
+	dir = debugfs_create_dir(dep->name, dep->dwc->debug_root);
 	for (i = 0; i < ARRAY_SIZE(dwc3_ep_file_map); i++) {
 		const struct file_operations *fops = dwc3_ep_file_map[i].fops;
 		const char *name = dwc3_ep_file_map[i].name;
 
-		debugfs_create_file(name, 0444, parent, dep, fops);
+		debugfs_create_file(name, 0444, dir, dep, fops);
 	}
 }
 
-void dwc3_debugfs_create_endpoint_dir(struct dwc3_ep *dep)
+void dwc3_debugfs_remove_endpoint_dir(struct dwc3_ep *dep)
 {
-	struct dentry		*dir;
-
-	dir = debugfs_create_dir(dep->name, dep->dwc->root);
-	dwc3_debugfs_create_endpoint_files(dep, dir);
+	debugfs_lookup_and_remove(dep->name, dep->dwc->debug_root);
 }
 
 void dwc3_debugfs_init(struct dwc3 *dwc)
@@ -1018,8 +1019,7 @@ void dwc3_debugfs_init(struct dwc3 *dwc)
 	dwc->regset->dev = dwc->dev;
 
 	root = debugfs_create_dir(dev_name(dwc->dev), usb_debug_root);
-	dwc->root = root;
-
+	dwc->debug_root = root;
 	debugfs_create_regset32("regdump", 0444, root, dwc->regset);
 	debugfs_create_file("lsp_dump", 0644, root, dwc, &dwc3_lsp_fops);
 
@@ -1038,6 +1038,6 @@ void dwc3_debugfs_init(struct dwc3 *dwc)
 
 void dwc3_debugfs_exit(struct dwc3 *dwc)
 {
-	debugfs_remove_recursive(dwc->root);
+	debugfs_lookup_and_remove(dev_name(dwc->dev), usb_debug_root);
 	kfree(dwc->regset);
 }

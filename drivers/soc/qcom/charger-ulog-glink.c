@@ -14,7 +14,7 @@
 #include <linux/platform_device.h>
 #include <linux/rpmsg.h>
 #include <linux/slab.h>
-#include <linux/soc/qcom/pmic_glink.h>
+#include <linux/soc/qcom/qti_pmic_glink.h>
 
 #define MSG_OWNER_CHG_ULOG		32778
 #define MSG_TYPE_REQ_RESP		1
@@ -405,7 +405,7 @@ static int chg_ulog_probe(struct platform_device *pdev)
 	cd->client = pmic_glink_register_client(cd->dev, &client_data);
 	if (IS_ERR(cd->client))
 		return dev_err_probe(cd->dev, PTR_ERR(cd->client),
-				"Error in registering with pmic_glink %d\n");
+				"Error in registering with pmic_glink\n");
 
 	rc = chg_ulog_add_debugfs(cd);
 	if (rc) {
@@ -466,4 +466,4 @@ static struct platform_driver chg_ulog_driver = {
 module_platform_driver(chg_ulog_driver);
 
 MODULE_DESCRIPTION("QTI charger ulog glink driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

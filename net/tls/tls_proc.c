@@ -6,7 +6,9 @@
 #include <net/snmp.h>
 #include <net/tls.h>
 
-#ifdef CONFIG_PROC_FS
+#include "tls.h"
+
+#if defined(CONFIG_PROC_FS) && defined(CONFIG_TLS_STATS)
 static const struct snmp_mib tls_mib_list[] = {
 	SNMP_MIB_ITEM("TlsCurrTxSw", LINUX_MIB_TLSCURRTXSW),
 	SNMP_MIB_ITEM("TlsCurrRxSw", LINUX_MIB_TLSCURRRXSW),
@@ -18,6 +20,8 @@ static const struct snmp_mib tls_mib_list[] = {
 	SNMP_MIB_ITEM("TlsRxDevice", LINUX_MIB_TLSRXDEVICE),
 	SNMP_MIB_ITEM("TlsDecryptError", LINUX_MIB_TLSDECRYPTERROR),
 	SNMP_MIB_ITEM("TlsRxDeviceResync", LINUX_MIB_TLSRXDEVICERESYNC),
+	SNMP_MIB_ITEM("TlsDecryptRetry", LINUX_MIB_TLSDECRYPTRETRY),
+	SNMP_MIB_ITEM("TlsRxNoPadViolation", LINUX_MIB_TLSRXNOPADVIOL),
 	SNMP_MIB_SENTINEL
 };
 
@@ -37,16 +41,18 @@ static int tls_statistics_seq_show(struct seq_file *seq, void *v)
 
 int __net_init tls_proc_init(struct net *net)
 {
-#ifdef CONFIG_PROC_FS
+#if defined(CONFIG_PROC_FS) && defined(CONFIG_TLS_STATS)
 	if (!proc_create_net_single("tls_stat", 0444, net->proc_net,
 				    tls_statistics_seq_show, NULL))
 		return -ENOMEM;
-#endif /* CONFIG_PROC_FS */
+#endif /* CONFIG_PROC_FS && CONFIG_TLS_STATS */
 
 	return 0;
 }
 
 void __net_exit tls_proc_fini(struct net *net)
 {
+#if defined(CONFIG_PROC_FS) && defined(CONFIG_TLS_STATS)
 	remove_proc_entry("tls_stat", net->proc_net);
+#endif /* CONFIG_PROC_FS && CONFIG_TLS_STATS */
 }

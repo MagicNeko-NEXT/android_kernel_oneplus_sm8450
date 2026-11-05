@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2015-2019, 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/dma-map-ops.h>
@@ -477,4 +478,4 @@ void msm_dma_buf_freed(void *buffer)
 }
 EXPORT_SYMBOL(msm_dma_buf_freed);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

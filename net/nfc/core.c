@@ -189,7 +189,8 @@ static const struct rfkill_ops nfc_rfkill_ops = {
  * nfc_start_poll - start polling for nfc targets
  *
  * @dev: The nfc device that must start polling
- * @protocols: bitset of nfc protocols that must be used for polling
+ * @im_protocols: bitset of nfc initiator protocols to be used for polling
+ * @tm_protocols: bitset of nfc transport protocols to be used for polling
  *
  * The device remains polling for targets until a target is found or
  * the nfc_stop_poll function is called.
@@ -436,6 +437,7 @@ error:
  *
  * @dev: The nfc device that found the target
  * @target_idx: index of the target that must be deactivated
+ * @mode: idle or sleep?
  */
 int nfc_deactivate_target(struct nfc_dev *dev, u32 target_idx, u8 mode)
 {
@@ -703,7 +705,11 @@ EXPORT_SYMBOL(nfc_tm_deactivated);
 /**
  * nfc_alloc_send_skb - allocate a skb for data exchange responses
  *
+ * @dev: device sending the response
+ * @sk: socket sending the response
+ * @flags: MSG_DONTWAIT flag
  * @size: size to allocate
+ * @err: pointer to memory to store the error code
  */
 struct sk_buff *nfc_alloc_send_skb(struct nfc_dev *dev, struct sock *sk,
 				   unsigned int flags, unsigned int size,
@@ -818,7 +824,7 @@ EXPORT_SYMBOL(nfc_targets_found);
  */
 int nfc_target_lost(struct nfc_dev *dev, u32 target_idx)
 {
-	struct nfc_target *tg;
+	const struct nfc_target *tg;
 	int i;
 
 	pr_debug("dev_name %s n_target %d\n", dev_name(&dev->dev), target_idx);
@@ -969,7 +975,7 @@ static void nfc_release(struct device *d)
 			kfree(se);
 	}
 
-	ida_simple_remove(&nfc_index_ida, dev->idx);
+	ida_free(&nfc_index_ida, dev->idx);
 
 	kfree(dev);
 }
@@ -1039,8 +1045,10 @@ struct nfc_dev *nfc_get_device(unsigned int idx)
  *
  * @ops: device operations
  * @supported_protocols: NFC protocols supported by the device
+ * @tx_headroom: reserved space at beginning of skb
+ * @tx_tailroom: reserved space at end of skb
  */
-struct nfc_dev *nfc_allocate_device(struct nfc_ops *ops,
+struct nfc_dev *nfc_allocate_device(const struct nfc_ops *ops,
 				    u32 supported_protocols,
 				    int tx_headroom, int tx_tailroom)
 {
@@ -1058,7 +1066,7 @@ struct nfc_dev *nfc_allocate_device(struct nfc_ops *ops,
 	if (!dev)
 		return NULL;
 
-	rc = ida_simple_get(&nfc_index_ida, 0, 0, GFP_KERNEL);
+	rc = ida_alloc(&nfc_index_ida, GFP_KERNEL);
 	if (rc < 0)
 		goto err_free_dev;
 	dev->idx = rc;
@@ -1139,12 +1147,13 @@ int nfc_register_device(struct nfc_dev *dev)
 EXPORT_SYMBOL(nfc_register_device);
 
 /**
- * nfc_unregister_device - unregister a nfc device in the nfc subsystem
+ * nfc_unregister_rfkill - unregister a nfc device in the rfkill subsystem
  *
  * @dev: The nfc device to unregister
  */
-void nfc_unregister_device(struct nfc_dev *dev)
+void nfc_unregister_rfkill(struct nfc_dev *dev)
 {
+	struct rfkill *rfk = NULL;
 	int rc;
 
 	pr_debug("dev_name=%s\n", dev_name(&dev->dev));
@@ -1156,13 +1165,26 @@ void nfc_unregister_device(struct nfc_dev *dev)
 
 	device_lock(&dev->dev);
 	if (dev->rfkill) {
-		rfkill_unregister(dev->rfkill);
-		rfkill_destroy(dev->rfkill);
+		rfk = dev->rfkill;
 		dev->rfkill = NULL;
 	}
 	dev->shutting_down = true;
 	device_unlock(&dev->dev);
 
+	if (rfk) {
+		rfkill_unregister(rfk);
+		rfkill_destroy(rfk);
+	}
+}
+EXPORT_SYMBOL(nfc_unregister_rfkill);
+
+/**
+ * nfc_remove_device - remove a nfc device in the nfc subsystem
+ *
+ * @dev: The nfc device to remove
+ */
+void nfc_remove_device(struct nfc_dev *dev)
+{
 	if (dev->ops->check_presence) {
 		del_timer_sync(&dev->check_pres_timer);
 		cancel_work_sync(&dev->check_pres_work);
@@ -1174,6 +1196,18 @@ void nfc_unregister_device(struct nfc_dev *dev)
 	nfc_devlist_generation++;
 	device_del(&dev->dev);
 	mutex_unlock(&nfc_devlist_mutex);
+}
+EXPORT_SYMBOL(nfc_remove_device);
+
+/**
+ * nfc_unregister_device - unregister a nfc device in the nfc subsystem
+ *
+ * @dev: The nfc device to unregister
+ */
+void nfc_unregister_device(struct nfc_dev *dev)
+{
+	nfc_unregister_rfkill(dev);
+	nfc_remove_device(dev);
 }
 EXPORT_SYMBOL(nfc_unregister_device);
 

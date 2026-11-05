@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2017-2020 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2017-2021 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "QCOM-BATT: %s: " fmt, __func__
@@ -148,24 +149,26 @@ enum {
 	PARALLEL_OUTPUT_MODE,
 };
 
+/* CP Channels */
 static const char * const bat_cp_ext_iio_chan[] = {
-	[BAT_CP_PARALLEL_MODE] = "parallel_mode",
-	[BAT_CP_PARALLEL_OUTPUT_MODE] = "parallel_output_mode",
-	[BAT_CP_MIN_ICL] = "min_icl",
+	[BAT_CP_PARALLEL_MODE] = "cp_parallel_mode",
+	[BAT_CP_PARALLEL_OUTPUT_MODE] = "cp_parallel_output_mode",
+	[BAT_CP_MIN_ICL] = "cp_min_icl",
 	[BAT_CP_SWITCHER_EN] = "cp_switcher_en",
 };
 
+/* SMB1355 Channels */
 static const char * const bat_smb_parallel_ext_iio_chan[] = {
-	[BAT_SMB_PARALLEL_INPUT_SUSPEND] = "input_suspend",
-	[BAT_SMB_PARALLEL_MODE] = "parallel_mode",
-	[BAT_SMB_PARALLEL_BATFET_MODE] = "parallel_batfet_mode",
-	[BAT_SMB_PARALLEL_MIN_ICL] = "min_icl",
-	[BAT_SMB_PARALLEL_FCC_MAX] = "parallel_fcc_max",
-	[BAT_SMB_PARALLEL_CURRENT_MAX] = "current_max",
+	[BAT_SMB_PARALLEL_INPUT_SUSPEND] = "pl_input_suspend",
+	[BAT_SMB_PARALLEL_MODE] = "pl_mode",
+	[BAT_SMB_PARALLEL_BATFET_MODE] = "pl_batfet_mode",
+	[BAT_SMB_PARALLEL_MIN_ICL] = "pl_min_icl",
+	[BAT_SMB_PARALLEL_FCC_MAX] = "pl_fcc_max",
+	[BAT_SMB_PARALLEL_CURRENT_MAX] = "pl_current_max",
 	[BAT_SMB_PARALLEL_CONSTANT_CHARGE_CURRENT_MAX] =
-			"constant_charge_current_max",
-	[BAT_SMB_PARALLEL_VOLTAGE_MAX] = "voltage_max",
-	[BAT_SMB_PARALLEL_CHARGE_TYPE] = "charge_type",
+			"pl_constant_charge_current_max",
+	[BAT_SMB_PARALLEL_VOLTAGE_MAX] = "pl_voltage_max",
+	[BAT_SMB_PARALLEL_CHARGE_TYPE] = "pl_charge_type",
 };
 
 /*********
@@ -553,7 +556,7 @@ static void split_settled(struct pl_data *chip)
 	chip->pl_settled_ua = slave_ua;
 }
 
-static ssize_t version_show(struct class *c, struct class_attribute *attr,
+static ssize_t version_show(const struct class *c, const struct class_attribute *attr,
 			char *buf)
 {
 	return scnprintf(buf, PAGE_SIZE, "%d.%d\n",
@@ -564,7 +567,7 @@ static CLASS_ATTR_RO(version);
 /*************
  * SLAVE PCT *
  **************/
-static ssize_t slave_pct_show(struct class *c, struct class_attribute *attr,
+static ssize_t slave_pct_show(const struct class *c, const struct class_attribute *attr,
 			char *ubuf)
 {
 	struct pl_data *chip = container_of(c, struct pl_data,
@@ -573,7 +576,7 @@ static ssize_t slave_pct_show(struct class *c, struct class_attribute *attr,
 	return scnprintf(ubuf, PAGE_SIZE, "%d\n", chip->slave_pct);
 }
 
-static ssize_t slave_pct_store(struct class *c, struct class_attribute *attr,
+static ssize_t slave_pct_store(const struct class *c, const struct class_attribute *attr,
 			const char *ubuf, size_t count)
 {
 	struct pl_data *chip = container_of(c, struct pl_data, qcom_batt_class);
@@ -604,7 +607,7 @@ static struct class_attribute class_attr_slave_pct =
 /************************
  * RESTRICTED CHARGIGNG *
  ************************/
-static ssize_t restrict_chg_show(struct class *c, struct class_attribute *attr,
+static ssize_t restrict_chg_show(const struct class *c, const struct class_attribute *attr,
 		char *ubuf)
 {
 	struct pl_data *chip = container_of(c, struct pl_data,
@@ -614,7 +617,7 @@ static ssize_t restrict_chg_show(struct class *c, struct class_attribute *attr,
 			chip->restricted_charging_enabled);
 }
 
-static ssize_t restrict_chg_store(struct class *c, struct class_attribute *attr,
+static ssize_t restrict_chg_store(const struct class *c, const struct class_attribute *attr,
 			const char *ubuf, size_t count)
 {
 	struct pl_data *chip = container_of(c, struct pl_data,
@@ -642,7 +645,7 @@ no_change:
 }
 static CLASS_ATTR_RW(restrict_chg);
 
-static ssize_t restrict_cur_show(struct class *c, struct class_attribute *attr,
+static ssize_t restrict_cur_show(const struct class *c, const struct class_attribute *attr,
 			char *ubuf)
 {
 	struct pl_data *chip = container_of(c, struct pl_data,
@@ -651,7 +654,7 @@ static ssize_t restrict_cur_show(struct class *c, struct class_attribute *attr,
 	return scnprintf(ubuf, PAGE_SIZE, "%d\n", chip->restricted_current);
 }
 
-static ssize_t restrict_cur_store(struct class *c, struct class_attribute *attr,
+static ssize_t restrict_cur_store(const struct class *c, const struct class_attribute *attr,
 			const char *ubuf, size_t count)
 {
 	struct pl_data *chip = container_of(c, struct pl_data,
@@ -674,8 +677,8 @@ static CLASS_ATTR_RW(restrict_cur);
 /****************************
  * FCC STEPPING IN PROGRESS *
  ****************************/
-static ssize_t fcc_stepping_in_progress_show(struct class *c,
-				struct class_attribute *attr, char *ubuf)
+static ssize_t fcc_stepping_in_progress_show(const struct class *c,
+				const struct class_attribute *attr, char *ubuf)
 {
 	struct pl_data *chip = container_of(c, struct pl_data,
 			qcom_batt_class);
@@ -711,9 +714,9 @@ static void get_fcc_split(struct pl_data *chip, int total_ua,
 	if (rc < 0) {
 		pr_err("Couldn't get fcc_delta rc=%d\n", rc);
 		hw_cc_delta_ua = 0;
-	}
-	else
+	} else {
 		hw_cc_delta_ua = val;
+	}
 
 	bcl_ua = INT_MAX;
 	if (chip->pl_mode == QTI_POWER_SUPPLY_PL_USBMID_USBMID) {
@@ -1167,7 +1170,8 @@ static void fcc_stepper_work(struct work_struct *work)
 		chip->main_step_fcc_count--;
 		reschedule_ms = chip->chg_param->fcc_step_delay_ms;
 	} else if (chip->main_step_fcc_residual) {
-		main_fcc += chip->main_step_fcc_residual;
+		main_fcc += chip->main_step_fcc_residual
+					* chip->main_step_fcc_dir;
 		chip->main_step_fcc_residual = 0;
 	}
 
@@ -2044,7 +2048,6 @@ static void pl_config_init(struct pl_data *chip, int smb_version)
 
 static void qcom_batt_create_debugfs(struct pl_data *chip)
 {
-	struct dentry *entry;
 
 	chip->dfs_root = debugfs_create_dir("battery", NULL);
 	if (IS_ERR_OR_NULL(chip->dfs_root)) {
@@ -2053,11 +2056,8 @@ static void qcom_batt_create_debugfs(struct pl_data *chip)
 		return;
 	}
 
-	entry = debugfs_create_u32("debug_mask", 0600, chip->dfs_root,
+	debugfs_create_u32("debug_mask", 0600, chip->dfs_root,
 			&debug_mask);
-	if (IS_ERR_OR_NULL(entry))
-		pr_err("Couldn't create force_dc_psy_update file rc=%ld\n",
-			(long)entry);
 }
 
 #define DEFAULT_RESTRICTED_CURRENT_UA	1000000
@@ -2186,8 +2186,7 @@ int qcom_batt_init(struct device *dev, struct charger_param *chg_param)
 
 	chip->pl_disable = true;
 	chip->cp_disabled = true;
-	chip->qcom_batt_class.name = "qcom-battery",
-	chip->qcom_batt_class.owner = THIS_MODULE,
+	chip->qcom_batt_class.name = "qcom-battery";
 	chip->qcom_batt_class.class_groups = batt_class_groups;
 
 	rc = class_register(&chip->qcom_batt_class);

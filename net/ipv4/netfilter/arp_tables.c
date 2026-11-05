@@ -110,13 +110,25 @@ static inline int arp_packet_match(const struct arphdr *arphdr,
 	arpptr += dev->addr_len;
 	memcpy(&src_ipaddr, arpptr, sizeof(u32));
 	arpptr += sizeof(u32);
-	tgt_devaddr = arpptr;
-	arpptr += dev->addr_len;
+
+	if (IS_ENABLED(CONFIG_FIREWIRE_NET) && dev->type == ARPHRD_IEEE1394) {
+		if (unlikely(memchr_inv(arpinfo->tgt_devaddr.mask, 0,
+					sizeof(arpinfo->tgt_devaddr.mask))))
+			return 0;
+
+		tgt_devaddr = NULL;
+	} else {
+		tgt_devaddr = arpptr;
+		arpptr += dev->addr_len;
+	}
 	memcpy(&tgt_ipaddr, arpptr, sizeof(u32));
 
 	if (NF_INVF(arpinfo, ARPT_INV_SRCDEVADDR,
 		    arp_devaddr_compare(&arpinfo->src_devaddr, src_devaddr,
-					dev->addr_len)) ||
+					dev->addr_len)))
+		return 0;
+
+	if (tgt_devaddr &&
 	    NF_INVF(arpinfo, ARPT_INV_TGTDEVADDR,
 		    arp_devaddr_compare(&arpinfo->tgt_devaddr, tgt_devaddr,
 					dev->addr_len)))
@@ -179,10 +191,11 @@ struct arpt_entry *arpt_next_entry(const struct arpt_entry *entry)
 	return (void *)entry + entry->next_offset;
 }
 
-unsigned int arpt_do_table(struct sk_buff *skb,
-			   const struct nf_hook_state *state,
-			   struct xt_table *table)
+unsigned int arpt_do_table(void *priv,
+			   struct sk_buff *skb,
+			   const struct nf_hook_state *state)
 {
+	const struct xt_table *table = priv;
 	unsigned int hook = state->hook;
 	static const char nulldevname[IFNAMSIZ] __attribute__((aligned(sizeof(long))));
 	unsigned int verdict = NF_DROP;
@@ -689,14 +702,12 @@ static int copy_entries_to_user(unsigned int total_size,
 		const struct xt_entry_target *t;
 
 		e = loc_cpu_entry + off;
-		if (copy_to_user(userptr + off, e, sizeof(*e))) {
-			ret = -EFAULT;
-			goto free_counters;
-		}
-		if (copy_to_user(userptr + off
+		if (copy_to_user(userptr + off, e,
+				 offsetof(struct arpt_entry, counters)) ||
+		    copy_to_user(userptr + off
 				 + offsetof(struct arpt_entry, counters),
 				 &counters[num],
-				 sizeof(counters[num])) != 0) {
+				 sizeof(counters[num]))) {
 			ret = -EFAULT;
 			goto free_counters;
 		}
@@ -713,7 +724,7 @@ static int copy_entries_to_user(unsigned int total_size,
 	return ret;
 }
 
-#ifdef CONFIG_COMPAT
+#ifdef CONFIG_NETFILTER_XTABLES_COMPAT
 static void compat_standard_from_user(void *dst, const void *src)
 {
 	int v = *(compat_int_t *)src;
@@ -800,7 +811,7 @@ static int get_info(struct net *net, void __user *user, const int *len)
 		return -EFAULT;
 
 	name[XT_TABLE_MAXNAMELEN-1] = '\0';
-#ifdef CONFIG_COMPAT
+#ifdef CONFIG_NETFILTER_XTABLES_COMPAT
 	if (in_compat_syscall())
 		xt_compat_lock(NFPROTO_ARP);
 #endif
@@ -808,7 +819,7 @@ static int get_info(struct net *net, void __user *user, const int *len)
 	if (!IS_ERR(t)) {
 		struct arpt_getinfo info;
 		const struct xt_table_info *private = t->private;
-#ifdef CONFIG_COMPAT
+#ifdef CONFIG_NETFILTER_XTABLES_COMPAT
 		struct xt_table_info tmp;
 
 		if (in_compat_syscall()) {
@@ -835,7 +846,7 @@ static int get_info(struct net *net, void __user *user, const int *len)
 		module_put(t->me);
 	} else
 		ret = PTR_ERR(t);
-#ifdef CONFIG_COMPAT
+#ifdef CONFIG_NETFILTER_XTABLES_COMPAT
 	if (in_compat_syscall())
 		xt_compat_unlock(NFPROTO_ARP);
 #endif
@@ -1048,7 +1059,7 @@ static int do_add_counters(struct net *net, sockptr_t arg, unsigned int len)
 	return ret;
 }
 
-#ifdef CONFIG_COMPAT
+#ifdef CONFIG_NETFILTER_XTABLES_COMPAT
 struct compat_arpt_replace {
 	char				name[XT_TABLE_MAXNAMELEN];
 	u32				valid_hooks;
@@ -1314,9 +1325,8 @@ static int compat_copy_entry_to_user(struct arpt_entry *e, void __user **dstptr,
 
 	origsize = *size;
 	ce = *dstptr;
-	if (copy_to_user(ce, e, sizeof(struct arpt_entry)) != 0 ||
-	    copy_to_user(&ce->counters, &counters[i],
-	    sizeof(counters[i])) != 0)
+	if (copy_to_user(ce, e, offsetof(struct compat_arpt_entry, counters)) ||
+	    copy_to_user(&ce->counters, &counters[i], sizeof(counters[i])))
 		return -EFAULT;
 
 	*dstptr += sizeof(struct compat_arpt_entry);
@@ -1420,7 +1430,7 @@ static int do_arpt_set_ctl(struct sock *sk, int cmd, sockptr_t arg,
 
 	switch (cmd) {
 	case ARPT_SO_SET_REPLACE:
-#ifdef CONFIG_COMPAT
+#ifdef CONFIG_NETFILTER_XTABLES_COMPAT
 		if (in_compat_syscall())
 			ret = compat_do_replace(sock_net(sk), arg, len);
 		else
@@ -1452,7 +1462,7 @@ static int do_arpt_get_ctl(struct sock *sk, int cmd, void __user *user, int *len
 		break;
 
 	case ARPT_SO_GET_ENTRIES:
-#ifdef CONFIG_COMPAT
+#ifdef CONFIG_NETFILTER_XTABLES_COMPAT
 		if (in_compat_syscall())
 			ret = compat_get_entries(sock_net(sk), user, len);
 		else
@@ -1507,10 +1517,11 @@ static void __arpt_unregister_table(struct net *net, struct xt_table *table)
 int arpt_register_table(struct net *net,
 			const struct xt_table *table,
 			const struct arpt_replace *repl,
-			const struct nf_hook_ops *ops,
-			struct xt_table **res)
+			const struct nf_hook_ops *template_ops)
 {
-	int ret;
+	struct nf_hook_ops *ops;
+	unsigned int num_ops;
+	int ret, i;
 	struct xt_table_info *newinfo;
 	struct xt_table_info bootstrap = {0};
 	void *loc_cpu_entry;
@@ -1524,55 +1535,89 @@ int arpt_register_table(struct net *net,
 	memcpy(loc_cpu_entry, repl->entries, repl->size);
 
 	ret = translate_table(net, newinfo, loc_cpu_entry, repl);
-	if (ret != 0)
-		goto out_free;
+	if (ret != 0) {
+		xt_free_table_info(newinfo);
+		return ret;
+	}
 
 	new_table = xt_register_table(net, table, &bootstrap, newinfo);
 	if (IS_ERR(new_table)) {
-		ret = PTR_ERR(new_table);
+		struct arpt_entry *iter;
+
+		xt_entry_foreach(iter, loc_cpu_entry, newinfo->size)
+			cleanup_entry(iter, net);
+		xt_free_table_info(newinfo);
+		return PTR_ERR(new_table);
+	}
+
+	num_ops = hweight32(table->valid_hooks);
+	if (num_ops == 0) {
+		ret = -EINVAL;
 		goto out_free;
 	}
 
-	/* set res now, will see skbs right after nf_register_net_hooks */
-	WRITE_ONCE(*res, new_table);
-
-	ret = nf_register_net_hooks(net, ops, hweight32(table->valid_hooks));
-	if (ret != 0) {
-		__arpt_unregister_table(net, new_table);
-		*res = NULL;
+	ops = kmemdup(template_ops, sizeof(*ops) * num_ops, GFP_KERNEL);
+	if (!ops) {
+		ret = -ENOMEM;
+		goto out_free;
 	}
+
+	for (i = 0; i < num_ops; i++)
+		ops[i].priv = new_table;
+
+	new_table->ops = ops;
+
+	ret = nf_register_net_hooks(net, ops, num_ops);
+	if (ret != 0)
+		goto out_free;
 
 	return ret;
 
 out_free:
-	xt_free_table_info(newinfo);
+	__arpt_unregister_table(net, new_table);
 	return ret;
 }
 
-void arpt_unregister_table_pre_exit(struct net *net, struct xt_table *table,
-				    const struct nf_hook_ops *ops)
+void arpt_unregister_table_pre_exit(struct net *net, const char *name)
 {
-	nf_unregister_net_hooks(net, ops, hweight32(table->valid_hooks));
+	struct xt_table *table = xt_find_table(net, NFPROTO_ARP, name);
+
+	if (table)
+		nf_unregister_net_hooks(net, table->ops, hweight32(table->valid_hooks));
 }
 EXPORT_SYMBOL(arpt_unregister_table_pre_exit);
 
-void arpt_unregister_table(struct net *net, struct xt_table *table)
+void arpt_unregister_table(struct net *net, const char *name)
 {
-	__arpt_unregister_table(net, table);
+	struct xt_table *table = xt_find_table(net, NFPROTO_ARP, name);
+
+	if (table)
+		__arpt_unregister_table(net, table);
 }
 
+#define DEFINE_ARPT_STANDARD_TARGET(compat)		\
+	{						\
+		.name             = XT_STANDARD_TARGET,	\
+		.targetsize       = sizeof(int),	\
+		.family           = NFPROTO_ARP,	\
+		.has_compat_metadata = compat,		\
+	}
+
 /* The built-in targets: standard (NULL) and error. */
-static struct xt_target arpt_builtin_tg[] __read_mostly = {
-	{
-		.name             = XT_STANDARD_TARGET,
-		.targetsize       = sizeof(int),
-		.family           = NFPROTO_ARP,
-#ifdef CONFIG_COMPAT
-		.compatsize       = sizeof(compat_int_t),
-		.compat_from_user = compat_standard_from_user,
-		.compat_to_user   = compat_standard_to_user,
+#ifdef CONFIG_NETFILTER_XTABLES_COMPAT
+static struct compat_xt_target_ext arpt_std_tg_ext __read_mostly = {
+	.compatsize       = sizeof(compat_int_t),
+	.compat_from_user = compat_standard_from_user,
+	.compat_to_user   = compat_standard_to_user,
+	.target = DEFINE_ARPT_STANDARD_TARGET(true),
+};
+
+#define arpt_std_tg (arpt_std_tg_ext.target)
+#else
+static struct xt_target arpt_std_tg __read_mostly = DEFINE_ARPT_STANDARD_TARGET(false);
 #endif
-	},
+
+static struct xt_target arpt_builtin_tg[] __read_mostly = {
 	{
 		.name             = XT_ERROR_TARGET,
 		.target           = arpt_error,
@@ -1616,19 +1661,25 @@ static int __init arp_tables_init(void)
 		goto err1;
 
 	/* No one else will be downing sem now, so we won't sleep */
-	ret = xt_register_targets(arpt_builtin_tg, ARRAY_SIZE(arpt_builtin_tg));
+	ret = xt_register_target(&arpt_std_tg);
 	if (ret < 0)
 		goto err2;
+
+	ret = xt_register_targets(arpt_builtin_tg, ARRAY_SIZE(arpt_builtin_tg));
+	if (ret < 0)
+		goto err4;
 
 	/* Register setsockopt */
 	ret = nf_register_sockopt(&arpt_sockopts);
 	if (ret < 0)
-		goto err4;
+		goto err8;
 
 	return 0;
 
-err4:
+err8:
 	xt_unregister_targets(arpt_builtin_tg, ARRAY_SIZE(arpt_builtin_tg));
+err4:
+	xt_unregister_target(&arpt_std_tg);
 err2:
 	unregister_pernet_subsys(&arp_tables_net_ops);
 err1:
@@ -1639,6 +1690,7 @@ static void __exit arp_tables_fini(void)
 {
 	nf_unregister_sockopt(&arpt_sockopts);
 	xt_unregister_targets(arpt_builtin_tg, ARRAY_SIZE(arpt_builtin_tg));
+	xt_unregister_target(&arpt_std_tg);
 	unregister_pernet_subsys(&arp_tables_net_ops);
 }
 

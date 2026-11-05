@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
-#include "common.h"
 #include <linux/scmi_plh.h>
+#include "common.h"
 
 #define SCMI_VENDOR_MSG_MAX_TX_SIZE		(100) /* in bytes */
 #define SCMI_VENDOR_MSG_START			(3)   /* MSG 3-15 can be used for spl purpose */
@@ -12,8 +13,6 @@
 #define SCMI_VENDOR_MSG_SPLH_END		(31)
 #define SCMI_VENDOR_MSG_LPLH_START		(32)  /* Each PLH module to use MAX 16 MSG */
 #define SCMI_VENDOR_MSG_LPLH_END		(47)
-#define SCMI_VENDOR_MSG_DPLH_START		(48)  /* Each PLH module to use MAX 16 MSG */
-#define SCMI_VENDOR_MSG_DPLH_END		(53)
 
 enum scmi_plh_protocol_cmd {
 	PERF_LOCK_SCROLL_INIT_IPC_FREQ_TBL_MSG_ID = SCMI_VENDOR_MSG_SPLH_START,
@@ -28,20 +27,15 @@ enum scmi_plh_protocol_cmd {
 	PERF_LOCK_LAUNCH_SET_SAMPLE_MS,
 	PERF_LOCK_LAUNCH_SET_LOG_LEVEL,
 	PERF_LOCK_LAUNCH_MAX_MSG_ID = SCMI_VENDOR_MSG_LPLH_END,
-	PERF_LOCK_DRAG_INIT_IPC_FREQ_TBL_MSG_ID = SCMI_VENDOR_MSG_DPLH_START,
-	PERF_LOCK_DRAG_START_MSG_ID,
-	PERF_LOCK_DRAG_STOP_MSG_ID,
-	PERF_LOCK_DRAG_SET_LOG_LEVEL,
-	PERF_LOCK_DRAG_MAX_MSG_ID = SCMI_VENDOR_MSG_DPLH_END,
 };
 
 
 static int scmi_plh_init_ipc_freq_tbl(const struct scmi_protocol_handle *ph,
 			u16 *p_init_args, u16 init_len, enum plh_features feature)
 {
-	int ret, i = 0;
-	struct scmi_xfer *t;
 	uint32_t *msg, msg_size, msg_val, align_init_len = init_len;
+	struct scmi_xfer *t;
+	int ret, i = 0;
 
 	if (init_len % 2)
 		align_init_len += 1; /* align in multiple of u32 */
@@ -56,9 +50,6 @@ static int scmi_plh_init_ipc_freq_tbl(const struct scmi_protocol_handle *ph,
 				(msg_size), sizeof(uint32_t), &t);
 	else if (feature == PERF_LOCK_LAUNCH)
 		ret = ph->xops->xfer_get_init(ph, PERF_LOCK_LAUNCH_INIT_IPC_FREQ_TBL_MSG_ID,
-				(msg_size), sizeof(uint32_t), &t);
-	else if (feature == PERF_LOCK_DRAG)
-		ret = ph->xops->xfer_get_init(ph, PERF_LOCK_DRAG_INIT_IPC_FREQ_TBL_MSG_ID,
 				(msg_size), sizeof(uint32_t), &t);
 	else
 		return -EINVAL;
@@ -104,32 +95,24 @@ static int scmi_plh_set_u16_val(const struct scmi_protocol_handle *ph,
 static int scmi_plh_start_cmd(const struct scmi_protocol_handle *ph,
 			u16 value, enum plh_features feature)
 {
-	int ret;
+	int ret = -EINVAL;
 
 	if (feature == PERF_LOCK_SCROLL)
 		ret = scmi_plh_set_u16_val(ph, value, PERF_LOCK_SCROLL_START_MSG_ID);
 	else if (feature == PERF_LOCK_LAUNCH)
 		ret = scmi_plh_set_u16_val(ph, value, PERF_LOCK_LAUNCH_START_MSG_ID);
-	else if (feature == PERF_LOCK_DRAG)
-		ret = scmi_plh_set_u16_val(ph, value, PERF_LOCK_DRAG_START_MSG_ID);
-	else
-		ret = -EINVAL;
 
 	return ret;
 }
 
 static int scmi_plh_stop_cmd(const struct scmi_protocol_handle *ph, enum plh_features feature)
 {
-	int ret;
+	int ret = -EINVAL;
 
 	if (feature == PERF_LOCK_SCROLL)
 		ret = scmi_plh_set_u16_val(ph, 0, PERF_LOCK_SCROLL_STOP_MSG_ID);
 	else if (feature == PERF_LOCK_LAUNCH)
 		ret = scmi_plh_set_u16_val(ph, 0, PERF_LOCK_LAUNCH_STOP_MSG_ID);
-	else if (feature == PERF_LOCK_DRAG)
-		ret = scmi_plh_set_u16_val(ph, 0, PERF_LOCK_DRAG_STOP_MSG_ID);
-	else
-		ret = -EINVAL;
 
 	return ret;
 }
@@ -137,14 +120,12 @@ static int scmi_plh_stop_cmd(const struct scmi_protocol_handle *ph, enum plh_fea
 static int scmi_plh_set_sample_ms(const struct scmi_protocol_handle *ph,
 			u16 sample_ms, enum plh_features feature)
 {
-	int ret;
+	int ret = -EINVAL;
 
 	if (feature == PERF_LOCK_SCROLL)
 		ret = scmi_plh_set_u16_val(ph, sample_ms, PERF_LOCK_SCROLL_SET_SAMPLE_MS);
 	else if (feature == PERF_LOCK_LAUNCH)
 		ret = scmi_plh_set_u16_val(ph, sample_ms, PERF_LOCK_LAUNCH_SET_SAMPLE_MS);
-	else
-		ret = -EINVAL;
 
 	return ret;
 }
@@ -152,21 +133,17 @@ static int scmi_plh_set_sample_ms(const struct scmi_protocol_handle *ph,
 static int scmi_plh_set_log_level(const struct scmi_protocol_handle *ph,
 			u16 log_level, enum plh_features feature)
 {
-	int ret;
+	int ret = -EINVAL;
 
 	if (feature == PERF_LOCK_SCROLL)
 		ret = scmi_plh_set_u16_val(ph, log_level, PERF_LOCK_SCROLL_SET_LOG_LEVEL);
 	else if (feature == PERF_LOCK_LAUNCH)
 		ret = scmi_plh_set_u16_val(ph, log_level, PERF_LOCK_LAUNCH_SET_LOG_LEVEL);
-	else if (feature == PERF_LOCK_DRAG)
-		ret = scmi_plh_set_u16_val(ph, log_level, PERF_LOCK_DRAG_SET_LOG_LEVEL);
-	else
-		ret = -EINVAL;
 
 	return ret;
 }
 
-static struct scmi_plh_vendor_ops plh_proto_ops = {
+static const struct scmi_plh_vendor_ops plh_proto_ops = {
 	.init_plh_ipc_freq_tbl = scmi_plh_init_ipc_freq_tbl,
 	.start_plh = scmi_plh_start_cmd,
 	.stop_plh = scmi_plh_stop_cmd,
@@ -189,10 +166,10 @@ static int scmi_plh_vendor_protocol_init(const struct scmi_protocol_handle *ph)
 static const struct scmi_protocol scmi_plh_vendor = {
 	.id = SCMI_PROTOCOL_PLH,
 	.owner = THIS_MODULE,
-	.init_instance = &scmi_plh_vendor_protocol_init,
+	.instance_init = &scmi_plh_vendor_protocol_init,
 	.ops = &plh_proto_ops,
 };
 module_scmi_protocol(scmi_plh_vendor);
 
 MODULE_DESCRIPTION("SCMI plh vendor Protocol");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt)	"tmelog: [%s][%d]:" fmt, __func__, __LINE__
@@ -55,7 +55,7 @@ int tmelog_process_request(uint32_t buf, uint32_t buf_capacity, uint32_t *buf_si
 
 	pr_debug("request var: cbor_header: %#x, log_len: %#x, log_ptr: %#x\n",
 			request->cbor_header, request->log_len, request->log_ptr);
-	pr_debug("request_size: %#x, response_size: %#x\n", sizeof(*request), sizeof(*response));
+	pr_debug("request_size: %ld, response_size: %ld\n", sizeof(*request), sizeof(*response));
 	ret = tmecom_process_request(request, sizeof(*request), response, &response_len);
 
 	if (ret != 0) {
@@ -64,7 +64,7 @@ int tmelog_process_request(uint32_t buf, uint32_t buf_capacity, uint32_t *buf_si
 	}
 
 	if (response_len != sizeof(*response)) {
-		pr_err("Tme Log failed with invalid length: %u, %u\n",
+		pr_err("Tme Log failed with invalid length: %zu, %ld\n",
 				response_len, sizeof(response));
 		ret = -EBADMSG;
 		goto err_exit;
@@ -79,4 +79,4 @@ err_exit:
 	kfree(response);
 	return ret;
 }
-EXPORT_SYMBOL(tmelog_process_request);
+EXPORT_SYMBOL_GPL(tmelog_process_request);

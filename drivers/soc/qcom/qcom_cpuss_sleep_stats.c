@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 /*
- * Copyright (c) 2020 The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <asm/cputype.h>
@@ -13,7 +12,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
-#include <linux/qcom_scm.h>
+#include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/slab.h>
 
 #define MAX_POSSIBLE_CPUS	8
@@ -308,7 +307,7 @@ static int qcom_cpuss_sleep_stats_show(struct seq_file *s, void *d)
 	u64 val;
 
 	val = readq_relaxed(reg);
-	seq_printf(s, "%ld\n", val);
+	seq_printf(s, "%llu\n", val);
 
 	return 0;
 }
@@ -323,7 +322,7 @@ static int qcom_cpuss_all_stats_show(struct seq_file *s, void *d)
 
 	list_for_each_entry(data, node1, node) {
 		count = readq_relaxed(data->reg);
-		seq_printf(s, "%s: %ld\n", data->mode_name, count);
+		seq_printf(s, "%s: %llu\n", data->mode_name, count);
 	}
 
 	return 0;
@@ -359,16 +358,22 @@ error:
 
 static bool check_val(const char __user *in, size_t count)
 {
-	loff_t ppos = 0;
 	char buffer[2] = {0};
 	int ret;
 
-	ret = simple_write_to_buffer(buffer, sizeof(buffer) - 1,
-				     &ppos, in, count - 1);
-	if (ret > 0)
-		return strcmp(buffer, "1") ? false : true;
+	if (count <= 1)
+		return false;
 
-	return false;
+	if (count > sizeof(buffer))
+		count = sizeof(buffer);
+
+	/* returns number of bytes not copied */
+	ret = __arch_copy_from_user(buffer, in, count - 1);
+
+	if (ret == (count - 1))
+		return -EFAULT;
+
+	return strcmp(buffer, "1") ? false : true;
 }
 
 static ssize_t qcom_cpuss_stats_reset_write(struct file *file,
@@ -442,7 +447,7 @@ static int store_stats_data(struct qcom_target_info *t_info, char *str,
 		return -ENOMEM;
 
 	store_stats_data->reg = reg;
-	strlcpy(store_stats_data->mode_name, str,
+	strscpy(store_stats_data->mode_name, str,
 		sizeof(store_stats_data->mode_name));
 
 	list_add_tail(&store_stats_data->node, &t_info->complete_stats.node);
@@ -780,4 +785,4 @@ static struct platform_driver qcom_cpuss_sleep_stats = {
 module_platform_driver(qcom_cpuss_sleep_stats);
 
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. (QTI) CPUSS sleep stats driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

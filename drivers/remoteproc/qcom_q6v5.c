@@ -4,21 +4,47 @@
  *
  * Copyright (C) 2016-2018 Linaro Ltd.
  * Copyright (C) 2014 Sony Mobile Communications AB
- * Copyright (c) 2012-2013, 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2024-2025, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #include <linux/kernel.h>
 #include <linux/platform_device.h>
+#include <linux/interconnect.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
+#include <linux/soc/qcom/qcom_aoss.h>
 #include <linux/soc/qcom/smem.h>
 #include <linux/soc/qcom/smem_state.h>
 #include <linux/remoteproc.h>
 #include <linux/delay.h>
+#include <asm/timex.h>
+
 #include "qcom_common.h"
 #include "qcom_q6v5.h"
 #include <trace/events/rproc_qcom.h>
 
+#define Q6V5_LOAD_STATE_MSG_LEN	64
 #define Q6V5_PANIC_DELAY_MS	200
+
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+#include <soc/oplus/system/oplus_mm_kevent_fb.h>
+#define REMOTEPROC_ADSP "remoteproc-adsp"
+#endif /* CONFIG_OPLUS_FEATURE_MM_FEEDBACK */
+
+static int q6v5_load_state_toggle(struct qcom_q6v5 *q6v5, bool enable)
+{
+	int ret;
+
+	if (!q6v5->qmp)
+		return 0;
+
+	ret = qmp_send(q6v5->qmp, "{class: image, res: load_state, name: %s, val: %s}",
+		       q6v5->load_state, enable ? "on" : "off");
+	if (ret)
+		dev_err(q6v5->dev, "failed to toggle load state\n");
+
+	return ret;
+}
 
 /**
  * qcom_q6v5_prepare() - reinitialize the qcom_q6v5 context before start
@@ -28,6 +54,20 @@
  */
 int qcom_q6v5_prepare(struct qcom_q6v5 *q6v5)
 {
+	int ret;
+
+	ret = icc_set_bw(q6v5->path, UINT_MAX, UINT_MAX);
+	if (ret < 0) {
+		dev_err(q6v5->dev, "failed to set bandwidth request\n");
+		return ret;
+	}
+
+	ret = q6v5_load_state_toggle(q6v5, true);
+	if (ret) {
+		icc_set_bw(q6v5->path, 0, 0);
+		return ret;
+	}
+
 	reinit_completion(&q6v5->start_done);
 	reinit_completion(&q6v5->stop_done);
 
@@ -49,6 +89,10 @@ EXPORT_SYMBOL_GPL(qcom_q6v5_prepare);
 int qcom_q6v5_unprepare(struct qcom_q6v5 *q6v5)
 {
 	disable_irq(q6v5->handover_irq);
+	q6v5_load_state_toggle(q6v5, false);
+
+	/* Disable interconnect vote, in case handover never happened */
+	icc_set_bw(q6v5->path, 0, 0);
 
 	return !q6v5->handover_issued;
 }
@@ -58,7 +102,13 @@ void qcom_q6v5_register_ssr_subdev(struct qcom_q6v5 *q6v5, struct rproc_subdev *
 {
 	q6v5->ssr_subdev = ssr_subdev;
 }
-EXPORT_SYMBOL(qcom_q6v5_register_ssr_subdev);
+EXPORT_SYMBOL_GPL(qcom_q6v5_register_ssr_subdev);
+
+void qcom_q6v5_register_glink_subdev(struct qcom_q6v5 *q6v5, struct rproc_subdev *glink_subdev)
+{
+	q6v5->glink_subdev = glink_subdev;
+}
+EXPORT_SYMBOL_GPL(qcom_q6v5_register_glink_subdev);
 
 static void qcom_q6v5_crash_handler_work(struct work_struct *work)
 {
@@ -68,64 +118,89 @@ static void qcom_q6v5_crash_handler_work(struct work_struct *work)
 	int votes;
 
 	mutex_lock(&rproc->lock);
-
-	rproc->state = RPROC_CRASHED;
-
-	votes = atomic_xchg(&rproc->power, 0);
-	/* if votes are zero, rproc has already been shutdown */
-	if (votes == 0) {
+	votes = atomic_read(&rproc->power);
+	if (votes == 0 || q6v5->crash_seq != q6v5->seq) {
 		mutex_unlock(&rproc->lock);
 		return;
 	}
 
+	rproc->state = RPROC_CRASHED;
 	list_for_each_entry_reverse(subdev, &rproc->subdevs, node) {
-		if (subdev->stop)
+		/*
+		 * Debug requirement from glink to not clean up their
+		 * data when SSR is not enabled for a remoteproc.
+		 */
+		if (subdev->stop && subdev != q6v5->glink_subdev)
 			subdev->stop(subdev, true);
 	}
 
-	mutex_unlock(&rproc->lock);
-
+	msleep(100);
 	/*
 	 * Temporary workaround until ramdump userspace application calls
 	 * sync() and fclose() on attempting the dump.
 	 */
-	msleep(100);
 	panic("Panicking, remoteproc %s crashed\n", q6v5->rproc->name);
+	mutex_unlock(&rproc->lock);
 }
 
 static irqreturn_t q6v5_wdog_interrupt(int irq, void *data)
 {
 	struct qcom_q6v5 *q6v5 = data;
-	struct qcom_rproc_ssr *ssr;
 	size_t len;
 	char *msg;
 
 	/* Sometimes the stop triggers a watchdog rather than a stop-ack */
 	if (!q6v5->running) {
-		dev_info(q6v5->dev, "received wdog irq while q6 is offline\n");
 		complete(&q6v5->stop_done);
 		return IRQ_HANDLED;
 	}
 
+	dev_err(q6v5->dev, "rproc crash at cycle:%llu, recovery state: %s\n",
+		get_cycles(),
+		q6v5->rproc->recovery_disabled ? "disabled and lead to device crash" :
+		"enabled and kick recovery process");
+
+	q6v5->crash_seq = q6v5->seq;
 	msg = qcom_smem_get(QCOM_SMEM_HOST_ANY, q6v5->crash_reason, &len);
 	if (!IS_ERR(msg) && len > 0 && msg[0])
 		dev_err(q6v5->dev, "watchdog received: %s\n", msg);
 	else
 		dev_err(q6v5->dev, "watchdog without message\n");
 
-	q6v5->running = false;
-	trace_rproc_qcom_event(dev_name(q6v5->dev), "q6v5_wdog", msg);
-	if (q6v5->rproc->recovery_disabled) {
-		schedule_work(&q6v5->crash_handler);
-	} else {
-		if (q6v5->ssr_subdev) {
-			qcom_notify_early_ssr_clients(q6v5->ssr_subdev);
-			ssr = container_of(q6v5->ssr_subdev, struct qcom_rproc_ssr, subdev);
-			ssr->is_notified = true;
-		}
-
-		rproc_report_crash(q6v5->rproc, RPROC_WATCHDOG);
+	if (q6v5->crash_stack) {
+		msg = qcom_smem_get(q6v5->smem_host_id, q6v5->crash_stack, &len);
+		if (!IS_ERR(msg) && len > 0 && msg[0])
+			dev_err(q6v5->dev, "%s\n", msg);
 	}
+
+	q6v5->running = false;
+
+	trace_rproc_qcom_event(dev_name(q6v5->dev), "q6v5_wdog", msg);
+	if (q6v5->ssr_subdev)
+		qcom_notify_early_ssr_clients(q6v5->ssr_subdev);
+
+	if (q6v5->rproc->recovery_disabled)
+		queue_work(system_unbound_wq, &q6v5->crash_handler);
+	else
+		rproc_report_crash(q6v5->rproc, RPROC_WATCHDOG);
+
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+	if (strstr(q6v5->rproc->name, REMOTEPROC_ADSP)) {
+		if (!IS_ERR(msg) && len > 0 && msg[0]) {
+			if (strstr(msg, "err_inject_crash")) {
+				//Via Diag trigger adsp crash reported to the 10050 event
+				mm_fb_audio_kevent_named(OPLUS_AUDIO_EVENTID_ADSP_DAEMON, \
+					MM_FB_KEY_RATELIMIT_5MIN, "FieldData@@%s$$detailData@@audio$$module@@adsp", msg);
+			} else {
+				mm_fb_audio_kevent_named(OPLUS_AUDIO_EVENTID_ADSP_CRASH, \
+					MM_FB_KEY_RATELIMIT_5MIN, "FieldData@@%s$$detailData@@audio$$module@@adsp", msg);
+			}
+		} else {
+			mm_fb_audio_kevent_named(OPLUS_AUDIO_EVENTID_ADSP_CRASH, \
+				MM_FB_KEY_RATELIMIT_5MIN, "FieldData@@fatal error without message$$detailData@@audio$$module@@adsp");
+		}
+	}
+#endif /* CONFIG_OPLUS_FEATURE_MM_FEEDBACK */
 
 	return IRQ_HANDLED;
 }
@@ -133,34 +208,59 @@ static irqreturn_t q6v5_wdog_interrupt(int irq, void *data)
 static irqreturn_t q6v5_fatal_interrupt(int irq, void *data)
 {
 	struct qcom_q6v5 *q6v5 = data;
-	struct qcom_rproc_ssr *ssr;
 	size_t len;
 	char *msg;
 
-	if (!q6v5->running) {
-		dev_info(q6v5->dev, "received fatal irq while q6 is offline\n");
+	if (!q6v5->running)
 		return IRQ_HANDLED;
-	}
 
+	dev_err(q6v5->dev, "rproc crash at cycle:%llu, recovery state: %s\n",
+		get_cycles(),
+		q6v5->rproc->recovery_disabled ? "disabled and lead to device crash" :
+		"enabled and kick recovery process");
+
+	q6v5->crash_seq = q6v5->seq;
 	msg = qcom_smem_get(QCOM_SMEM_HOST_ANY, q6v5->crash_reason, &len);
 	if (!IS_ERR(msg) && len > 0 && msg[0])
 		dev_err(q6v5->dev, "fatal error received: %s\n", msg);
 	else
 		dev_err(q6v5->dev, "fatal error without message\n");
 
-	q6v5->running = false;
-	trace_rproc_qcom_event(dev_name(q6v5->dev), "q6v5_fatal", msg);
-	if (q6v5->rproc->recovery_disabled) {
-		schedule_work(&q6v5->crash_handler);
-	} else {
-		if (q6v5->ssr_subdev) {
-			qcom_notify_early_ssr_clients(q6v5->ssr_subdev);
-			ssr = container_of(q6v5->ssr_subdev, struct qcom_rproc_ssr, subdev);
-			ssr->is_notified = true;
-		}
-
-		rproc_report_crash(q6v5->rproc, RPROC_FATAL_ERROR);
+	if (q6v5->crash_stack) {
+		msg = qcom_smem_get(q6v5->smem_host_id, q6v5->crash_stack, &len);
+		if (!IS_ERR(msg) && len > 0 && msg[0])
+			dev_err(q6v5->dev, "%s\n", msg);
 	}
+
+	q6v5->running = false;
+
+	trace_rproc_qcom_event(dev_name(q6v5->dev), "q6v5_fatal", msg);
+
+	if (q6v5->ssr_subdev)
+		qcom_notify_early_ssr_clients(q6v5->ssr_subdev);
+
+	if (q6v5->rproc->recovery_disabled)
+		queue_work(system_unbound_wq, &q6v5->crash_handler);
+	else
+		rproc_report_crash(q6v5->rproc, RPROC_FATAL_ERROR);
+
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+	if (strstr(q6v5->rproc->name, REMOTEPROC_ADSP)) {
+		if (!IS_ERR(msg) && len > 0 && msg[0]) {
+			if (strstr(msg, "err_inject_crash")) {
+				//Via Diag trigger adsp crash reported to the 10050 event
+				mm_fb_audio_kevent_named(OPLUS_AUDIO_EVENTID_ADSP_DAEMON, \
+					MM_FB_KEY_RATELIMIT_5MIN, "FieldData@@%s$$detailData@@audio$$module@@adsp", msg);
+			} else {
+				mm_fb_audio_kevent_named(OPLUS_AUDIO_EVENTID_ADSP_CRASH, \
+					MM_FB_KEY_RATELIMIT_5MIN, "FieldData@@%s$$detailData@@audio$$module@@adsp", msg);
+			}
+		} else {
+			mm_fb_audio_kevent_named(OPLUS_AUDIO_EVENTID_ADSP_CRASH, \
+				MM_FB_KEY_RATELIMIT_5MIN, "FieldData@@fatal error without message$$detailData@@audio$$module@@adsp");
+		}
+	}
+#endif /* CONFIG_OPLUS_FEATURE_MM_FEEDBACK */
 
 	return IRQ_HANDLED;
 }
@@ -196,8 +296,15 @@ static irqreturn_t q6v5_handover_interrupt(int irq, void *data)
 {
 	struct qcom_q6v5 *q6v5 = data;
 
+	if (q6v5->handover_issued) {
+		dev_err(q6v5->dev, "Handover signaled, but it already happened\n");
+		return IRQ_HANDLED;
+	}
+
 	if (q6v5->handover)
 		q6v5->handover(q6v5);
+
+	icc_set_bw(q6v5->path, 0, 0);
 
 	q6v5->handover_issued = true;
 
@@ -226,10 +333,8 @@ int qcom_q6v5_request_stop(struct qcom_q6v5 *q6v5, struct qcom_sysmon *sysmon)
 
 	q6v5->running = false;
 
-	/* Don't perform SMP2P dance if sysmon already shut
-	 * down the remote or if it isn't running
-	 */
-	if (q6v5->rproc->state != RPROC_RUNNING || qcom_sysmon_shutdown_acked(sysmon))
+	/* Don't perform SMP2P dance if remote isn't running */
+	if (qcom_sysmon_shutdown_acked(sysmon) || (q6v5->rproc->state != RPROC_RUNNING))
 		return 0;
 
 	qcom_smem_state_update_bits(q6v5->state,
@@ -267,12 +372,14 @@ EXPORT_SYMBOL_GPL(qcom_q6v5_panic);
  * @pdev:	platform_device reference for acquiring resources
  * @rproc:	associated remoteproc instance
  * @crash_reason: SMEM id for crash reason string, or 0 if none
+ * @load_state: load state resource string
  * @handover:	function to be called when proxy resources should be released
  *
  * Return: 0 on success, negative errno on failure
  */
 int qcom_q6v5_init(struct qcom_q6v5 *q6v5, struct platform_device *pdev,
-		   struct rproc *rproc, int crash_reason,
+		   struct rproc *rproc,  int crash_reason, int crash_stack,
+		   unsigned int smem_host_id, const char *load_state,
 		   void (*handover)(struct qcom_q6v5 *q6v5))
 {
 	int ret;
@@ -280,6 +387,8 @@ int qcom_q6v5_init(struct qcom_q6v5 *q6v5, struct platform_device *pdev,
 	q6v5->rproc = rproc;
 	q6v5->dev = &pdev->dev;
 	q6v5->crash_reason = crash_reason;
+	q6v5->crash_stack = crash_stack;
+	q6v5->smem_host_id = smem_host_id;
 	q6v5->handover = handover;
 	q6v5->ssr_subdev = NULL;
 
@@ -292,7 +401,7 @@ int qcom_q6v5_init(struct qcom_q6v5 *q6v5, struct platform_device *pdev,
 
 	ret = devm_request_threaded_irq(&pdev->dev, q6v5->wdog_irq,
 					NULL, q6v5_wdog_interrupt,
-					IRQF_ONESHOT,
+					IRQF_TRIGGER_RISING | IRQF_ONESHOT,
 					"q6v5 wdog", q6v5);
 	if (ret) {
 		dev_err(&pdev->dev, "failed to acquire wdog IRQ\n");
@@ -352,10 +461,43 @@ int qcom_q6v5_init(struct qcom_q6v5 *q6v5, struct platform_device *pdev,
 		return ret;
 	}
 
-	q6v5->state = qcom_smem_state_get(&pdev->dev, "stop", &q6v5->stop_bit);
+	q6v5->state = devm_qcom_smem_state_get(&pdev->dev, "stop", &q6v5->stop_bit);
 	if (IS_ERR(q6v5->state)) {
 		dev_err(&pdev->dev, "failed to acquire stop state\n");
 		return PTR_ERR(q6v5->state);
+	}
+
+	q6v5->load_state = devm_kstrdup_const(&pdev->dev, load_state, GFP_KERNEL);
+	q6v5->qmp = qmp_get(&pdev->dev);
+	if (IS_ERR(q6v5->qmp)) {
+		if (PTR_ERR(q6v5->qmp) != -ENODEV)
+			return dev_err_probe(&pdev->dev, PTR_ERR(q6v5->qmp),
+					     "failed to acquire load state\n");
+		q6v5->qmp = NULL;
+	} else if (!q6v5->load_state) {
+		if (!load_state)
+			dev_err(&pdev->dev, "load state resource string empty\n");
+
+		qmp_put(q6v5->qmp);
+		return load_state ? -ENOMEM : -EINVAL;
+	}
+
+	q6v5->path = devm_of_icc_get(&pdev->dev, "rproc_ddr");
+	if (IS_ERR(q6v5->path)) {
+		if (PTR_ERR(q6v5->path) != -ENODATA) {
+			return dev_err_probe(&pdev->dev, PTR_ERR(q6v5->path),
+				     "failed to acquire rproc_ddr interconnect path\n");
+		}
+		q6v5->path = NULL;
+	}
+
+	q6v5->crypto_path = devm_of_icc_get(&pdev->dev, "crypto_ddr");
+	if (IS_ERR(q6v5->crypto_path)) {
+		if (PTR_ERR(q6v5->crypto_path) != -ENODATA) {
+			return dev_err_probe(&pdev->dev, PTR_ERR(q6v5->crypto_path),
+				     "failed to acquire crypto_ddr interconnect path\n");
+		}
+		q6v5->crypto_path = NULL;
 	}
 
 	INIT_WORK(&q6v5->crash_handler, qcom_q6v5_crash_handler_work);
@@ -363,6 +505,16 @@ int qcom_q6v5_init(struct qcom_q6v5 *q6v5, struct platform_device *pdev,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(qcom_q6v5_init);
+
+/**
+ * qcom_q6v5_deinit() - deinitialize the q6v5 common struct
+ * @q6v5:	reference to qcom_q6v5 context to be deinitialized
+ */
+void qcom_q6v5_deinit(struct qcom_q6v5 *q6v5)
+{
+	qmp_put(q6v5->qmp);
+}
+EXPORT_SYMBOL_GPL(qcom_q6v5_deinit);
 
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("Qualcomm Peripheral Image Loader for Q6V5");

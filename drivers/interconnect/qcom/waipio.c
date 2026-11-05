@@ -2530,7 +2530,9 @@ static int qnoc_probe(struct platform_device *pdev)
 
 	ret = qcom_icc_rpmh_probe(pdev);
 	if (ret)
-		dev_err(&pdev->dev, "failed to register ICC provider\n");
+		dev_err_probe(&pdev->dev, ret, "failed to register ICC provider\n");
+	else
+		dev_info(&pdev->dev, "Registered WAIPIO ICC\n");
 
 	return ret;
 }
@@ -2568,7 +2570,7 @@ static struct platform_driver qnoc_driver = {
 	.driver = {
 		.name = "qnoc-waipio",
 		.of_match_table = qnoc_of_match,
-		.sync_state = qcom_icc_rpmh_sync_state,
+		.sync_state = icc_sync_state,
 	},
 };
 

@@ -206,7 +206,7 @@ static int v1_write_file_info(struct super_block *sb, int type)
 	      sizeof(struct v1_disk_dqblk), v1_dqoff(0));
 	if (ret == sizeof(struct v1_disk_dqblk))
 		ret = 0;
-	else if (ret > 0)
+	else if (ret >= 0)
 		ret = -EIO;
 out:
 	up_write(&dqopt->dqio_sem);
@@ -229,7 +229,8 @@ static struct quota_format_type v1_quota_format = {
 
 static int __init init_v1_quota_format(void)
 {
-        return register_quota_format(&v1_quota_format);
+	register_quota_format(&v1_quota_format);
+	return 0;
 }
 
 static void __exit exit_v1_quota_format(void)

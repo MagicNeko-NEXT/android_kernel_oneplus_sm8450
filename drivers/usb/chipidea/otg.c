@@ -22,7 +22,7 @@
 #include "otg_fsm.h"
 
 /**
- * hw_read_otgsc returns otgsc register bits value.
+ * hw_read_otgsc - returns otgsc register bits value.
  * @ci: the controller
  * @mask: bitfield mask
  */
@@ -75,7 +75,7 @@ u32 hw_read_otgsc(struct ci_hdrc *ci, u32 mask)
 }
 
 /**
- * hw_write_otgsc updates target bits of OTGSC register.
+ * hw_write_otgsc - updates target bits of OTGSC register.
  * @ci: the controller
  * @mask: bitfield mask
  * @data: to be written
@@ -130,8 +130,14 @@ enum ci_role ci_otg_role(struct ci_hdrc *ci)
 
 void ci_handle_vbus_change(struct ci_hdrc *ci)
 {
-	if (!ci->is_otg)
+	if (ci->role != CI_ROLE_GADGET)
 		return;
+
+	if (!ci->is_otg) {
+		if (ci->platdata->flags & CI_HDRC_FORCE_VBUS_ACTIVE_ALWAYS)
+			usb_gadget_vbus_connect(&ci->gadget);
+		return;
+	}
 
 	if (hw_read_otgsc(ci, OTGSC_BSV) && !ci->vbus_active)
 		usb_gadget_vbus_connect(&ci->gadget);
@@ -140,8 +146,9 @@ void ci_handle_vbus_change(struct ci_hdrc *ci)
 }
 
 /**
- * When we switch to device mode, the vbus value should be lower
- * than OTGSC_BSV before connecting to host.
+ * hw_wait_vbus_lower_bsv - When we switch to device mode, the vbus value
+ *                          should be lower than OTGSC_BSV before connecting
+ *                          to host.
  *
  * @ci: the controller
  *
@@ -164,7 +171,7 @@ static int hw_wait_vbus_lower_bsv(struct ci_hdrc *ci)
 	return 0;
 }
 
-static void ci_handle_id_switch(struct ci_hdrc *ci)
+void ci_handle_id_switch(struct ci_hdrc *ci)
 {
 	enum ci_role role;
 
@@ -183,8 +190,8 @@ static void ci_handle_id_switch(struct ci_hdrc *ci)
 
 		ci_role_stop(ci);
 
-		if (role == CI_ROLE_GADGET &&
-				IS_ERR(ci->platdata->vbus_extcon.edev))
+		if (role == CI_ROLE_GADGET && !ci->role_switch &&
+		    IS_ERR(ci->platdata->vbus_extcon.edev))
 			/*
 			 * Wait vbus lower than OTGSC_BSV before connecting
 			 * to host. If connecting status is from an external
@@ -257,10 +264,9 @@ int ci_hdrc_otg_init(struct ci_hdrc *ci)
  */
 void ci_hdrc_otg_destroy(struct ci_hdrc *ci)
 {
-	if (ci->wq) {
-		flush_workqueue(ci->wq);
+	if (ci->wq)
 		destroy_workqueue(ci->wq);
-	}
+
 	/* Disable all OTG irq and clear status */
 	hw_write_otgsc(ci, OTGSC_INT_EN_BITS | OTGSC_INT_STATUS_BITS,
 						OTGSC_INT_STATUS_BITS);

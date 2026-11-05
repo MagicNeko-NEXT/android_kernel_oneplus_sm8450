@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "qcom-memlat: " fmt
@@ -30,17 +31,76 @@
 #include <soc/qcom/dcvs.h>
 #include <soc/qcom/pmu_lib.h>
 #include <linux/scmi_protocol.h>
-#include <linux/scmi_memlat.h>
+#include <linux/sched/clock.h>
+#include <linux/qcom_scmi_vendor.h>
+#include <linux/cpu_phys_log_map.h>
 #include "trace-dcvs.h"
 
 #define MAX_MEMLAT_GRPS	NUM_DCVS_HW_TYPES
 #define FP_NAME		"memlat_fp"
-#define MAX_SPM_WINDOW_SIZE 20U
-#define MAX_SPM_FREQ_MAP 2
-#define MISS_DELTA_PCT_THRES 30U
-#define SPM_FREQ_THRES 2000U
-#define L2MISS_RATIO_THRES 150U
-#define SPM_CPU_FREQ_IGN 200U
+#define MEMLAT_ALGO_STR 0x4D454D4C4154 /* "MEMLAT" */
+#define SCMI_VENDOR_MSG_START   (3)
+#define SCMI_VENDOR_MSG_MODULE_START   (16)
+#define INVALID_IDX		0xFF
+#define MAX_NAME_LEN		20
+#define MAX_MAP_ENTRIES 14
+
+enum scmi_memlat_protocol_cmd {
+	MEMLAT_SET_LOG_LEVEL = SCMI_VENDOR_MSG_START,
+	MEMLAT_FLUSH_LOGBUF,
+	MEMLAT_SET_MEM_GROUP = SCMI_VENDOR_MSG_MODULE_START,
+	MEMLAT_SET_MONITOR,
+	MEMLAT_SET_COMMON_EV_MAP,
+	MEMLAT_SET_GRP_EV_MAP,
+	MEMLAT_ADAPTIVE_LOW_FREQ,
+	MEMLAT_ADAPTIVE_HIGH_FREQ,
+	MEMLAT_GET_ADAPTIVE_CUR_FREQ,
+	MEMLAT_IPM_CEIL,
+	MEMLAT_FE_STALL_FLOOR,
+	MEMLAT_BE_STALL_FLOOR,
+	MEMLAT_WB_PCT,
+	MEMLAT_IPM_FILTER,
+	MEMLAT_FREQ_SCALE_PCT,
+	MEMLAT_FREQ_SCALE_CEIL_MHZ,
+	MEMLAT_FREQ_SCALE_FLOOR_MHZ,
+	MEMLAT_SAMPLE_MS,
+	MEMLAT_MON_FREQ_MAP,
+	MEMLAT_SET_MIN_FREQ,
+	MEMLAT_SET_MAX_FREQ,
+	MEMLAT_GET_CUR_FREQ,
+	MEMLAT_START_TIMER,
+	MEMLAT_STOP_TIMER,
+	MEMLAT_GET_TIMESTAMP,
+	MEMLAT_SET_EFFECTIVE_FREQ_METHOD,
+	MEMLAT_ADAPTIVE_LEVEL_1,
+	MEMLAT_MAX_MSG
+};
+
+struct map_table {
+	uint16_t v1;
+	uint16_t v2;
+};
+
+struct map_param_msg {
+	uint32_t hw_type;
+	uint32_t mon_idx;
+	uint32_t nr_rows;
+	struct map_table tbl[MAX_MAP_ENTRIES];
+} __packed;
+
+struct node_msg {
+	uint32_t cpumask;
+	uint32_t hw_type;
+	uint32_t mon_type;
+	uint32_t mon_idx;
+	char mon_name[MAX_NAME_LEN];
+};
+
+struct scalar_param_msg {
+	uint32_t hw_type;
+	uint32_t mon_idx;
+	uint32_t val;
+};
 
 enum common_ev_idx {
 	INST_IDX,
@@ -57,6 +117,12 @@ enum grp_ev_idx {
 	NUM_GRP_EVS
 };
 
+struct ev_map_msg {
+	uint32_t num_evs;
+	uint32_t hw_type;
+	uint8_t cid[NUM_COMMON_EVS];
+};
+
 enum mon_type {
 	SAMPLING_MON	= BIT(0),
 	THREADLAT_MON	= BIT(1),
@@ -64,7 +130,7 @@ enum mon_type {
 	NUM_MON_TYPES
 };
 
-#define SAMPLING_VOTER	max(num_possible_cpus(), 8U)
+#define SAMPLING_VOTER	(num_possible_cpus())
 #define NUM_FP_VOTERS	(SAMPLING_VOTER + 1)
 
 enum memlat_type {
@@ -97,8 +163,6 @@ struct cpu_stats {
 	u32				be_stall_pct;
 	u32				ipm[MAX_MEMLAT_GRPS];
 	u32				wb_pct[MAX_MEMLAT_GRPS];
-	u32				spm[MAX_MEMLAT_GRPS];
-	u32				l2miss_ratio[MAX_MEMLAT_GRPS];
 };
 
 struct cpufreq_memfreq_map {
@@ -119,28 +183,16 @@ struct memlat_mon {
 	u32				fe_stall_floor;
 	u32				be_stall_floor;
 	u32				freq_scale_pct;
-	u32				freq_scale_limit_mhz;
+	u32				freq_scale_ceil_mhz;
+	u32				freq_scale_floor_mhz;
 	u32				wb_pct_thres;
 	u32				wb_filter_ipm;
 	u32				min_freq;
 	u32				max_freq;
-	u32				mon_min_freq;
-	u32				mon_max_freq;
 	u32				cur_freq;
 	struct kobject			kobj;
 	bool				is_compute;
 	u32				index;
-	u32			enable_spm_voting;
-	u64			prev_max_miss;
-	u32			spm_thres;
-	u32			spm_drop_pct;
-	u32			spm_window_size;
-	u32			sampled_max_spm[MAX_SPM_WINDOW_SIZE];
-	u32			sampled_max_cpu_freq[MAX_SPM_WINDOW_SIZE];
-	u32			sampled_spm_idx;
-	u32			spm_vote_inc_steps;
-	u32			disable_spm_value;
-	struct	cpufreq_memfreq_map	spm_freq_map[MAX_SPM_FREQ_MAP];
 };
 
 struct memlat_group {
@@ -154,10 +206,13 @@ struct memlat_group {
 	u32				adaptive_cur_freq;
 	u32				adaptive_high_freq;
 	u32				adaptive_low_freq;
+	u32				adaptive_level_1;
 	bool				fp_voting_enabled;
 	u32				fp_freq;
 	u32				*fp_votes;
 	u32				grp_ev_ids[NUM_GRP_EVS];
+	u32				hw_min_freq;
+	u32				hw_max_freq;
 	struct memlat_mon		*mons;
 	u32				num_mons;
 	u32				num_inited_mons;
@@ -184,7 +239,7 @@ struct memlat_dev_data {
 	bool				sampling_enabled;
 	bool				inited;
 /* CPUCP related struct fields */
-	const struct scmi_memlat_vendor_ops *memlat_ops;
+	const struct qcom_scmi_vendor_ops *ops;
 	struct scmi_protocol_handle	*ph;
 	u32				cpucp_sample_ms;
 	u32				cpucp_log_level;
@@ -223,28 +278,32 @@ static ssize_t show_##name(struct kobject *kobj,			\
 	return scnprintf(buf, PAGE_SIZE, "%u\n", mon->name);		\
 }									\
 
-#define store_attr(name, _min, _max)					\
+#define store_attr(name, _min, _max, param_id)					\
 static ssize_t store_##name(struct kobject *kobj,			\
 			struct attribute *attr, const char *buf,	\
 			size_t count)					\
 {									\
 	int ret;							\
 	unsigned int val;						\
+	struct scalar_param_msg msg;                                            \
 	struct memlat_mon *mon = to_memlat_mon(kobj);			\
 	struct memlat_group *grp = mon->memlat_grp;			\
-	const struct scmi_memlat_vendor_ops *ops = memlat_data->memlat_ops;	\
+	const struct qcom_scmi_vendor_ops *ops = memlat_data->ops;       \
 	ret = kstrtouint(buf, 10, &val);				\
 	if (ret < 0)							\
 		return ret;						\
 	val = max(val, _min);						\
 	val = min(val, _max);						\
 	mon->name = val;						\
-	if (mon->type == CPUCP_MON && ops) {					\
-		ret = ops->name(memlat_data->ph, grp->hw_type,		\
-				mon->index, mon->name);			\
-		if (ret == 0) {							\
+	if ((mon->type & CPUCP_MON) && ops)  {				\
+		msg.hw_type = grp->hw_type;                                             \
+		msg.mon_idx = mon->index;                                                \
+		msg.val = val;                                          \
+		ret = ops->set_param(memlat_data->ph, &msg, MEMLAT_ALGO_STR,            \
+				param_id, sizeof(msg));                              \
+		if (ret < 0) {						\
 			pr_err("failed to set mon tunable :%d\n", ret);	\
-			count = 0;					\
+			return ret;					\
 		}							\
 	}								\
 	return count;							\
@@ -258,22 +317,35 @@ static ssize_t show_##name(struct kobject *kobj,			\
 	return scnprintf(buf, PAGE_SIZE, "%u\n", grp->name);		\
 }									\
 
-#define store_grp_attr(name, _min, _max)				\
-static ssize_t store_##name(struct kobject *kobj,			\
-			struct attribute *attr, const char *buf,	\
-			size_t count)					\
-{									\
-	int ret;							\
-	unsigned int val;						\
-	struct memlat_group *grp = to_memlat_grp(kobj);			\
-	ret = kstrtouint(buf, 10, &val);				\
-	if (ret < 0)							\
-		return ret;						\
-	val = max(val, _min);						\
-	val = min(val, _max);						\
-	grp->name = val;						\
-	return count;							\
-}									\
+#define store_grp_attr(name, _min, _max, param_id)				\
+static ssize_t store_##name(struct kobject *kobj,                      \
+			struct attribute *attr, const char *buf,        \
+				size_t count)                                   \
+{                                                                      \
+		int ret;                                                        \
+		unsigned int val;                                               \
+		struct scalar_param_msg msg;                                            \
+		struct memlat_group *grp = to_memlat_grp(kobj);                 \
+		const struct qcom_scmi_vendor_ops *ops = memlat_data->ops;       \
+		ret = kstrtouint(buf, 10, &val);                                \
+		if (ret < 0)                                                    \
+			return ret;                                             \
+		val = max(val, _min);                                           \
+		val = min(val, _max);                                           \
+		grp->name = val;                                                \
+		if (grp->cpucp_enabled && ops) {                                        \
+			msg.hw_type = grp->hw_type;                                             \
+			msg.mon_idx = 0;                                                \
+			msg.val = val;                                          \
+			ret = ops->set_param(memlat_data->ph, &msg, MEMLAT_ALGO_STR,		\
+					param_id, sizeof(msg));	 \
+			if (ret < 0) {                                          \
+				pr_err("failed to set grp tunable :%d\n", ret); \
+				return ret;                                     \
+			}                                                       \
+		}                                                               \
+		return count;                                                   \
+}
 
 static ssize_t store_min_freq(struct kobject *kobj,
 			struct attribute *attr, const char *buf,
@@ -283,21 +355,25 @@ static ssize_t store_min_freq(struct kobject *kobj,
 	unsigned int freq;
 	struct memlat_mon *mon = to_memlat_mon(kobj);
 	struct memlat_group *grp = mon->memlat_grp;
-	const struct scmi_memlat_vendor_ops *ops = memlat_data->memlat_ops;
+	struct scalar_param_msg msg;
+	const struct qcom_scmi_vendor_ops *ops =  memlat_data->ops;
 
 	ret = kstrtouint(buf, 10, &freq);
 	if (ret < 0)
 		return ret;
-	freq = max(freq, mon->mon_min_freq);
+	freq = max(freq, grp->hw_min_freq);
 	freq = min(freq, mon->max_freq);
 	mon->min_freq = freq;
 
-	if (mon->type == CPUCP_MON && ops) {
-		ret = ops->min_freq(memlat_data->ph, grp->hw_type,
-				    mon->index, mon->min_freq);
+	if ((mon->type & CPUCP_MON) && ops) {
+		msg.hw_type = grp->hw_type;
+		msg.mon_idx = mon->index;
+		msg.val = mon->min_freq;
+		ret = ops->set_param(memlat_data->ph,
+				&msg, MEMLAT_ALGO_STR, MEMLAT_SET_MIN_FREQ, sizeof(msg));
 		if (ret < 0) {
 			pr_err("failed to set min_freq :%d\n", ret);
-			count = 0;
+			return ret;
 		}
 	}
 
@@ -312,21 +388,24 @@ static ssize_t store_max_freq(struct kobject *kobj,
 	unsigned int freq;
 	struct memlat_mon *mon = to_memlat_mon(kobj);
 	struct memlat_group *grp = mon->memlat_grp;
-	const struct scmi_memlat_vendor_ops *ops = memlat_data->memlat_ops;
+	struct scalar_param_msg msg;
+	const struct qcom_scmi_vendor_ops *ops =  memlat_data->ops;
 
 	ret = kstrtouint(buf, 10, &freq);
 	if (ret < 0)
 		return ret;
 	freq = max(freq, mon->min_freq);
-	freq = min(freq, mon->mon_max_freq);
+	freq = min(freq, grp->hw_max_freq);
 	mon->max_freq = freq;
-
-	if (mon->type == CPUCP_MON && ops) {
-		ret = ops->max_freq(memlat_data->ph, grp->hw_type,
-				    mon->index, mon->max_freq);
+	if ((mon->type & CPUCP_MON) && ops) {
+		msg.hw_type = grp->hw_type;
+		msg.mon_idx = mon->index;
+		msg.val = mon->max_freq;
+		ret = ops->set_param(memlat_data->ph,
+				&msg, MEMLAT_ALGO_STR, MEMLAT_SET_MAX_FREQ, sizeof(msg));
 		if (ret < 0) {
 			pr_err("failed to set max_freq :%d\n", ret);
-			count = 0;
+			return ret;
 		}
 	}
 
@@ -353,20 +432,33 @@ static ssize_t show_freq_map(struct kobject *kobj,
 	return cnt;
 }
 
-static ssize_t show_spm_freq_map(struct kobject *kobj,
-			struct attribute *attr, char *buf)
+static int update_cpucp_sample_ms(unsigned int val)
 {
-	struct memlat_mon *mon = to_memlat_mon(kobj);
-	unsigned int cnt = 0, i;
+	const struct qcom_scmi_vendor_ops *ops =  memlat_data->ops;
+	struct memlat_group *grp;
+	int i, ret;
 
-	cnt += scnprintf(buf, PAGE_SIZE, "CPU freq (MHz)\tMem freq (kHz)\n");
-	for (i = 0; i < MAX_SPM_FREQ_MAP && mon->spm_freq_map[i].cpufreq_mhz; i++)
-		cnt += scnprintf(buf + cnt, PAGE_SIZE - cnt, "%14u\t%14u\n",
-				mon->spm_freq_map[i].cpufreq_mhz, mon->spm_freq_map[i].memfreq_khz);
-	if (cnt < PAGE_SIZE)
-		cnt += scnprintf(buf + cnt, PAGE_SIZE - cnt, "\n");
+	if (!ops)
+		return -ENODEV;
 
-	return cnt;
+	for (i = 0; i < MAX_MEMLAT_GRPS; i++) {
+		grp = memlat_data->groups[i];
+		if (grp && grp->cpucp_enabled)
+			break;
+	}
+	if (i == MAX_MEMLAT_GRPS)
+		return 0;
+
+	ret = ops->set_param(memlat_data->ph, &val,
+			MEMLAT_ALGO_STR, MEMLAT_SAMPLE_MS, sizeof(val));
+	if (ret < 0) {
+		pr_err("Failed to set cpucp sample ms :%d\n", ret);
+		return ret;
+	}
+
+	memlat_data->cpucp_sample_ms = val;
+
+	return ret;
 }
 
 #define MIN_SAMPLE_MS	4U
@@ -386,6 +478,12 @@ static ssize_t store_sample_ms(struct kobject *kobj,
 
 	memlat_data->sample_ms = val;
 
+	if (memlat_data->ops) {
+		ret = update_cpucp_sample_ms(val);
+		if (ret < 0)
+			pr_err("Warning: CPUCP sample_ms not set: %d\n", ret);
+	}
+
 	return count;
 }
 
@@ -399,21 +497,8 @@ static ssize_t store_cpucp_sample_ms(struct kobject *kobj,
 				     struct attribute *attr, const char *buf,
 				     size_t count)
 {
-	int ret, i;
+	int ret;
 	unsigned int val;
-	const struct scmi_memlat_vendor_ops *ops = memlat_data->memlat_ops;
-	struct memlat_group *grp;
-
-	if (!ops)
-		return -ENODEV;
-
-	for (i = 0; i < MAX_MEMLAT_GRPS; i++) {
-		grp = memlat_data->groups[i];
-		if (grp->cpucp_enabled)
-			break;
-	}
-	if (i == MAX_MEMLAT_GRPS)
-		return count;
 
 	ret = kstrtouint(buf, 10, &val);
 	if (ret < 0)
@@ -421,20 +506,17 @@ static ssize_t store_cpucp_sample_ms(struct kobject *kobj,
 	val = max(val, MIN_SAMPLE_MS);
 	val = min(val, MAX_SAMPLE_MS);
 
-	ret = ops->sample_ms(memlat_data->ph, val);
-	if (ret < 0) {
-		pr_err("Failed to set cpucp sample ms :%d\n", ret);
-		return 0;
-	}
+	ret = update_cpucp_sample_ms(val);
+	if (ret < 0)
+		return ret;
 
-	memlat_data->cpucp_sample_ms = val;
 	return count;
 }
 
 static ssize_t show_cpucp_sample_ms(struct kobject *kobj,
 				    struct attribute *attr, char *buf)
 {
-	return scnprintf(buf, PAGE_SIZE, "%lu\n", memlat_data->cpucp_sample_ms);
+	return scnprintf(buf, PAGE_SIZE, "%d\n", memlat_data->cpucp_sample_ms);
 }
 
 static ssize_t store_cpucp_log_level(struct kobject *kobj,
@@ -443,7 +525,7 @@ static ssize_t store_cpucp_log_level(struct kobject *kobj,
 {
 	int ret, i;
 	unsigned int val;
-	const struct scmi_memlat_vendor_ops *ops = memlat_data->memlat_ops;
+	const struct qcom_scmi_vendor_ops *ops =  memlat_data->ops;
 	struct memlat_group *grp;
 
 	if (!ops)
@@ -451,7 +533,7 @@ static ssize_t store_cpucp_log_level(struct kobject *kobj,
 
 	for (i = 0; i < MAX_MEMLAT_GRPS; i++) {
 		grp = memlat_data->groups[i];
-		if (grp->cpucp_enabled)
+		if (grp && grp->cpucp_enabled)
 			break;
 	}
 	if (i == MAX_MEMLAT_GRPS)
@@ -460,171 +542,160 @@ static ssize_t store_cpucp_log_level(struct kobject *kobj,
 	ret = kstrtouint(buf, 10, &val);
 	if (ret < 0)
 		return ret;
-
-	ret = ops->set_log_level(memlat_data->ph, val);
+	ret = ops->set_param(memlat_data->ph, &val,
+			MEMLAT_ALGO_STR, MEMLAT_SET_LOG_LEVEL, sizeof(val));
 	if (ret < 0) {
 		pr_err("failed to configure log_level, ret = %d\n", ret);
-		return 0;
+		return ret;
 	}
 
 	memlat_data->cpucp_log_level = val;
 	return count;
 }
 
-#define MIN_SPM_WINDOW_SIZE 1U
-static ssize_t store_spm_window_size(struct kobject *kobj,
-			struct attribute *attr, const char *buf,
-			size_t count)
-{
-	int ret;
-	u32 spm_window_size;
-	struct memlat_mon *mon = to_memlat_mon(kobj);
-
-	ret = kstrtouint(buf, 10, &spm_window_size);
-	if (ret < 0)
-		return ret;
-	spm_window_size = max(spm_window_size, MIN_SPM_WINDOW_SIZE);
-	spm_window_size = min(spm_window_size, MAX_SPM_WINDOW_SIZE);
-	mon->spm_window_size = spm_window_size;
-	return count;
-}
-
-#define MIN_SPM_DROP_PCT 1U
-#define MAX_SPM_DROP_PCT 100U
-static ssize_t store_spm_drop_pct(struct kobject *kobj,
-			struct attribute *attr, const char *buf,
-			size_t count)
-{
-	int ret;
-	u32 spm_drop_pct;
-	struct memlat_mon *mon = to_memlat_mon(kobj);
-
-	ret = kstrtouint(buf, 10, &spm_drop_pct);
-	if (ret < 0)
-		return ret;
-	spm_drop_pct = max(spm_drop_pct, MIN_SPM_DROP_PCT);
-	spm_drop_pct = min(spm_drop_pct, MAX_SPM_DROP_PCT);
-	mon->spm_drop_pct = spm_drop_pct;
-	mon->disable_spm_value = mon->spm_thres -
-				mult_frac(mon->spm_thres, mon->spm_drop_pct, 100);
-
-	return count;
-}
-
-#define MIN_SPM_THRES 1U
-#define MAX_SPM_THRES 1000U
-static ssize_t store_spm_thres(struct kobject *kobj,
-			struct attribute *attr, const char *buf,
-			size_t count)
-{
-	int ret;
-	u32 spm_thres;
-	struct memlat_mon *mon = to_memlat_mon(kobj);
-
-	ret = kstrtouint(buf, 10, &spm_thres);
-	if (ret < 0)
-		return ret;
-	spm_thres = max(spm_thres, MIN_SPM_THRES);
-	spm_thres = min(spm_thres, MAX_SPM_THRES);
-	mon->spm_thres = spm_thres;
-	if (mon->spm_thres < MAX_SPM_THRES)
-		mon->enable_spm_voting = 1;
-	else
-		mon->enable_spm_voting = 0;
-	mon->disable_spm_value = mon->spm_thres -
-				mult_frac(mon->spm_thres, mon->spm_drop_pct, 100);
-	return count;
-}
-
-static ssize_t store_spm_freq_map(struct kobject *kobj,
-			struct attribute *attr, const char *buf,
-			size_t count)
-{
-	struct memlat_mon *mon  = to_memlat_mon(kobj);
-	int ret;
-	char  *sptr, *token, *str;
-	u32 val, i;
-
-	str = kstrdup(buf, GFP_KERNEL);
-	if (!str)
-		return -ENOMEM;
-	sptr = str;
-	for (i = 0; i < MAX_SPM_FREQ_MAP; i++) {
-		token = strsep(&sptr, ":");
-		if (!token) {
-			ret =  -EINVAL;
-			goto out;
-		}
-		ret = kstrtouint(token, 10, &val);
-		if (ret < 0) {
-			ret =  -EINVAL;
-			goto out;
-		}
-		val = max(val, 0U);
-		val = min(val, U32_MAX);
-		mon->spm_freq_map[i].cpufreq_mhz = val;
-		token = strsep(&sptr, " ");
-		if (!token) {
-			ret =  -EINVAL;
-			goto out;
-		}
-		ret = kstrtouint(token, 10, &val);
-		if (ret < 0) {
-			ret =  -EINVAL;
-			goto out;
-		}
-		val = max(val, mon->min_freq);
-		val = min(val, mon->mon_max_freq);
-		mon->spm_freq_map[i].memfreq_khz = val;
-	}
-	ret = count;
-out:
-	kfree(str);
-	return ret;
-}
-
 static ssize_t show_cpucp_log_level(struct kobject *kobj,
 				    struct attribute *attr, char *buf)
 {
-	return scnprintf(buf, PAGE_SIZE, "%lu\n", memlat_data->cpucp_log_level);
+	return scnprintf(buf, PAGE_SIZE, "%d\n", memlat_data->cpucp_log_level);
+}
+
+static ssize_t store_flush_cpucp_log(struct kobject *kobj,
+				     struct attribute *attr, const char *buf,
+				     size_t count)
+{
+	int ret;
+	const struct qcom_scmi_vendor_ops *ops =  memlat_data->ops;
+
+	if (!ops)
+		return -ENODEV;
+	ret = ops->set_param(memlat_data->ph, 0,
+			MEMLAT_ALGO_STR, MEMLAT_FLUSH_LOGBUF, 0);
+	if (ret < 0) {
+		pr_err("failed to flush cpucp log, ret = %d\n", ret);
+		return ret;
+	}
+
+	return count;
+}
+
+static ssize_t show_flush_cpucp_log(struct kobject *kobj,
+				    struct attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "Echo here to flush cpucp logs\n");
+}
+
+static ssize_t show_hlos_cpucp_offset(struct kobject *kobj,
+				      struct attribute *attr, char *buf)
+{
+	int ret;
+	const struct qcom_scmi_vendor_ops *ops =  memlat_data->ops;
+	uint64_t cpucp_ts, hlos_ts;
+
+	if (!ops)
+		return -ENODEV;
+	ret = ops->get_param(memlat_data->ph, &cpucp_ts,
+			MEMLAT_ALGO_STR, MEMLAT_GET_TIMESTAMP, 0, sizeof(cpucp_ts));
+	if (ret < 0) {
+		pr_err("failed to get cpucp timestamp\n");
+		return ret;
+	}
+
+	hlos_ts = sched_clock()/1000;
+
+	return scnprintf(buf, PAGE_SIZE, "%llu\n", le64_to_cpu(cpucp_ts) - hlos_ts);
+}
+
+static ssize_t show_cur_freq(struct kobject *kobj,
+			     struct attribute *attr, char *buf)
+{
+	struct scalar_param_msg msg;
+	const struct qcom_scmi_vendor_ops *ops =  memlat_data->ops;
+	struct memlat_mon *mon = to_memlat_mon(kobj);
+	struct memlat_group *grp = mon->memlat_grp;
+	uint32_t cur_freq;
+	int ret;
+
+	if (!grp->cpucp_enabled)
+		return scnprintf(buf, PAGE_SIZE, "%u\n", mon->cur_freq);
+
+	if (!ops)
+		return -ENODEV;
+	msg.hw_type = grp->hw_type;
+	msg.mon_idx = mon->index;
+	ret = ops->get_param(memlat_data->ph, &msg,
+			MEMLAT_ALGO_STR, MEMLAT_GET_CUR_FREQ, sizeof(msg), sizeof(cur_freq));
+	if (ret < 0) {
+		pr_err("failed to get mon current frequency\n");
+		return ret;
+	}
+	memcpy(&cur_freq, (void *)&msg, sizeof(cur_freq));
+	return scnprintf(buf, PAGE_SIZE, "%u\n", le32_to_cpu(cur_freq));
+}
+
+static ssize_t show_adaptive_cur_freq(struct kobject *kobj,
+				      struct attribute *attr, char *buf)
+{
+	struct scalar_param_msg msg;
+	const struct qcom_scmi_vendor_ops *ops =  memlat_data->ops;
+	uint32_t adaptive_cur_freq;
+	struct memlat_group *grp = to_memlat_grp(kobj);
+	int ret;
+
+	if (!grp->cpucp_enabled)
+		return scnprintf(buf, PAGE_SIZE, "%u\n", grp->adaptive_cur_freq);
+
+	if (!ops)
+		return -ENODEV;
+	msg.hw_type = grp->hw_type;
+	msg.mon_idx = 0;
+	ret = ops->get_param(memlat_data->ph, &msg, MEMLAT_ALGO_STR,
+			MEMLAT_GET_ADAPTIVE_CUR_FREQ, sizeof(msg), sizeof(adaptive_cur_freq));
+	if (ret < 0) {
+		pr_err("failed to get grp adaptive current frequency\n");
+		return ret;
+	}
+	memcpy(&adaptive_cur_freq, &msg, sizeof(adaptive_cur_freq));
+	return scnprintf(buf, PAGE_SIZE, "%u\n", le32_to_cpu(adaptive_cur_freq));
 }
 
 show_grp_attr(sampling_cur_freq);
-show_grp_attr(adaptive_cur_freq);
 show_grp_attr(adaptive_high_freq);
-store_grp_attr(adaptive_high_freq, 0U, 8000000U);
+store_grp_attr(adaptive_high_freq, 0U, 8000000U, MEMLAT_ADAPTIVE_HIGH_FREQ);
 show_grp_attr(adaptive_low_freq);
-store_grp_attr(adaptive_low_freq, 0U, 8000000U);
+store_grp_attr(adaptive_low_freq, 0U, 8000000U, MEMLAT_ADAPTIVE_LOW_FREQ);
+show_grp_attr(adaptive_level_1);
+store_grp_attr(adaptive_level_1, 0U, 8000000U, MEMLAT_ADAPTIVE_LEVEL_1);
 
 show_attr(min_freq);
 show_attr(max_freq);
-show_attr(cur_freq);
 show_attr(ipm_ceil);
-store_attr(ipm_ceil, 1U, 50000U);
+store_attr(ipm_ceil, 1U, 50000U, MEMLAT_IPM_CEIL);
 show_attr(fe_stall_floor);
-store_attr(fe_stall_floor, 0U, 100U);
+store_attr(fe_stall_floor, 0U, 100U, MEMLAT_FE_STALL_FLOOR);
 show_attr(be_stall_floor);
-store_attr(be_stall_floor, 0U, 100U);
+store_attr(be_stall_floor, 0U, 100U, MEMLAT_BE_STALL_FLOOR);
 show_attr(freq_scale_pct);
-store_attr(freq_scale_pct, 0U, 1000U);
+store_attr(freq_scale_pct, 0U, 1000U, MEMLAT_FREQ_SCALE_PCT);
 show_attr(wb_pct_thres);
-store_attr(wb_pct_thres, 0U, 100U);
+store_attr(wb_pct_thres, 0U, 100U, MEMLAT_WB_PCT);
 show_attr(wb_filter_ipm);
-store_attr(wb_filter_ipm, 0U, 50000U);
-store_attr(freq_scale_limit_mhz, 0U, 5000U);
-show_attr(freq_scale_limit_mhz);
-show_attr(spm_drop_pct);
-show_attr(spm_thres);
-show_attr(spm_window_size);
+store_attr(wb_filter_ipm, 0U, 50000U, MEMLAT_IPM_FILTER);
+show_attr(freq_scale_ceil_mhz);
+store_attr(freq_scale_ceil_mhz, 0U, 5000U, MEMLAT_FREQ_SCALE_CEIL_MHZ);
+show_attr(freq_scale_floor_mhz);
+store_attr(freq_scale_floor_mhz, 0U, 5000U, MEMLAT_FREQ_SCALE_FLOOR_MHZ);
 
 MEMLAT_ATTR_RW(sample_ms);
 MEMLAT_ATTR_RW(cpucp_sample_ms);
 MEMLAT_ATTR_RW(cpucp_log_level);
+MEMLAT_ATTR_RW(flush_cpucp_log);
+MEMLAT_ATTR_RO(hlos_cpucp_offset);
 
 MEMLAT_ATTR_RO(sampling_cur_freq);
 MEMLAT_ATTR_RO(adaptive_cur_freq);
 MEMLAT_ATTR_RW(adaptive_low_freq);
 MEMLAT_ATTR_RW(adaptive_high_freq);
+MEMLAT_ATTR_RW(adaptive_level_1);
 
 MEMLAT_ATTR_RW(min_freq);
 MEMLAT_ATTR_RW(max_freq);
@@ -636,28 +707,30 @@ MEMLAT_ATTR_RW(be_stall_floor);
 MEMLAT_ATTR_RW(freq_scale_pct);
 MEMLAT_ATTR_RW(wb_pct_thres);
 MEMLAT_ATTR_RW(wb_filter_ipm);
-MEMLAT_ATTR_RW(freq_scale_limit_mhz);
-MEMLAT_ATTR_RW(spm_thres);
-MEMLAT_ATTR_RW(spm_drop_pct);
-MEMLAT_ATTR_RW(spm_window_size);
-MEMLAT_ATTR_RW(spm_freq_map);
+MEMLAT_ATTR_RW(freq_scale_ceil_mhz);
+MEMLAT_ATTR_RW(freq_scale_floor_mhz);
 
-static struct attribute *memlat_settings_attr[] = {
+static struct attribute *memlat_settings_attrs[] = {
 	&sample_ms.attr,
 	&cpucp_sample_ms.attr,
 	&cpucp_log_level.attr,
+	&flush_cpucp_log.attr,
+	&hlos_cpucp_offset.attr,
 	NULL,
 };
+ATTRIBUTE_GROUPS(memlat_settings);
 
-static struct attribute *memlat_grp_attr[] = {
+static struct attribute *memlat_grp_attrs[] = {
 	&sampling_cur_freq.attr,
 	&adaptive_cur_freq.attr,
 	&adaptive_high_freq.attr,
 	&adaptive_low_freq.attr,
+	&adaptive_level_1.attr,
 	NULL,
 };
+ATTRIBUTE_GROUPS(memlat_grp);
 
-static struct attribute *memlat_mon_attr[] = {
+static struct attribute *memlat_mon_attrs[] = {
 	&min_freq.attr,
 	&max_freq.attr,
 	&freq_map.attr,
@@ -668,21 +741,20 @@ static struct attribute *memlat_mon_attr[] = {
 	&freq_scale_pct.attr,
 	&wb_pct_thres.attr,
 	&wb_filter_ipm.attr,
-	&freq_scale_limit_mhz.attr,
-	&spm_thres.attr,
-	&spm_drop_pct.attr,
-	&spm_window_size.attr,
-	&spm_freq_map.attr,
+	&freq_scale_ceil_mhz.attr,
+	&freq_scale_floor_mhz.attr,
 	NULL,
 };
+ATTRIBUTE_GROUPS(memlat_mon);
 
-static struct attribute *compute_mon_attr[] = {
+static struct attribute *compute_mon_attrs[] = {
 	&min_freq.attr,
 	&max_freq.attr,
 	&freq_map.attr,
 	&cur_freq.attr,
 	NULL,
 };
+ATTRIBUTE_GROUPS(compute_mon);
 
 static ssize_t attr_show(struct kobject *kobj, struct attribute *attr,
 				char *buf)
@@ -713,27 +785,27 @@ static const struct sysfs_ops memlat_sysfs_ops = {
 	.store	= attr_store,
 };
 
-static struct kobj_type memlat_settings_ktype = {
+static const struct kobj_type memlat_settings_ktype = {
 	.sysfs_ops	= &memlat_sysfs_ops,
-	.default_attrs	= memlat_settings_attr,
+	.default_groups	= memlat_settings_groups,
 
 };
 
-static struct kobj_type memlat_mon_ktype = {
+static const struct kobj_type memlat_mon_ktype = {
 	.sysfs_ops	= &memlat_sysfs_ops,
-	.default_attrs	= memlat_mon_attr,
+	.default_groups	= memlat_mon_groups,
 
 };
 
-static struct kobj_type compute_mon_ktype = {
+static const struct kobj_type compute_mon_ktype = {
 	.sysfs_ops	= &memlat_sysfs_ops,
-	.default_attrs	= compute_mon_attr,
+	.default_groups	= compute_mon_groups,
 
 };
 
-static struct kobj_type memlat_grp_ktype = {
+static const struct kobj_type memlat_grp_ktype = {
 	.sysfs_ops	= &memlat_sysfs_ops,
-	.default_attrs	= memlat_grp_attr,
+	.default_groups	= memlat_grp_groups,
 
 };
 
@@ -835,20 +907,6 @@ static void calculate_sampling_stats(void)
 				stats->ipm[grp] /=
 					delta->grp_ctrs[grp][MISS_IDX];
 
-			if (delta->grp_ctrs[grp][MISS_IDX] > 0)
-				stats->l2miss_ratio[grp] = mult_frac(100,
-					delta->grp_ctrs[DCVS_L3][MISS_IDX],
-					delta->grp_ctrs[grp][MISS_IDX]);
-			else
-				stats->l2miss_ratio[grp] =
-				(delta->grp_ctrs[DCVS_L3][MISS_IDX] * 100);
-
-			stats->spm[grp] = delta->common_ctrs[BE_STALL_IDX];
-			if (delta->grp_ctrs[grp][MISS_IDX])
-				stats->spm[grp] /=
-					delta->grp_ctrs[grp][MISS_IDX];
-			else
-				stats->spm[grp] = 0;
 			if (!memlat_grp->grp_ev_ids[WB_IDX]
 					|| !memlat_grp->grp_ev_ids[ACC_IDX])
 				stats->wb_pct[grp] = 0;
@@ -890,7 +948,10 @@ static inline void apply_adaptive_freq(struct memlat_group *memlat_grp,
 {
 	u32 prev_freq = memlat_grp->adaptive_cur_freq;
 
-	if (*max_freq < memlat_grp->adaptive_low_freq) {
+	if (*max_freq < memlat_grp->adaptive_level_1) {
+		*max_freq = memlat_grp->adaptive_level_1;
+		memlat_grp->adaptive_cur_freq = memlat_grp->adaptive_level_1;
+	} else if (*max_freq < memlat_grp->adaptive_low_freq) {
 		*max_freq = memlat_grp->adaptive_low_freq;
 		memlat_grp->adaptive_cur_freq = memlat_grp->adaptive_low_freq;
 	} else if (*max_freq < memlat_grp->adaptive_high_freq) {
@@ -908,25 +969,15 @@ static void calculate_mon_sampling_freq(struct memlat_mon *mon)
 {
 	struct cpu_stats *stats;
 	int cpu, max_cpu = cpumask_first(&mon->cpus);
-	u32 max_memfreq, max_cpufreq = 0, max_max_spm_cpufreq = 0, max_spm_cpufreq = 0;
-	u32 max_cpufreq_scaled = 0, ipm_diff, base_vote = 0;
+	u32 max_memfreq, max_cpufreq = 0;
+	u32 max_cpufreq_scaled = 0, ipm_diff;
 	u32 hw = mon->memlat_grp->hw_type;
-	u32 max_spm = 0, avg_spm = 0, min_l2miss_ratio = U32_MAX;
-	u64  max_miss = 0;
-	u32 miss_delta, miss_delta_pct;
-	u32 i, j, vote_idx, spm_max_vote_khz;
-	struct cpufreq_memfreq_map *map;
 
 	if (hw >= NUM_DCVS_HW_TYPES)
 		return;
 
 	for_each_cpu(cpu, &mon->cpus) {
 		stats = per_cpu(sampling_stats, cpu);
-		/* these are max of any CPU (for SPM algo) */
-		if (stats->l2miss_ratio[hw])
-			min_l2miss_ratio = min(stats->l2miss_ratio[hw], min_l2miss_ratio);
-		max_miss = max(stats->delta.grp_ctrs[hw][MISS_IDX], max_miss);
-		max_spm_cpufreq = max(max_spm_cpufreq, stats->freq_mhz);
 		if (mon->is_compute || (stats->wb_pct[hw] >= mon->wb_pct_thres
 		    && stats->ipm[hw] <= mon->wb_filter_ipm))
 			set_higher_freq(&max_cpu, cpu, &max_cpufreq,
@@ -934,82 +985,22 @@ static void calculate_mon_sampling_freq(struct memlat_mon *mon)
 		else if (stats->ipm[hw] <= mon->ipm_ceil) {
 			ipm_diff = mon->ipm_ceil - stats->ipm[hw];
 			max_cpufreq_scaled = stats->freq_mhz;
-
-			if (mon->enable_spm_voting && stats->freq_mhz >= SPM_CPU_FREQ_IGN)
-				max_spm = max(stats->spm[hw], max_spm);
-
-			if (mon->freq_scale_pct && stats->freq_mhz &&
-			    (stats->freq_mhz < mon->freq_scale_limit_mhz) &&
-			    (stats->be_stall_pct >= mon->be_stall_floor)) {
+			if (mon->freq_scale_pct &&
+			    (stats->freq_mhz > mon->freq_scale_floor_mhz &&
+			     stats->freq_mhz < mon->freq_scale_ceil_mhz) &&
+			    (stats->fe_stall_pct >= mon->fe_stall_floor ||
+			     stats->be_stall_pct >= mon->be_stall_floor)) {
 				max_cpufreq_scaled += (stats->freq_mhz * ipm_diff *
 					mon->freq_scale_pct) / (mon->ipm_ceil * 100);
-				max_cpufreq_scaled = min(mon->freq_scale_limit_mhz,
+				max_cpufreq_scaled = min(mon->freq_scale_ceil_mhz,
 							 max_cpufreq_scaled);
 			}
 			set_higher_freq(&max_cpu, cpu, &max_cpufreq,
 					max_cpufreq_scaled);
 		}
 	}
+
 	max_memfreq = cpufreq_to_memfreq(mon, max_cpufreq);
-
-	base_vote = max_memfreq;
-	if (mon->enable_spm_voting) {
-		mon->sampled_max_spm[mon->sampled_spm_idx] = max_spm;
-		mon->sampled_max_cpu_freq[mon->sampled_spm_idx] = max_spm_cpufreq;
-		mon->sampled_spm_idx = (mon->sampled_spm_idx + 1) % mon->spm_window_size;
-		for (i = 0; i < mon->spm_window_size; i++) {
-			avg_spm += mon->sampled_max_spm[i];
-			max_max_spm_cpufreq = max(max_max_spm_cpufreq,
-				mon->sampled_max_cpu_freq[i]);
-		}
-		avg_spm = avg_spm / mon->spm_window_size;
-		if (avg_spm >= mon->spm_thres && ((min_l2miss_ratio
-			< L2MISS_RATIO_THRES) || max_spm_cpufreq >= SPM_FREQ_THRES))
-			mon->spm_vote_inc_steps++;
-		else if (avg_spm < mon->disable_spm_value && mon->spm_vote_inc_steps >= 1)
-			mon->spm_vote_inc_steps--;
-
-		if (mon->spm_vote_inc_steps && max_miss < mon->prev_max_miss) {
-			miss_delta = mon->prev_max_miss - max_miss;
-			miss_delta_pct = mult_frac(100, miss_delta, mon->prev_max_miss);
-			if (miss_delta_pct >= MISS_DELTA_PCT_THRES)
-				mon->spm_vote_inc_steps = 0;
-		}
-		mon->prev_max_miss = max_miss;
-		if (max_spm_cpufreq < SPM_CPU_FREQ_IGN)
-			mon->spm_vote_inc_steps = 0;
-		if (mon->spm_vote_inc_steps) {
-			if (max_max_spm_cpufreq < mon->spm_freq_map[0].cpufreq_mhz)
-				spm_max_vote_khz = mon->spm_freq_map[0].memfreq_khz;
-			else if (max_max_spm_cpufreq < mon->spm_freq_map[1].cpufreq_mhz)
-				spm_max_vote_khz = mon->spm_freq_map[1].memfreq_khz;
-			else
-				spm_max_vote_khz = mon->max_freq;
-		}
-	} else
-		mon->spm_vote_inc_steps = 0;
-
-	map = mon->freq_map;
-	if (mon->spm_vote_inc_steps && max_memfreq < spm_max_vote_khz) {
-		for (i = 0; i < mon->freq_map_len && map[i].cpufreq_mhz; i++) {
-			if (map[i].memfreq_khz >= max_memfreq)
-				break;
-		}
-		for (j = i; j < mon->freq_map_len && map[j].cpufreq_mhz; j++) {
-			if (map[j].memfreq_khz >= spm_max_vote_khz)
-				break;
-		}
-		if (i != mon->freq_map_len && j != mon->freq_map_len) {
-			vote_idx = i + mon->spm_vote_inc_steps;
-			vote_idx = min(vote_idx, j);
-			if (i + mon->spm_vote_inc_steps > j)
-				mon->spm_vote_inc_steps = j - i;
-			if (vote_idx < mon->freq_map_len && mon->freq_map[vote_idx].memfreq_khz)
-				max_memfreq = min(mon->freq_map[vote_idx].memfreq_khz,
-								spm_max_vote_khz);
-		}
-	}
-
 	max_memfreq = max(max_memfreq, mon->min_freq);
 	max_memfreq = min(max_memfreq, mon->max_freq);
 
@@ -1019,12 +1010,6 @@ static void calculate_mon_sampling_freq(struct memlat_mon *mon)
 				stats->delta.common_ctrs[INST_IDX],
 				stats->delta.grp_ctrs[hw][MISS_IDX],
 				max_cpufreq, max_memfreq);
-
-		if (mon->enable_spm_voting)
-			trace_memlat_spm_update(dev_name(mon->dev),
-				max_spm_cpufreq, max_max_spm_cpufreq, base_vote,
-				max_memfreq, mon->spm_vote_inc_steps,
-				spm_max_vote_khz, avg_spm, min_l2miss_ratio);
 	}
 
 	mon->cur_freq = max_memfreq;
@@ -1114,6 +1099,7 @@ static void memlat_update_work(struct work_struct *work)
 		}
 		if (memlat_grp->adaptive_high_freq ||
 				memlat_grp->adaptive_low_freq ||
+				memlat_grp->adaptive_level_1 ||
 				memlat_grp->adaptive_cur_freq)
 			apply_adaptive_freq(memlat_grp, &max_freqs[grp]);
 	}
@@ -1253,36 +1239,25 @@ out:
 	spin_unlock_irqrestore(&stats->ctrs_lock, flags);
 }
 
-static void get_mpidr_cpu(void *cpu)
-{
-	u64 mpidr = read_cpuid_mpidr() & MPIDR_HWID_BITMASK;
-
-	*((uint32_t *)cpu) = MPIDR_AFFINITY_LEVEL(mpidr, 1);
-}
-
 static int get_mask_and_mpidr_from_pdev(struct platform_device *pdev,
 					cpumask_t *mask, u32 *cpus_mpidr)
 {
 	struct device *dev = &pdev->dev;
 	struct device_node *dev_phandle;
-	struct device *cpu_dev;
 	int cpu, i = 0;
 	uint32_t physical_cpu;
 	int ret = -ENODEV;
 
 	dev_phandle = of_parse_phandle(dev->of_node, "qcom,cpulist", i++);
 	while (dev_phandle) {
-		for_each_possible_cpu(cpu) {
-			cpu_dev = get_cpu_device(cpu);
-			if (cpu_dev && cpu_dev->of_node == dev_phandle) {
-				cpumask_set_cpu(cpu, mask);
-				smp_call_function_single(cpu, get_mpidr_cpu,
-							 &physical_cpu, true);
-				*cpus_mpidr |= BIT(physical_cpu);
-				ret = 0;
-				break;
-			}
+		cpu = of_cpu_node_to_id(dev_phandle);
+		if (cpu >= 0) {
+			cpumask_set_cpu(cpu, mask);
+			physical_cpu = cpu_logical_to_phys(cpu);
+			*cpus_mpidr |= BIT(physical_cpu);
+			ret = 0;
 		}
+		of_node_put(dev_phandle);
 		dev_phandle = of_parse_phandle(dev->of_node, "qcom,cpulist", i++);
 	}
 
@@ -1402,21 +1377,16 @@ static inline bool should_enable_memlat_fp(void)
 	return false;
 }
 
-static int configure_cpucp_grp(struct memlat_group *grp)
+#if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+static int configure_cpucp_common_events(void)
 {
-	const struct scmi_memlat_vendor_ops *ops = memlat_data->memlat_ops;
+
+	struct ev_map_msg msg;
+	const struct qcom_scmi_vendor_ops *ops = memlat_data->ops;
 	int ret = 0, i, j = 0;
-	struct device_node *of_node = grp->dev->of_node;
-	u8 ev_map[MAX_EV_CNTRS];
+	u8 ev_map[NUM_COMMON_EVS];
 
-	ret = ops->set_mem_grp(memlat_data->ph, *cpumask_bits(cpu_possible_mask),
-			       grp->hw_type);
-	if (ret < 0) {
-		pr_err("Failed to configure mem grp %s\n", of_node->name);
-		return ret;
-	}
-
-	memset(ev_map, 0xFF, MAX_EV_CNTRS);
+	memset(ev_map, 0xFF, NUM_COMMON_EVS);
 	for (i = 0; i < NUM_COMMON_EVS; i++, j++) {
 		if (!memlat_data->common_ev_ids[i])
 			continue;
@@ -1425,7 +1395,36 @@ static int configure_cpucp_grp(struct memlat_group *grp)
 		if (ret >= 0 && ret < MAX_CPUCP_EVT)
 			ev_map[j] = ret;
 	}
+	msg.num_evs = NUM_COMMON_EVS;
+	msg.hw_type = INVALID_IDX;
+	for (i = 0; i < NUM_COMMON_EVS; i++)
+		msg.cid[i] = ev_map[i];
+	ret = ops->set_param(memlat_data->ph, &msg,
+			MEMLAT_ALGO_STR, MEMLAT_SET_COMMON_EV_MAP, sizeof(msg));
+	return ret;
+}
 
+static int configure_cpucp_grp(struct memlat_group *grp)
+{
+	struct node_msg msg;
+	struct ev_map_msg ev_msg;
+	const struct qcom_scmi_vendor_ops *ops = memlat_data->ops;
+	int ret = 0, i, j = 0;
+	struct device_node *of_node = grp->dev->of_node;
+	u8 ev_map[NUM_GRP_EVS];
+
+	msg.cpumask = *cpumask_bits(cpu_possible_mask);
+	msg.hw_type = grp->hw_type;
+	msg.mon_type = 0;
+	msg.mon_idx = 0;
+	ret = ops->set_param(memlat_data->ph, &msg,
+			MEMLAT_ALGO_STR, MEMLAT_SET_MEM_GROUP, sizeof(msg));
+	if (ret < 0) {
+		pr_err("Failed to configure mem grp %s\n", of_node->name);
+		return ret;
+	}
+
+	memset(ev_map, 0xFF, NUM_GRP_EVS);
 	for (i = 0; i < NUM_GRP_EVS; i++, j++) {
 		if (!grp->grp_ev_ids[i])
 			continue;
@@ -1434,173 +1433,232 @@ static int configure_cpucp_grp(struct memlat_group *grp)
 		if (ret >= 0 && ret < MAX_CPUCP_EVT)
 			ev_map[j] = ret;
 	}
-
-	ret = ops->set_ev_map(memlat_data->ph, grp->hw_type, ev_map);
-	if (ret < 0)
+	ev_msg.num_evs = NUM_GRP_EVS;
+	ev_msg.hw_type = grp->hw_type;
+	for (i = 0; i < NUM_GRP_EVS; i++)
+		ev_msg.cid[i] = ev_map[i];
+	ret = ops->set_param(memlat_data->ph, &ev_msg,
+			MEMLAT_ALGO_STR, MEMLAT_SET_GRP_EV_MAP, sizeof(ev_msg));
+	if (ret < 0) {
 		pr_err("Failed to configure event map for mem grp %s\n",
 							of_node->name);
+		return ret;
+	}
 	return ret;
 }
 
 static int configure_cpucp_mon(struct memlat_mon *mon)
 {
 	struct memlat_group *grp = mon->memlat_grp;
-	const struct scmi_memlat_vendor_ops *ops = memlat_data->memlat_ops;
+	struct node_msg msg;
+	struct scalar_param_msg scalar_msg;
+	struct map_param_msg map_msg;
+	const struct qcom_scmi_vendor_ops *ops = memlat_data->ops;
+	int i;
 	struct device_node *of_node = mon->dev->of_node;
 	int ret;
+	const char c = ':';
 
-	ret = ops->set_mon(memlat_data->ph, mon->cpus_mpidr, grp->hw_type,
-			   mon->is_compute, mon->index);
+	msg.cpumask = mon->cpus_mpidr;
+	msg.hw_type = grp->hw_type;
+	msg.mon_type = mon->is_compute;
+	msg.mon_idx = mon->index;
+	if ((strrchr(dev_name(mon->dev), c) + 1))
+		scnprintf(msg.mon_name, MAX_NAME_LEN, "%s", (strrchr(dev_name(mon->dev), c) + 1));
+	ret = ops->set_param(memlat_data->ph, &msg,
+			MEMLAT_ALGO_STR, MEMLAT_SET_MONITOR, sizeof(msg));
 	if (ret < 0) {
 		pr_err("failed to configure monitor %s\n", of_node->name);
 		return ret;
 	}
-
-	ret = ops->ipm_ceil(memlat_data->ph, grp->hw_type, mon->index,
-			    mon->ipm_ceil);
+	scalar_msg.hw_type = grp->hw_type;
+	scalar_msg.mon_idx = mon->index;
+	scalar_msg.val = mon->ipm_ceil;
+	ret = ops->set_param(memlat_data->ph, &scalar_msg,
+			MEMLAT_ALGO_STR, MEMLAT_IPM_CEIL, sizeof(scalar_msg));
 	if (ret < 0) {
 		pr_err("failed to set ipm ceil for %s\n", of_node->name);
 		return ret;
 	}
+	scalar_msg.hw_type = grp->hw_type;
+	scalar_msg.mon_idx = mon->index;
+	scalar_msg.val = mon->fe_stall_floor;
+	ret = ops->set_param(memlat_data->ph, &scalar_msg,
+			MEMLAT_ALGO_STR, MEMLAT_FE_STALL_FLOOR, sizeof(scalar_msg));
 
-	ret = ops->fe_stall_floor(memlat_data->ph, grp->hw_type, mon->index,
-				  mon->fe_stall_floor);
 	if (ret < 0) {
 		pr_err("failed to set fe stall floor for %s\n", of_node->name);
 		return ret;
 	}
-
-	ret = ops->be_stall_floor(memlat_data->ph, grp->hw_type, mon->index,
-				  mon->be_stall_floor);
+	scalar_msg.hw_type = grp->hw_type;
+	scalar_msg.mon_idx = mon->index;
+	scalar_msg.val = mon->be_stall_floor;
+	ret = ops->set_param(memlat_data->ph, &scalar_msg,
+			MEMLAT_ALGO_STR, MEMLAT_BE_STALL_FLOOR, sizeof(scalar_msg));
 	if (ret < 0) {
 		pr_err("failed to set be stall floor for %s\n", of_node->name);
 		return ret;
 	}
-
-	ret = ops->sample_ms(memlat_data->ph, memlat_data->cpucp_sample_ms);
-	if (ret < 0) {
-		pr_err("failed to set cpucp sample_ms for %s\n", of_node->name);
-		return ret;
-	}
-
-	ret = ops->wb_pct_thres(memlat_data->ph, grp->hw_type, mon->index,
-				mon->wb_pct_thres);
+	scalar_msg.hw_type = grp->hw_type;
+	scalar_msg.mon_idx = mon->index;
+	scalar_msg.val = mon->wb_pct_thres;
+	ret = ops->set_param(memlat_data->ph, &scalar_msg,
+			MEMLAT_ALGO_STR, MEMLAT_WB_PCT, sizeof(scalar_msg));
 	if (ret < 0) {
 		pr_err("failed to set wb pct for %s\n", of_node->name);
 		return ret;
 	}
-
-	ret = ops->wb_filter_ipm(memlat_data->ph, grp->hw_type, mon->index,
-				 mon->wb_filter_ipm);
+	scalar_msg.hw_type = grp->hw_type;
+	scalar_msg.mon_idx = mon->index;
+	scalar_msg.val = mon->wb_filter_ipm;
+	ret = ops->set_param(memlat_data->ph, &scalar_msg,
+			MEMLAT_ALGO_STR, MEMLAT_IPM_FILTER, sizeof(scalar_msg));
 	if (ret < 0) {
 		pr_err("failed to set wb filter ipm for %s\n", of_node->name);
 		return ret;
 	}
 
-	ret = ops->freq_scale_pct(memlat_data->ph, grp->hw_type, mon->index,
-				  mon->freq_scale_pct);
+	scalar_msg.hw_type = grp->hw_type;
+	scalar_msg.mon_idx = mon->index;
+	scalar_msg.val = mon->freq_scale_pct;
+	ret = ops->set_param(memlat_data->ph, &scalar_msg,
+			MEMLAT_ALGO_STR, MEMLAT_FREQ_SCALE_PCT, sizeof(scalar_msg));
 	if (ret < 0) {
 		pr_err("failed to set freq_scale_pct for %s\n", of_node->name);
 		return ret;
 	}
-
-	ret = ops->freq_scale_limit_mhz(memlat_data->ph, grp->hw_type, mon->index,
-					mon->freq_scale_limit_mhz);
+	scalar_msg.hw_type = grp->hw_type;
+	scalar_msg.mon_idx = mon->index;
+	scalar_msg.val = mon->freq_scale_ceil_mhz;
+	ret = ops->set_param(memlat_data->ph, &scalar_msg,
+			MEMLAT_ALGO_STR, MEMLAT_FREQ_SCALE_CEIL_MHZ, sizeof(scalar_msg));
 	if (ret < 0) {
-		pr_err("failed to set wb filter ipm for %s\n", of_node->name);
+		pr_err("failed to failed to set freq_scale_ceil on %s\n", of_node->name);
+		return ret;
+	}
+	scalar_msg.hw_type = grp->hw_type;
+	scalar_msg.mon_idx = mon->index;
+	scalar_msg.val = mon->freq_scale_floor_mhz;
+	ret = ops->set_param(memlat_data->ph, &scalar_msg,
+			MEMLAT_ALGO_STR, MEMLAT_FREQ_SCALE_FLOOR_MHZ, sizeof(scalar_msg));
+	if (ret < 0) {
+		pr_err("failed to failed to set freq_scale_floor on %s\n", of_node->name);
 		return ret;
 	}
 
-	ret = ops->freq_map(memlat_data->ph, grp->hw_type, mon->index,
-			    mon->freq_map_len, mon->freq_map);
+	map_msg.hw_type = grp->hw_type;
+	map_msg.mon_idx = mon->index;
+	map_msg.nr_rows = mon->freq_map_len;
+	for (i = 0; i < mon->freq_map_len; i++) {
+		map_msg.tbl[i].v1 = mon->freq_map[i].cpufreq_mhz;
+		if (mon->freq_map[i].memfreq_khz > 1000)
+			map_msg.tbl[i].v2 = mon->freq_map[i].memfreq_khz / 1000;
+		else
+			/* in case of DDRQOS, we do not want to divide by 1000 */
+			map_msg.tbl[i].v2 = mon->freq_map[i].memfreq_khz;
+	}
+	ret = ops->set_param(memlat_data->ph, &map_msg,
+			MEMLAT_ALGO_STR, MEMLAT_MON_FREQ_MAP, sizeof(map_msg));
 	if (ret < 0) {
 		pr_err("failed to configure freq_map for %s\n", of_node->name);
 		return ret;
 	}
 
-	ret = ops->min_freq(memlat_data->ph, grp->hw_type, mon->index,
-			    mon->min_freq);
+	scalar_msg.hw_type = grp->hw_type;
+	scalar_msg.mon_idx = mon->index;
+	scalar_msg.val = mon->min_freq;
+	ret = ops->set_param(memlat_data->ph, &scalar_msg,
+			MEMLAT_ALGO_STR, MEMLAT_SET_MIN_FREQ, sizeof(scalar_msg));
 	if (ret < 0) {
 		pr_err("failed to set min_freq for %s\n", of_node->name);
 		return ret;
 	}
-
-	ret = ops->max_freq(memlat_data->ph, grp->hw_type, mon->index,
-			    mon->max_freq);
+	scalar_msg.hw_type = grp->hw_type;
+	scalar_msg.mon_idx = mon->index;
+	scalar_msg.val = mon->max_freq;
+	ret = ops->set_param(memlat_data->ph, &scalar_msg,
+			MEMLAT_ALGO_STR, MEMLAT_SET_MAX_FREQ, sizeof(scalar_msg));
 	if (ret < 0)
 		pr_err("failed to set max_freq for %s\n", of_node->name);
 
 	return ret;
 }
 
-int cpucp_memlat_init(struct scmi_device *sdev)
+static int cpucp_memlat_init(struct scmi_device *sdev)
 {
 	int ret = 0, i, j;
 	struct scmi_protocol_handle *ph;
-	const struct scmi_memlat_vendor_ops *ops;
+	const struct qcom_scmi_vendor_ops *ops;
 	struct memlat_group *grp;
 	bool start_cpucp_timer = false;
-
-	if (!memlat_data->inited)
-		return -EPROBE_DEFER;
 
 	if (!sdev || !sdev->handle)
 		return -EINVAL;
 
-	ops = sdev->handle->devm_get_protocol(sdev, SCMI_PROTOCOL_MEMLAT, &ph);
-	if (IS_ERR(ops))
-		return PTR_ERR(ops);
+	ops = sdev->handle->devm_protocol_get(sdev, QCOM_SCMI_VENDOR_PROTOCOL, &ph);
+	if (IS_ERR(ops)) {
+		ret = PTR_ERR(ops);
+		ops = NULL;
+		return ret;
+	}
 
 	mutex_lock(&memlat_lock);
 	memlat_data->ph = ph;
-	memlat_data->memlat_ops = ops;
+	memlat_data->ops = ops;
 
-	/* Configure group and common parameters */
+	/* Configure common events */
+	ret = configure_cpucp_common_events();
+	if (ret < 0) {
+		pr_err("Failed to configure common events: %d\n", ret);
+		goto memlat_unlock;
+	}
+
+	/* Configure group/mon parameters */
 	for (i = 0; i < MAX_MEMLAT_GRPS; i++) {
 		grp = memlat_data->groups[i];
-		if (!grp->cpucp_enabled)
+		if (!grp || !grp->cpucp_enabled)
 			continue;
 		ret = configure_cpucp_grp(grp);
 		if (ret < 0) {
 			pr_err("Failed to configure mem group: %d\n", ret);
-			ops = NULL;
 			goto memlat_unlock;
 		}
 
-		mutex_lock(&grp->mons_lock);
 		for (j = 0; j < grp->num_inited_mons; j++) {
-			if (grp->mons[j].type != CPUCP_MON)
+			if (!grp->cpucp_enabled)
 				continue;
 			/* Configure per monitor parameters */
 			ret = configure_cpucp_mon(&grp->mons[j]);
 			if (ret < 0) {
 				pr_err("failed to configure mon: %d\n", ret);
-				ops = NULL;
-				goto mons_unlock;
+				goto memlat_unlock;
 			}
 			start_cpucp_timer = true;
 		}
-		mutex_unlock(&grp->mons_lock);
+	}
+	ret = ops->set_param(memlat_data->ph, &memlat_data->cpucp_sample_ms,
+			MEMLAT_ALGO_STR, MEMLAT_SAMPLE_MS, sizeof(memlat_data->cpucp_sample_ms));
+
+	if (ret < 0) {
+		pr_err("failed to set cpucp sample_ms ret = %d\n", ret);
+		goto memlat_unlock;
 	}
 
 	/* Start sampling and voting timer */
-	if (!start_cpucp_timer)
-		goto memlat_unlock;
+	if (start_cpucp_timer) {
+		ret = ops->start_activity(memlat_data->ph, NULL,
+			MEMLAT_ALGO_STR, MEMLAT_START_TIMER, 0);
+		if (ret < 0)
+			pr_err("Error in starting the mem group timer %d\n", ret);
+	}
 
-	ret = ops->start_timer(memlat_data->ph);
-	if (ret < 0)
-		pr_err("Error in starting the mem group timer %d\n", ret);
-
-	goto memlat_unlock;
-
-mons_unlock:
-	mutex_unlock(&grp->mons_lock);
 memlat_unlock:
+	if (ret < 0)
+		memlat_data->ops = NULL;
 	mutex_unlock(&memlat_lock);
 	return ret;
 }
-EXPORT_SYMBOL(cpucp_memlat_init);
-
+#endif
 #define INST_EV		0x08
 #define CYC_EV		0x11
 static int memlat_dev_probe(struct platform_device *pdev)
@@ -1610,6 +1668,18 @@ static int memlat_dev_probe(struct platform_device *pdev)
 	struct memlat_dev_data *dev_data;
 	int i, cpu, ret;
 	u32 event_id;
+
+#if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+	struct scmi_device *scmi_dev;
+
+	scmi_dev = get_qcom_scmi_device();
+	if (IS_ERR(scmi_dev)) {
+		ret = PTR_ERR(scmi_dev);
+		if (ret == -EPROBE_DEFER)
+			return ret;
+		dev_err(dev, "Error getting scmi_dev ret = %d\n", ret);
+	}
+#endif
 
 	dev_data = devm_kzalloc(dev, sizeof(*dev_data), GFP_KERNEL);
 	if (!dev_data)
@@ -1662,7 +1732,7 @@ static int memlat_dev_probe(struct platform_device *pdev)
 			if (!ret)
 				continue;
 			if (ret != -EPROBE_DEFER) {
-				dev_err(dev, "ev=%lu not found on cpu%d: %d\n",
+				dev_err(dev, "ev=%u not found on cpu%d: %d\n",
 						event_id, cpu, ret);
 				if (event_id == INST_EV || event_id == CYC_EV)
 					return ret;
@@ -1702,14 +1772,17 @@ static int memlat_grp_probe(struct platform_device *pdev)
 	of_node = of_parse_phandle(dev->of_node, "qcom,target-dev", 0);
 	if (!of_node) {
 		dev_err(dev, "Unable to find target-dev for grp\n");
+		of_node_put(of_node);
 		return -EINVAL;
 	}
 
 	ret = of_property_read_u32(of_node, "qcom,dcvs-hw-type", &hw_type);
 	if (ret < 0 || hw_type >= NUM_DCVS_HW_TYPES) {
 		dev_err(dev, "invalid dcvs hw_type=%d, ret=%d\n", hw_type, ret);
+		of_node_put(of_node);
 		return -EINVAL;
 	}
+	of_node_put(of_node);
 
 	memlat_grp = devm_kzalloc(dev, sizeof(*memlat_grp), GFP_KERNEL);
 	if (!memlat_grp)
@@ -1719,11 +1792,14 @@ static int memlat_grp_probe(struct platform_device *pdev)
 	memlat_grp->dev = dev;
 
 	memlat_grp->dcvs_kobj = qcom_dcvs_kobject_get(hw_type);
-	if (IS_ERR(memlat_grp->dcvs_kobj)) {
-		ret = PTR_ERR(memlat_grp->dcvs_kobj);
-		dev_err(dev, "error getting kobj from qcom_dcvs: %d\n", ret);
-		return ret;
-	}
+	if (IS_ERR(memlat_grp->dcvs_kobj))
+		return dev_err_probe(dev, PTR_ERR(memlat_grp->dcvs_kobj),
+					"error getting kobj from qcom_dcvs\n");
+
+	ret = qcom_dcvs_hw_minmax_get(hw_type, &memlat_grp->hw_min_freq,
+						&memlat_grp->hw_max_freq);
+	if (ret < 0)
+		return dev_err_probe(dev, ret, "error getting minmax from qcom_dcvs\n");
 
 	of_node = of_parse_phandle(dev->of_node, "qcom,sampling-path", 0);
 	if (of_node) {
@@ -1732,6 +1808,7 @@ static int memlat_grp_probe(struct platform_device *pdev)
 		if (ret < 0 || path_type >= NUM_DCVS_PATHS) {
 			dev_err(dev, "invalid dcvs path: %d, ret=%d\n",
 							path_type, ret);
+			of_node_put(of_node);
 			return -EINVAL;
 		}
 		if (path_type == DCVS_FAST_PATH)
@@ -1742,12 +1819,14 @@ static int memlat_grp_probe(struct platform_device *pdev)
 								path_type);
 		if (ret < 0) {
 			dev_err(dev, "qcom dcvs registration error: %d\n", ret);
+			of_node_put(of_node);
 			return ret;
 		}
 		memlat_grp->sampling_path_type = path_type;
 	} else
 		memlat_grp->sampling_path_type = NUM_DCVS_PATHS;
 
+	of_node_put(of_node);
 	of_node = of_parse_phandle(dev->of_node, "qcom,threadlat-path", 0);
 	if (of_node) {
 		ret = of_property_read_u32(of_node, "qcom,dcvs-path-type",
@@ -1755,12 +1834,14 @@ static int memlat_grp_probe(struct platform_device *pdev)
 		if (ret < 0 || path_type >= NUM_DCVS_PATHS) {
 			dev_err(dev, "invalid dcvs path: %d, ret=%d\n",
 							path_type, ret);
+			of_node_put(of_node);
 			return -EINVAL;
 		}
 		memlat_grp->threadlat_path_type = path_type;
 	} else
 		memlat_grp->threadlat_path_type = NUM_DCVS_PATHS;
 
+	of_node_put(of_node);
 	if (path_type >= NUM_DCVS_PATHS) {
 		dev_err(dev, "error: no dcvs voting paths\n");
 		return -ENODEV;
@@ -1815,9 +1896,10 @@ static int memlat_grp_probe(struct platform_device *pdev)
 			ret = qcom_pmu_event_supported(event_id, cpu);
 			if (!ret)
 				continue;
-			if (ret != -EPROBE_DEFER)
-				dev_err(dev, "ev=%lu not found on cpu%d: %d\n",
+			if (ret != -EPROBE_DEFER) {
+				dev_err(dev, "ev=%d not found on cpu%d: %d\n",
 						event_id, cpu, ret);
+			}
 			return ret;
 		}
 	}
@@ -1846,9 +1928,16 @@ static int memlat_mon_probe(struct platform_device *pdev)
 	int ret = 0;
 	struct memlat_group *memlat_grp;
 	struct memlat_mon *mon;
-	struct device_node *of_node = dev->of_node;
+	struct device_node *of_tbl_node, *of_node = dev->of_node;
 	u32 num_cpus;
+#if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+	int cpucp_ret = 0;
+	struct scmi_device *scmi_dev;
+#endif
 
+	ret = cpu_logical_to_phys(0);
+	if (ret == -EPROBE_DEFER)
+		return ret;
 	memlat_grp = dev_get_drvdata(dev->parent);
 	if (!memlat_grp) {
 		dev_err(dev, "Mon probe called without memlat_grp inited.\n");
@@ -1902,30 +1991,33 @@ static int memlat_mon_probe(struct platform_device *pdev)
 	mon->freq_scale_pct = 0;
 	mon->wb_pct_thres = 100;
 	mon->wb_filter_ipm = 25000;
-	mon->freq_scale_limit_mhz = 5000;
-	mon->spm_thres = MAX_SPM_THRES;
-	mon->spm_drop_pct = 20;
-	mon->spm_window_size = 10;
-	mon->spm_freq_map[0].cpufreq_mhz = 1200;
-	mon->spm_freq_map[1].cpufreq_mhz = 2100;
-	mon->spm_freq_map[0].memfreq_khz = 1708000;
-	mon->spm_freq_map[1].memfreq_khz = 2092000;
+	mon->freq_scale_ceil_mhz = 5000;
+	mon->freq_scale_floor_mhz = 5000;
 
-	if (of_parse_phandle(of_node, COREDEV_TBL_PROP, 0))
-		of_node = of_parse_phandle(of_node, COREDEV_TBL_PROP, 0);
+
+	of_node = of_parse_phandle(of_node, COREDEV_TBL_PROP, 0);
+	if (!of_node)
+		of_node = dev->of_node;
+
 	if (of_get_child_count(of_node))
-		of_node = qcom_dcvs_get_ddr_child_node(of_node);
+		of_tbl_node = qcom_dcvs_get_ddr_child_node(of_node);
+	else
+		of_tbl_node = of_node;
 
-	mon->freq_map = init_cpufreq_memfreq_map(dev, of_node,
+	mon->freq_map = init_cpufreq_memfreq_map(dev, of_tbl_node,
 						 &mon->freq_map_len);
+
+	if (of_node != dev->of_node)
+		of_node_put(of_node);
+
 	if (!mon->freq_map) {
 		dev_err(dev, "error importing cpufreq-memfreq table!\n");
 		ret = -EINVAL;
 		goto unlock_out;
 	}
 
-	mon->mon_min_freq = mon->min_freq = cpufreq_to_memfreq(mon, 0);
-	mon->mon_max_freq = mon->max_freq = cpufreq_to_memfreq(mon, U32_MAX);
+	mon->min_freq = memlat_grp->hw_min_freq;
+	mon->max_freq = memlat_grp->hw_max_freq;
 	mon->cur_freq = mon->min_freq;
 
 	if (mon->is_compute)
@@ -1942,8 +2034,20 @@ static int memlat_mon_probe(struct platform_device *pdev)
 
 	mon->index = memlat_grp->num_inited_mons++;
 unlock_out_init:
-	if (memlat_grps_and_mons_inited())
+	if (memlat_grps_and_mons_inited()) {
 		memlat_data->inited = true;
+#if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+		scmi_dev = get_qcom_scmi_device();
+		if (IS_ERR(scmi_dev)) {
+			cpucp_ret = PTR_ERR(scmi_dev);
+			dev_err(dev, "get_qcom_scmi_device ret: %d\n", cpucp_ret);
+		} else {
+			cpucp_ret = cpucp_memlat_init(scmi_dev);
+			if (cpucp_ret < 0)
+				dev_err(dev, "Err during cpucp_memlat_init: %d\n", cpucp_ret);
+		}
+#endif
+	}
 
 unlock_out:
 	mutex_unlock(&memlat_grp->mons_lock);
@@ -2015,17 +2119,10 @@ static struct platform_driver qcom_memlat_driver = {
 		.suppress_bind_attrs = true,
 	},
 };
+module_platform_driver(qcom_memlat_driver);
 
-static int __init qcom_memlat_init(void)
-{
-	return platform_driver_register(&qcom_memlat_driver);
-}
-
-#if IS_MODULE(CONFIG_QCOM_MEMLAT)
-module_init(qcom_memlat_init);
-#else
-arch_initcall(qcom_memlat_init);
+#if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+MODULE_SOFTDEP("pre: qcom_scmi_client");
 #endif
-
 MODULE_DESCRIPTION("QCOM MEMLAT Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

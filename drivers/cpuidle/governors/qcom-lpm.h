@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2023-2025, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef __QCOM_LPM_H__
 #define __QCOM_LPM_H__
+
+#include <linux/cpumask.h>
 
 #define MAX_LPM_CPUS		8
 #define MAXSAMPLES		5
@@ -13,6 +15,7 @@
 #define PRED_PREMATURE_CNT	3
 #define PRED_REF_STDDEV		500
 #define CLUST_SMPL_INVLD_TIME	40000
+#define CLUST_BIAS_TIME_MSEC	10
 #define MAX_CLUSTER_STATES	4
 
 extern bool sleep_disabled;
@@ -62,6 +65,7 @@ struct lpm_cpu {
 	uint32_t pred_type;
 	bool ipi_pending;
 	spinlock_t lock;
+	bool cpu_off_invoked;
 };
 
 struct cluster_history {
@@ -76,7 +80,10 @@ struct lpm_cluster {
 	bool history_invalid;
 	bool htmr_wkup;
 	int entry_idx;
+	int restrict_idx;
 	int nsamp;
+	u32 samples_invalid_time;
+	u32 pred_premature_cnt;
 	struct cluster_history history[MAXSAMPLES];
 	struct generic_pm_domain *genpd;
 	struct qcom_cluster_node *dev_node[MAX_CLUSTER_STATES];
@@ -88,32 +95,35 @@ struct lpm_cluster {
 	ktime_t next_wakeup;
 	ktime_t pred_wakeup;
 	ktime_t now;
-	ktime_t cpu_next_wakeup[MAX_LPM_CPUS];
+	u64 pred_residency;
 	bool state_allowed[MAX_CLUSTER_STATES];
 	struct list_head list;
 	spinlock_t lock;
 	bool predicted;
 	bool initialized;
+	bool is_timer_expired;
+	bool is_timer_queued;
+	bool need_timer_requeue;
+	bool use_bias_timer;
 };
 
 struct cluster_governor {
 	void (*select)(struct lpm_cpu *cpu_gov);
 	void (*enable)(void);
 	void (*disable)(void);
-	void (*reflect)(void);
+	void (*reflect)(struct lpm_cpu *cpu_gov);
 };
 
 DECLARE_PER_CPU(struct lpm_cpu, lpm_cpu_data);
 
 int qcom_cluster_lpm_governor_init(void);
 void qcom_cluster_lpm_governor_deinit(void);
-void update_cluster_select(struct lpm_cpu *cpu_gov);
 void clear_cpu_predict_history(void);
 int create_global_sysfs_nodes(void);
 int create_cluster_sysfs_nodes(struct lpm_cluster *cluster_gov);
 void register_cluster_governor_ops(struct cluster_governor *ops);
-void unregister_cluster_governor_ops(struct cluster_governor *ops);
 void remove_global_sysfs_nodes(void);
 void remove_cluster_sysfs_nodes(struct lpm_cluster *cluster_gov);
+s64 get_cpus_qos(const struct cpumask *mask);
 
 #endif /* __QCOM_LPM_H__ */

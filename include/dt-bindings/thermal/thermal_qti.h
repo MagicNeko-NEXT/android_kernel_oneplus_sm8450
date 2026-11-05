@@ -1,5 +1,8 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (c) 2020-2021, The Linux Foundation. All rights reserved. */
+/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
+/*
+ * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2021-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ */
 
 #include <dt-bindings/thermal/thermal.h>
 
@@ -75,14 +78,23 @@
 #define QMI_SUB2_SCG_FR1_CC	61
 #define QMI_SUB2_SCG_FR2_CC	62
 #define QMI_NSP_ISENSE_TRIM	63
-#define QMI_SDR0_PA		64
-#define QMI_SDR1_PA		65
-#define QMI_MODEM_CFG	66
-#define QMI_LTE_CC		67
-#define QMI_MCG_FR1_CC	68
-#define QMI_MCG_FR2_CC	69
-#define QMI_SCG_FR1_CC	70
-#define QMI_SCG_FR2_CC	71
+#define QMI_EPM0		64
+#define QMI_EPM1		65
+#define QMI_EPM2		66
+#define QMI_EPM3		67
+#define QMI_EPM4		68
+#define QMI_EPM5		69
+#define QMI_EPM6		70
+#define QMI_EPM7		71
+#define QMI_SDR0_PA		72
+#define QMI_SDR1_PA		73
+#define QMI_SUB0_SDR0_PA	74
+#define QMI_SUB1_SDR0_PA	75
+#define QMI_SYS_THERM_3		76
+#define QMI_SYS_THERM_4		77
+#define QMI_SYS_THERM_5		78
+#define QMI_SYS_THERM_6		79
+#define QMI_RF_CAL              86
 
 #define QMI_MODEM_INST_ID	0x0
 #define QMI_ADSP_INST_ID	0x1

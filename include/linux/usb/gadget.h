@@ -10,13 +10,13 @@
  *
  * (C) Copyright 2002-2004 by David Brownell
  * All Rights Reserved.
- *
- * This software is licensed under the GNU GPL version 2.
  */
 
 #ifndef __LINUX_USB_GADGET_H
 #define __LINUX_USB_GADGET_H
 
+#include <linux/cleanup.h>
+#include <linux/configfs.h>
 #include <linux/device.h>
 #include <linux/errno.h>
 #include <linux/init.h>
@@ -26,8 +26,6 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 #include <linux/usb/ch9.h>
-#include <linux/pm_runtime.h>
-#include <linux/android_kabi.h>
 
 #define UDC_TRACE_STR_MAX	512
 
@@ -35,6 +33,7 @@ struct usb_ep;
 
 /**
  * struct usb_request - describes one i/o request
+ * @ep: The associated endpoint set by usb_ep_alloc_request().
  * @buf: Buffer used for data.  Always provide this; some controllers
  *	only use PIO, or don't use DMA for some endpoints.
  * @dma: DMA address corresponding to 'buf'.  If you don't set this
@@ -125,7 +124,7 @@ struct usb_request {
 	int			status;
 	unsigned		actual;
 
-	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_USE(1, struct usb_ep *ep);
 };
 
 /*-------------------------------------------------------------------------*/
@@ -203,7 +202,7 @@ struct usb_ep_caps {
  * @name:identifier for the endpoint, such as "ep-a" or "ep9in-bulk"
  * @ops: Function pointers used to access hardware-specific operations.
  * @ep_list:the gadget's ep_list holds all of its endpoints
- * @caps:The structure describing types and directions supported by endoint.
+ * @caps:The structure describing types and directions supported by endpoint.
  * @enabled: The current endpoint enabled/disabled state.
  * @claimed: True if this endpoint is claimed by a function.
  * @maxpacket:The maximum packet size used on this endpoint.  The initial
@@ -298,6 +297,28 @@ static inline void usb_ep_fifo_flush(struct usb_ep *ep)
 
 /*-------------------------------------------------------------------------*/
 
+/**
+ * free_usb_request - frees a usb_request object and its buffer
+ * @req: the request being freed
+ *
+ * This helper function frees both the request's buffer and the request object
+ * itself by calling usb_ep_free_request(). Its signature is designed to be used
+ * with DEFINE_FREE() to enable automatic, scope-based cleanup for usb_request
+ * pointers.
+ */
+static inline void free_usb_request(struct usb_request *req)
+{
+	if (!req)
+		return;
+
+	kfree(req->buf);
+	usb_ep_free_request(req->ep, req);
+}
+
+DEFINE_FREE(free_usb_request, struct usb_request *, free_usb_request(_T))
+
+/*-------------------------------------------------------------------------*/
+
 struct usb_dcd_config_params {
 	__u8  bU1devExitLat;	/* U1 Device exit Latency */
 #define USB_DEFAULT_U1_DEV_EXIT_LAT	0x01	/* Less then 1 microsec */
@@ -319,6 +340,8 @@ struct usb_udc;
 struct usb_gadget_ops {
 	int	(*get_frame)(struct usb_gadget *);
 	int	(*wakeup)(struct usb_gadget *);
+	int	(*func_wakeup)(struct usb_gadget *gadget, int intf_id);
+	int	(*set_remote_wakeup)(struct usb_gadget *, int set);
 	int	(*set_selfpowered) (struct usb_gadget *, int is_selfpowered);
 	int	(*vbus_session) (struct usb_gadget *, int is_active);
 	int	(*vbus_draw) (struct usb_gadget *, unsigned mA);
@@ -338,9 +361,6 @@ struct usb_gadget_ops {
 			struct usb_endpoint_descriptor *,
 			struct usb_ss_ep_comp_descriptor *);
 	int	(*check_config)(struct usb_gadget *gadget);
-#ifdef CONFIG_USB_FUNC_WAKEUP_SUPPORTED
-	int     (*func_wakeup)(struct usb_gadget *, int interface_id);
-#endif
 
 	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
@@ -401,7 +421,10 @@ struct usb_gadget_ops {
  * @connected: True if gadget is connected.
  * @lpm_capable: If the gadget max_speed is FULL or HIGH, this flag
  *	indicates that it supports LPM as per the LPM ECN & errata.
+ * @wakeup_capable: True if gadget is capable of sending remote wakeup.
+ * @wakeup_armed: True if gadget is armed by the host for remote wakeup.
  * @irq: the interrupt number for device controller.
+ * @id_number: a unique ID number for ensuring that gadget names are distinct
  *
  * Gadgets have a mostly-portable "gadget driver" implementing device
  * functions, handling all usb configurations and interfaces.  Gadget
@@ -461,12 +484,10 @@ struct usb_gadget {
 	unsigned			deactivated:1;
 	unsigned			connected:1;
 	unsigned			lpm_capable:1;
+	unsigned			wakeup_capable:1;
+	unsigned			wakeup_armed:1;
 	int				irq;
-
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
+	int				id_number;
 };
 #define work_to_gadget(w)	(container_of((w), struct usb_gadget, work))
 
@@ -513,7 +534,7 @@ extern char *usb_get_gadget_udc_name(void);
  */
 static inline size_t usb_ep_align(struct usb_ep *ep, size_t len)
 {
-	int max_packet_size = (size_t)usb_endpoint_maxp(ep->desc) & 0x7ff;
+	int max_packet_size = (size_t)usb_endpoint_maxp(ep->desc);
 
 	return round_up(len, max_packet_size);
 }
@@ -621,6 +642,7 @@ static inline int gadget_is_otg(struct usb_gadget *g)
 #if IS_ENABLED(CONFIG_USB_GADGET)
 int usb_gadget_frame_number(struct usb_gadget *gadget);
 int usb_gadget_wakeup(struct usb_gadget *gadget);
+int usb_gadget_set_remote_wakeup(struct usb_gadget *gadget, int set);
 int usb_gadget_set_selfpowered(struct usb_gadget *gadget);
 int usb_gadget_clear_selfpowered(struct usb_gadget *gadget);
 int usb_gadget_vbus_connect(struct usb_gadget *gadget);
@@ -635,6 +657,8 @@ int usb_gadget_check_config(struct usb_gadget *gadget);
 static inline int usb_gadget_frame_number(struct usb_gadget *gadget)
 { return 0; }
 static inline int usb_gadget_wakeup(struct usb_gadget *gadget)
+{ return 0; }
+static inline int usb_gadget_set_remote_wakeup(struct usb_gadget *gadget, int set)
 { return 0; }
 static inline int usb_gadget_set_selfpowered(struct usb_gadget *gadget)
 { return 0; }
@@ -657,15 +681,6 @@ static inline int usb_gadget_activate(struct usb_gadget *gadget)
 static inline int usb_gadget_check_config(struct usb_gadget *gadget)
 { return 0; }
 #endif /* CONFIG_USB_GADGET */
-
-#if IS_ENABLED(CONFIG_USB_GADGET) && \
-	IS_BUILTIN(CONFIG_USB_FUNC_WAKEUP_SUPPORTED)
-int usb_gadget_func_wakeup(struct usb_gadget *gadget, int interface_id);
-#else
-static inline int usb_gadget_func_wakeup(struct usb_gadget *gadget,
-		int interface_id)
-{ return 0; }
-#endif
 
 /*-------------------------------------------------------------------------*/
 
@@ -694,9 +709,9 @@ static inline int usb_gadget_func_wakeup(struct usb_gadget *gadget,
  * @driver: Driver model state for this driver.
  * @udc_name: A name of UDC this driver should be bound to. If udc_name is NULL,
  *	this driver will be bound to any available UDC.
- * @pending: UDC core private data used for deferred probe of this driver.
- * @match_existing_only: If udc is not found, return an error and don't add this
- *      gadget driver to list of pending driver
+ * @match_existing_only: If udc is not found, return an error and fail
+ *	the driver registration
+ * @is_bound: Allow a driver to be bound to only one gadget
  *
  * Devices are disabled till a gadget driver successfully bind()s, which
  * means the driver will handle setup() requests needed to enumerate (and
@@ -759,8 +774,8 @@ struct usb_gadget_driver {
 	struct device_driver	driver;
 
 	char			*udc_name;
-	struct list_head	pending;
 	unsigned                match_existing_only:1;
+	bool			is_bound:1;
 };
 
 
@@ -770,22 +785,30 @@ struct usb_gadget_driver {
 /* driver modules register and unregister, as usual.
  * these calls must be made in a context that can sleep.
  *
- * these will usually be implemented directly by the hardware-dependent
- * usb bus interface driver, which will only support a single driver.
+ * A gadget driver can be bound to only one gadget at a time.
  */
 
 /**
- * usb_gadget_probe_driver - probe a gadget driver
+ * usb_gadget_register_driver_owner - register a gadget driver
  * @driver: the driver being registered
+ * @owner: the driver module
+ * @mod_name: the driver module's build name
  * Context: can sleep
  *
  * Call this in your gadget driver's module initialization function,
- * to tell the underlying usb controller driver about your driver.
+ * to tell the underlying UDC controller driver about your driver.
  * The @bind() function will be called to bind it to a gadget before this
  * registration call returns.  It's expected that the @bind() function will
  * be in init sections.
+ *
+ * Use the macro defined below instead of calling this directly.
  */
-int usb_gadget_probe_driver(struct usb_gadget_driver *driver);
+int usb_gadget_register_driver_owner(struct usb_gadget_driver *driver,
+		struct module *owner, const char *mod_name);
+
+/* use a define to avoid include chaining to get THIS_MODULE & friends */
+#define usb_gadget_register_driver(driver) \
+	usb_gadget_register_driver_owner(driver, THIS_MODULE, KBUILD_MODNAME)
 
 /**
  * usb_gadget_unregister_driver - unregister a gadget driver
@@ -842,6 +865,16 @@ int usb_gadget_get_string(const struct usb_gadget_strings *table, int id, u8 *bu
 
 /* check if the given language identifier is valid */
 bool usb_validate_langid(u16 langid);
+
+struct gadget_string {
+	struct config_item item;
+	struct list_head list;
+	char string[USB_MAX_STRING_LEN];
+	struct usb_string usb_string;
+};
+
+#define to_gadget_string(str_item)\
+container_of(str_item, struct gadget_string, item)
 
 /*-------------------------------------------------------------------------*/
 
@@ -945,129 +978,6 @@ extern int usb_gadget_ep_match_desc(struct usb_gadget *gadget,
 
 /* utility to update vbus status for udc core, it may be scheduled */
 extern void usb_udc_vbus_handler(struct usb_gadget *gadget, bool status);
-
-/**
- * usb_gadget_autopm_get - increment PM-usage counter of usb gadget's parent
- * device.
- * @gadget: usb gadget whose parent device counter is incremented
- *
- * This routine should be called by function driver when it wants to use
- * gadget's parent device and needs to guarantee that it is not suspended. In
- * addition, the routine prevents subsequent autosuspends of gadget's parent
- * device. However if the autoresume fails then the counter is re-decremented.
- *
- * This routine can run only in process context.
- */
-static inline int usb_gadget_autopm_get(struct usb_gadget *gadget)
-{
-	int status = -ENODEV;
-
-	if (!gadget || !gadget->dev.parent)
-		return status;
-
-	status = pm_runtime_get_sync(gadget->dev.parent);
-	if (status < 0)
-		pm_runtime_put_sync(gadget->dev.parent);
-
-	if (status > 0)
-		status = 0;
-	return status;
-}
-
-/**
- * usb_gadget_autopm_get_async - increment PM-usage counter of usb gadget's
- * parent device.
- * @gadget: usb gadget whose parent device counter is incremented
- *
- * This routine increments @gadget parent device PM usage counter and queue an
- * autoresume request if the device is suspended. It does not autoresume device
- * directly (it only queues a request). After a successful call, the device may
- * not yet be resumed.
- *
- * This routine can run in atomic context.
- */
-static inline int usb_gadget_autopm_get_async(struct usb_gadget *gadget)
-{
-	int status = -ENODEV;
-
-	if (!gadget || !gadget->dev.parent)
-		return status;
-
-	status = pm_runtime_get(gadget->dev.parent);
-	if (status < 0 && status != -EINPROGRESS)
-		pm_runtime_put_noidle(gadget->dev.parent);
-
-	if (status > 0 || status == -EINPROGRESS)
-		status = 0;
-	return status;
-}
-
-/**
- * usb_gadget_autopm_get_noresume - increment PM-usage counter of usb gadget's
- * parent device.
- * @gadget: usb gadget whose parent device counter is incremented
- *
- * This routine increments PM-usage count of @gadget parent device but does not
- * carry out an autoresume.
- *
- * This routine can run in atomic context.
- */
-static inline void usb_gadget_autopm_get_noresume(struct usb_gadget *gadget)
-{
-	if (gadget && gadget->dev.parent)
-		pm_runtime_get_noresume(gadget->dev.parent);
-}
-
-/**
- * usb_gadget_autopm_put - decrement PM-usage counter of usb gadget's parent
- * device.
- * @gadget: usb gadget whose parent device counter is decremented.
- *
- * This routine should be called by function driver when it is finished using
- * @gadget parent device and wants to allow it to autosuspend. It decrements
- * PM-usage counter of @gadget parent device, when the counter reaches 0, a
- * delayed autosuspend request is attempted.
- *
- * This routine can run only in process context.
- */
-static inline void usb_gadget_autopm_put(struct usb_gadget *gadget)
-{
-	if (gadget && gadget->dev.parent)
-		pm_runtime_put_sync(gadget->dev.parent);
-}
-
-/**
- * usb_gadget_autopm_put_async - decrement PM-usage counter of usb gadget's
- * parent device.
- * @gadget: usb gadget whose parent device counter is decremented.
- *
- * This routine decrements PM-usage counter of @gadget parent device and
- * schedules a delayed autosuspend request if the counter is <= 0.
- *
- * This routine can run in atomic context.
- */
-static inline void usb_gadget_autopm_put_async(struct usb_gadget *gadget)
-{
-	if (gadget && gadget->dev.parent)
-		pm_runtime_put(gadget->dev.parent);
-}
-
-/**
- * usb_gadget_autopm_put_no_suspend - decrement PM-usage counter of usb gadget
-'s
- * parent device.
- * @gadget: usb gadget whose parent device counter is decremented.
- *
- * This routine decrements PM-usage counter of @gadget parent device but does
- * not carry out an autosuspend.
- *
- * This routine can run in atomic context.
- */
-static inline void usb_gadget_autopm_put_no_suspend(struct usb_gadget *gadget)
-{
-	if (gadget && gadget->dev.parent)
-		pm_runtime_put_noidle(gadget->dev.parent);
-}
 
 /*-------------------------------------------------------------------------*/
 

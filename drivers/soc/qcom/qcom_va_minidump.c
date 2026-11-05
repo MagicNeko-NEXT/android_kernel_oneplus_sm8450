@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "va-minidump: %s: " fmt, __func__
@@ -16,6 +17,7 @@
 #include <linux/dma-direct.h>
 #include <linux/elf.h>
 #include <linux/slab.h>
+#include <linux/panic_notifier.h>
 #include <soc/qcom/minidump.h>
 #include "elf.h"
 
@@ -112,7 +114,7 @@ static const struct sysfs_ops va_md_sysfs_ops = {
 	.store  = attr_store,
 };
 
-static struct kobj_type va_md_kobj_type = {
+static const struct kobj_type va_md_kobj_type = {
 	.sysfs_ops      = &va_md_sysfs_ops,
 };
 
@@ -158,7 +160,7 @@ bool qcom_va_md_enabled(void)
 	 */
 	return msm_minidump_enabled() && smp_load_acquire(&va_md_data.va_md_init);
 }
-EXPORT_SYMBOL(qcom_va_md_enabled);
+EXPORT_SYMBOL_GPL(qcom_va_md_enabled);
 
 int qcom_va_md_register(const char *name, struct notifier_block *nb)
 {
@@ -233,7 +235,7 @@ out:
 	mutex_unlock(&va_md_lock);
 	return ret;
 }
-EXPORT_SYMBOL(qcom_va_md_register);
+EXPORT_SYMBOL_GPL(qcom_va_md_register);
 
 int qcom_va_md_unregister(const char *name, struct notifier_block *nb)
 {
@@ -283,7 +285,7 @@ int qcom_va_md_unregister(const char *name, struct notifier_block *nb)
 	mutex_unlock(&va_md_lock);
 	return ret;
 }
-EXPORT_SYMBOL(qcom_va_md_unregister);
+EXPORT_SYMBOL_GPL(qcom_va_md_unregister);
 
 static void va_md_add_entry(struct va_md_entry *entry)
 {
@@ -460,11 +462,11 @@ int qcom_va_md_add_region(struct va_md_entry *entry)
 
 	return va_md_tree_insert(entry);
 }
-EXPORT_SYMBOL(qcom_va_md_add_region);
+EXPORT_SYMBOL_GPL(qcom_va_md_add_region);
 
 static void qcom_va_md_minidump_registration(void)
 {
-	strlcpy(va_md_data.md_entry.name, "KVA_DUMP", sizeof(va_md_data.md_entry.name));
+	strscpy(va_md_data.md_entry.name, "KVA_DUMP", sizeof(va_md_data.md_entry.name));
 
 	va_md_data.md_entry.virt_addr = va_md_data.elf.ehdr;
 	va_md_data.md_entry.phys_addr =	va_md_data.mem_phys_addr +
@@ -494,7 +496,7 @@ static inline unsigned long set_sec_name(struct elfhdr *ehdr, const char *name)
 		return 0;
 
 	ret = idx;
-	idx += strlcpy((strtab + idx), name, MAX_OWNER_STRING);
+	idx += strscpy((strtab + idx), name, MAX_OWNER_STRING);
 	va_md_data.str_tbl_idx = idx + 1;
 	return ret;
 }
@@ -594,12 +596,12 @@ static int qcom_va_md_calc_size(unsigned int shdr_cnt)
 	len = strlen(arr[shdr_cnt].entry.owner);
 	size += (sizeof(struct elf_shdr) + sizeof(struct elf_phdr) +
 		arr[shdr_cnt].entry.size + len + 1);
-	tot_size += size;
-	if (tot_size > va_md_data.total_mem_size) {
+	if (tot_size  > va_md_data.total_mem_size - size) {
 		pr_err("Total CMA consumed, no space left\n");
 		return -ENOSPC;
 	}
 
+	tot_size += size;
 	if (!shdr_cnt) {
 		va_md_data.elf.ehdr = va_md_data.elf_mem + (sizeof(struct va_md_tree_node)
 					* va_md_data.num_sections);
@@ -630,6 +632,13 @@ static int qcom_va_md_calc_elf_size(void)
 	pr_debug("Num sections:%u\n", va_md_data.num_sections);
 	for (i = 0; i < va_md_data.num_sections; i++) {
 		ret = qcom_va_md_calc_size(i);
+		/*
+		 * Collect the region till we have to consume
+		 * within va-minidump memory region
+		 */
+		if (ret == -ENOSPC)
+			return 0;
+
 		if (ret < 0)
 			break;
 	}
@@ -688,12 +697,12 @@ out:
 
 static struct notifier_block qcom_va_md_panic_blk = {
 	.notifier_call = qcom_va_md_panic_handler,
-	.priority = INT_MAX - 3,
+	.priority = INT_MAX - 4,
 };
 
 static struct notifier_block qcom_va_md_elf_panic_blk = {
 	.notifier_call = qcom_va_md_elf_panic_handler,
-	.priority = INT_MAX - 4,
+	.priority = INT_MAX - 5,
 };
 
 static int qcom_va_md_reserve_mem(struct device *dev)
@@ -833,4 +842,4 @@ static struct platform_driver qcom_va_md_driver = {
 module_platform_driver(qcom_va_md_driver);
 
 MODULE_DESCRIPTION("Qcom VA Minidump Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

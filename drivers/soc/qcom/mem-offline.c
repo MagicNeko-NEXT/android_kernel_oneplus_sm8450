@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/memory.h>
@@ -15,15 +16,14 @@
 #include <linux/kobject.h>
 #include <linux/platform_device.h>
 #include <linux/of.h>
-#include <linux/mailbox_client.h>
-#include <linux/mailbox/qmp.h>
-#include <asm/tlbflush.h>
-#include <asm/cacheflush.h>
+#ifdef CONFIG_MSM_RPM_SMD
 #include <soc/qcom/rpm-smd.h>
+#endif
 #include <linux/migrate.h>
 #include <linux/swap.h>
 #include <linux/mm_inline.h>
 #include <linux/compaction.h>
+#include <linux/soc/qcom/qcom_aoss.h>
 
 struct movable_zone_fill_control {
 	struct list_head freepages;
@@ -58,9 +58,9 @@ static unsigned int sections_per_block;
 static atomic_t target_migrate_pages = ATOMIC_INIT(0);
 static u32 offline_granule;
 static bool is_rpm_controller;
+static DECLARE_BITMAP(movable_bitmap, 1024);
 static bool has_pend_offline_req;
 static struct workqueue_struct *migrate_wq;
-static DECLARE_BITMAP(movable_bitmap, 1024);
 static struct timer_list mem_offline_timeout_timer;
 static struct task_struct *offline_trig_task;
 #define MODULE_CLASS_NAME	"mem-offline"
@@ -140,10 +140,7 @@ static phys_addr_t bootmem_dram_end_addr;
 
 static phys_addr_t offlinable_region_start_addr;
 
-static struct mem_offline_mailbox {
-	struct mbox_client cl;
-	struct mbox_chan *mbox;
-} mailbox;
+static struct qmp *qmp;
 
 struct memory_refresh_request {
 	u64 start;	/* Lower bit signifies action
@@ -203,6 +200,7 @@ static int mem_region_refresh_control(unsigned long pfn,
 				      unsigned long nr_pages,
 				      bool enable)
 {
+#ifdef CONFIG_MSM_RPM_SMD
 	struct memory_refresh_request mem_req;
 	struct msm_rpm_kvp rpm_kvp;
 
@@ -216,14 +214,15 @@ static int mem_region_refresh_control(unsigned long pfn,
 
 	return msm_rpm_send_message(MSM_RPM_CTX_ACTIVE_SET, RPM_DDR_REQ, 0,
 				    &rpm_kvp, 1);
+#else
+	return -EINVAL;
+#endif
 }
 
 static int aop_send_msg(unsigned long addr, bool online)
 {
-	struct qmp_pkt pkt;
 	char mbox_msg[MAX_LEN];
 	unsigned long addr_low, addr_high;
-	int ret;
 
 	addr_low = addr & AOP_MSG_ADDR_MASK;
 	addr_high = (addr >> AOP_MSG_ADDR_HIGH_SHIFT) & AOP_MSG_ADDR_MASK;
@@ -232,23 +231,20 @@ static int aop_send_msg(unsigned long addr, bool online)
 		 "{class: ddr, event: pasr, addr_hi: 0x%08lx, addr_lo: 0x%08lx, refresh: %s}",
 		 addr_high, addr_low, online ? "on" : "off");
 
-	pkt.size = MAX_LEN;
-	pkt.data = mbox_msg;
-	ret = mbox_send_message(mailbox.mbox, &pkt);
-	return ret;
+	return qmp_send(qmp, mbox_msg, MAX_LEN);
 }
 
-static long get_memblk_bits(unsigned int seg_idx, unsigned long memblk_addr)
+static long get_memblk_bits(int seg_idx, unsigned long memblk_addr)
 {
-	if (memblk_addr > segment_infos[seg_idx].start_addr +
-			segment_infos[seg_idx].seg_size)
+	if (seg_idx < 0 || (memblk_addr > segment_infos[seg_idx].start_addr +
+			segment_infos[seg_idx].seg_size))
 		return -EINVAL;
 
 	return (1 << ((memblk_addr - segment_infos[seg_idx].start_addr) /
 				memory_block_size_bytes()));
 }
 
-static long get_segment_addr_to_idx(unsigned long addr)
+static int get_segment_addr_to_idx(unsigned long addr)
 {
 	int i;
 
@@ -265,6 +261,7 @@ static int send_msg(struct memory_notify *mn, bool online, int count)
 {
 	unsigned long segment_size, start, addr, base_addr;
 	int ret, i, seg_idx;
+	phys_addr_t phys;
 
 	if (bypass_send_msg)
 		return 0;
@@ -277,7 +274,8 @@ static int send_msg(struct memory_notify *mn, bool online, int count)
 
 		seg_idx = get_segment_addr_to_idx(addr);
 		segment_size = segment_infos[seg_idx].seg_size;
-		start = __phys_to_pfn(segment_infos[seg_idx].start_addr);
+		phys = segment_infos[seg_idx].start_addr;
+		start = __phys_to_pfn(phys);
 		addr = segment_infos[seg_idx].start_addr;
 
 		if (is_rpm_controller)
@@ -285,18 +283,18 @@ static int send_msg(struct memory_notify *mn, bool online, int count)
 						 segment_size >> PAGE_SHIFT,
 						 online);
 		else
-			ret = aop_send_msg(__pfn_to_phys(start), online);
+			ret = aop_send_msg(phys, online);
 
 		if (ret < 0) {
-			pr_err("PASR: %s %s request addr:0x%llx failed and return value from AOP is %d\n",
+			pr_err("PASR: %s %s request addr:0x%pa failed and return value from AOP is %d\n",
 			       is_rpm_controller ? "RPM" : "AOP",
 			       online ? "online" : "offline",
-			       __pfn_to_phys(start), ret);
+			       &phys, ret);
 			goto undo;
 		}
 
-		pr_info("mem-offline: sent msg successfully to %s segment at phys addr 0x%lx\n",
-					online ? "online" : "offline", __pfn_to_phys(start));
+		pr_info("mem-offline: sent msg successfully to %s segment at phys addr 0x%pa\n",
+					online ? "online" : "offline", &phys);
 		addr += segment_size;
 	}
 
@@ -317,7 +315,7 @@ undo:
 			ret = aop_send_msg(__pfn_to_phys(start), !online);
 
 		if (ret < 0)
-			panic("Failed to completely online/offline a hotpluggable segment. A quasi state of memblock can cause randomn system failures. Return value from AOP is %d",
+			panic("Failed to completely online/offline a hotpluggable segment. A quasi state of memblock can cause random system failures. Return value from AOP is %d",
 				ret);
 		segment_size = segment_infos[seg_idx].seg_size;
 		addr += segment_size;
@@ -330,7 +328,7 @@ undo:
 
 static void set_memblk_bitmap_online(unsigned long addr)
 {
-	unsigned long seg_idx;
+	int seg_idx;
 	long cur_blk_bit;
 
 	seg_idx = get_segment_addr_to_idx(addr);
@@ -351,7 +349,7 @@ static void set_memblk_bitmap_online(unsigned long addr)
 
 static void set_memblk_bitmap_offline(unsigned long addr)
 {
-	unsigned long seg_idx;
+	int seg_idx;
 	long cur_blk_bit;
 
 	seg_idx = get_segment_addr_to_idx(addr);
@@ -445,7 +443,7 @@ static int mem_change_refresh_state(struct memory_notify *mn,
 
 	if (mem_sec_state[idx] == state) {
 		/* we shouldn't be getting this request */
-		pr_warn("mem-offline: state of mem%d block already in %s state. Ignoring refresh state change request\n",
+		pr_warn("mem-offline: state of mem%ld block already in %s state. Ignoring refresh state change request\n",
 				sec_nr, online ? "online" : "offline");
 		return 0;
 	}
@@ -523,7 +521,7 @@ static int mem_event_callback(struct notifier_block *self,
 	ktime_t delay = 0;
 	phys_addr_t start_addr, end_addr;
 	unsigned int idx = end_section_nr - start_section_nr + 1;
-	unsigned long seg_idx;
+	int seg_idx;
 
 	start = SECTION_ALIGN_DOWN(mn->start_pfn);
 	end = SECTION_ALIGN_UP(mn->start_pfn + mn->nr_pages);
@@ -549,8 +547,8 @@ static int mem_event_callback(struct notifier_block *self,
 
 	switch (action) {
 	case MEM_GOING_ONLINE:
-		pr_debug("mem-offline: MEM_GOING_ONLINE : start = 0x%llx end = 0x%llx\n",
-				start_addr, end_addr);
+		pr_debug("mem-offline: MEM_GOING_ONLINE : start = 0x%pa end = 0x%pa\n",
+				&start_addr, &end_addr);
 		++mem_info[(sec_nr - start_section_nr + MEMORY_ONLINE *
 			   idx) / sections_per_block].fail_count;
 		cur = ktime_get();
@@ -567,13 +565,13 @@ static int mem_event_callback(struct notifier_block *self,
 		pr_info("mem-offline: Onlined memory block mem%pK\n",
 			(void *)sec_nr);
 		seg_idx = get_segment_addr_to_idx(start_addr);
-		pr_debug("mem-offline: Segment %d memblk_bitmap 0x%lx\n",
+		pr_debug("mem-offline: Segment %d memblk_bitmap 0x%x\n",
 				seg_idx, segment_infos[seg_idx].bitmask_kernel_blk);
 		totalram_pages_add(-(memory_block_size_bytes()/PAGE_SIZE));
 		break;
 	case MEM_GOING_OFFLINE:
-		pr_debug("mem-offline: MEM_GOING_OFFLINE : start = 0x%llx end = 0x%llx\n",
-				start_addr, end_addr);
+		pr_debug("mem-offline: MEM_GOING_OFFLINE : start = 0x%pa end = 0x%pa\n",
+				&start_addr, &end_addr);
 		++mem_info[(sec_nr - start_section_nr + MEMORY_OFFLINE *
 			   idx) / sections_per_block].fail_count;
 		has_pend_offline_req = true;
@@ -597,7 +595,7 @@ static int mem_event_callback(struct notifier_block *self,
 		pr_info("mem-offline: Offlined memory block mem%pK\n",
 			(void *)sec_nr);
 		seg_idx = get_segment_addr_to_idx(start_addr);
-		pr_debug("mem-offline: Segment %d memblk_bitmap 0x%lx\n",
+		pr_debug("mem-offline: Segment %d memblk_bitmap 0x%x\n",
 				seg_idx, segment_infos[seg_idx].bitmask_kernel_blk);
 		totalram_pages_add(memory_block_size_bytes()/PAGE_SIZE);
 		del_timer_sync(&mem_offline_timeout_timer);
@@ -610,8 +608,8 @@ static int mem_event_callback(struct notifier_block *self,
 		offline_trig_task = NULL;
 		break;
 	case MEM_CANCEL_ONLINE:
-		pr_info("mem-offline: MEM_CANCEL_ONLINE: start = 0x%llx end = 0x%llx\n",
-				start_addr, end_addr);
+		pr_info("mem-offline: MEM_CANCEL_ONLINE: start = 0x%pa end = 0x%pa\n",
+				&start_addr, &end_addr);
 		mem_change_refresh_state(mn, MEMORY_OFFLINE);
 		break;
 	default:
@@ -629,7 +627,8 @@ static int mem_online_remaining_blocks(void)
 	phys_addr_t phys_addr;
 	int fail = 0;
 
-	pr_debug("mem-offline: memblock_end_of_DRAM 0x%lx\n", memblock_end_of_DRAM());
+	phys_addr = memblock_end_of_DRAM();
+	pr_debug("mem-offline: memblock_end_of_DRAM 0x%pa\n", &phys_addr);
 
 	block_size = memory_block_size_bytes();
 	sections_per_block = block_size / MIN_MEMORY_BLOCK_SIZE;
@@ -645,7 +644,7 @@ static int mem_online_remaining_blocks(void)
 	if (memblock_end_of_DRAM() % block_size) {
 		delta = block_size - (memblock_end_of_DRAM() % block_size);
 		pr_err("mem-offline: !!ERROR!! memblock end of dram address is not aligned to memory block size!\n");
-		pr_err("mem-offline: memory%lu could be partially available. %lukB of memory will be missing from RAM!\n",
+		pr_err("mem-offline: memory%lu could be partially available. %ukB of memory will be missing from RAM!\n",
 				start_section_nr, delta / SZ_1K);
 
 		/*
@@ -661,7 +660,7 @@ static int mem_online_remaining_blocks(void)
 	if (bootmem_dram_end_addr % block_size) {
 		delta = bootmem_dram_end_addr % block_size;
 		pr_err("mem-offline: !!ERROR!! bootmem end of dram address is not aligned to memory block size!\n");
-		pr_err("mem-offline: memory%lu will not be added. %lukB of memory will be missing from RAM!\n",
+		pr_err("mem-offline: memory%lu will not be added. %ukB of memory will be missing from RAM!\n",
 				end_section_nr, delta / SZ_1K);
 
 		/*
@@ -681,8 +680,8 @@ static int mem_online_remaining_blocks(void)
 	if (start_section_nr > end_section_nr)
 		return 1;
 
-	pr_debug("mem-offline: offlinable_region_start_addr 0X%lx\n",
-		offlinable_region_start_addr);
+	pr_debug("mem-offline: offlinable_region_start_addr 0x%pa\n",
+		&offlinable_region_start_addr);
 
 	for (memblock = start_section_nr; memblock <= end_section_nr;
 			memblock += sections_per_block) {
@@ -792,7 +791,7 @@ static ssize_t show_mem_offline_granule(struct kobject *kobj,
 static ssize_t show_differing_seg_sizes(struct kobject *kobj,
 				struct kobj_attribute *attr, char *buf)
 {
-	return scnprintf(buf, PAGE_SIZE, "%lu\n",
+	return scnprintf(buf, PAGE_SIZE, "%u\n",
 			(unsigned int)differing_segment_sizes);
 }
 
@@ -839,7 +838,7 @@ static unsigned int print_blk_residency_times(char *buf, size_t sz,
 			delta = 0;
 		delta = ktime_add(delta,
 			mem_info[i + mode * idx].resident_time);
-		c += scnprintf(buf + c, sz - c, "%lus\t\t",
+		c += scnprintf(buf + c, sz - c, "%llus\t\t",
 				ktime_to_us(delta) / USEC_PER_SEC);
 		total_time[i + mode * idx] = delta;
 	}
@@ -957,11 +956,11 @@ static ssize_t show_mem_stats(struct kobject *kobj,
 	total_offline = ktime_sub(total, total_online);
 
 	c += scnprintf(buf + c, sz - c,
-					"\tAvg Online %%:\t%d%%\n",
-					((int)total_online * 100) / total);
+					"\tAvg Online %%:\t%lld%%\n",
+					(total_online * 100) / total);
 	c += scnprintf(buf + c, sz - c,
-					"\tAvg Offline %%:\t%d%%\n",
-					((int)total_offline * 100) / total);
+					"\tAvg Offline %%:\t%lld%%\n",
+					(total_offline * 100) / total);
 
 	c += scnprintf(buf + c, sz - c, "\n");
 	kfree(total_time);
@@ -971,7 +970,7 @@ static ssize_t show_mem_stats(struct kobject *kobj,
 static ssize_t show_anon_migrate(struct kobject *kobj,
 				struct kobj_attribute *attr, char *buf)
 {
-	return scnprintf(buf, PAGE_SIZE, "%lu\n",
+	return scnprintf(buf, PAGE_SIZE, "%u\n",
 				atomic_read(&target_migrate_pages));
 }
 
@@ -992,6 +991,8 @@ static ssize_t store_anon_migrate(struct kobject *kobj,
 
 	return size;
 }
+
+#ifdef CONFIG_MEM_OFFLINE_ZONE_BALANCING
 
 static unsigned long get_anon_movable_pages(
 			struct movable_zone_fill_control *fc,
@@ -1032,8 +1033,7 @@ static unsigned long get_anon_movable_pages(
 			continue;
 		}
 
-		ret = isolate_anon_lru_page(page);
-		if (ret)
+		if (isolate_anon_lru_page(page) <= 0)
 			continue;
 
 		list_add_tail(&page->lru, list);
@@ -1110,6 +1110,15 @@ static void isolate_free_pages(struct movable_zone_fill_control *fc)
 			start_pfn += pageblock_nr_pages - 1;
 			continue;
 		}
+		/*
+		 * Make sure that the zone->lock is not held for long by
+		 * returning once we have SWAP_CLUSTER_MAX pages in the
+		 * free list for migration.
+		 */
+		if (!(start_pfn % pageblock_nr_pages) &&
+			(fc->nr_free_pages >= SWAP_CLUSTER_MAX ||
+			 has_pend_offline_req))
+			break;
 
 		if (!PageBuddy(page))
 			continue;
@@ -1124,18 +1133,8 @@ static void isolate_free_pages(struct movable_zone_fill_control *fc)
 		list_splice(&tmp, &fc->freepages);
 		fc->nr_free_pages += isolated;
 		start_pfn += isolated - 1;
-
-		/*
-		 * Make sure that the zone->lock is not held for long by
-		 * returning once we have SWAP_CLUSTER_MAX pages in the
-		 * free list for migration.
-		 */
-		if (!((start_pfn + 1) % pageblock_nr_pages) &&
-			(fc->nr_free_pages >= SWAP_CLUSTER_MAX ||
-			 has_pend_offline_req))
-			break;
 	}
-	fc->start_pfn = start_pfn + 1;
+	fc->start_pfn = start_pfn;
 out:
 	spin_unlock_irqrestore(&fc->zone->lock, flags);
 }
@@ -1212,7 +1211,7 @@ repeat:
 		goto repeat;
 
 	ret = migrate_pages(&source, movable_page_alloc, movable_page_free,
-		(unsigned long) &fc, MIGRATE_ASYNC, MR_MEMORY_HOTPLUG);
+		(unsigned long) &fc, MIGRATE_ASYNC, MR_MEMORY_HOTPLUG, NULL);
 	if (ret)
 		putback_movable_pages(&source);
 
@@ -1228,6 +1227,10 @@ out:
 		release_freepages(&fc.freepages);
 	mutex_unlock(&page_migrate_lock);
 }
+
+#else
+static void fill_movable_zone_fn(struct work_struct *work) {}
+#endif
 
 static struct kobj_attribute stats_attr =
 		__ATTR(stats, 0444, show_mem_stats, NULL);
@@ -1399,22 +1402,17 @@ static int mem_parse_dt(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
-	if (!of_find_property(node, "mboxes", NULL)) {
+	if (!of_find_property(node, "qcom,qmp", NULL)) {
 		is_rpm_controller = true;
 		return 0;
 	}
 
-	mailbox.cl.dev = &pdev->dev;
-	mailbox.cl.tx_block = true;
-	mailbox.cl.tx_tout = 1000;
-	mailbox.cl.knows_txdone = false;
-
-	mailbox.mbox = mbox_request_channel(&mailbox.cl, 0);
-	if (IS_ERR(mailbox.mbox)) {
-		if (PTR_ERR(mailbox.mbox) != -EPROBE_DEFER)
-			pr_err("mem-offline: failed to get mailbox channel %pK %ld\n",
-				mailbox.mbox, PTR_ERR(mailbox.mbox));
-		return PTR_ERR(mailbox.mbox);
+	qmp = qmp_get(&pdev->dev);
+	if (IS_ERR(qmp)) {
+		if (PTR_ERR(qmp) != -EPROBE_DEFER)
+			pr_err("mem-offline: failed to get qmp channel %ld\n",
+			       PTR_ERR(qmp));
+		return PTR_ERR(qmp);
 	}
 
 	return 0;
@@ -1469,8 +1467,8 @@ static int get_segment_region_info(void)
 {
 	uint8_t r = 0; // region index
 	unsigned long region_end, segment_start, segment_size, r0_segment_size;
-	unsigned long num_kernel_blks, seg_idx = 0, addr;
-	int i;
+	unsigned long num_kernel_blks, addr;
+	int i, seg_idx = 0;
 
 	num_segments = get_num_offlinable_segments();
 
@@ -1570,6 +1568,11 @@ static int get_ddr_regions_info(void)
 
 	num_ddr_regions = get_num_ddr_regions(node);
 
+	if (!num_ddr_regions) {
+		pr_err("mem-offine: num_ddr_regions is %d\n", num_ddr_regions);
+		return -EINVAL;
+	}
+
 	ddr_regions = kcalloc(num_ddr_regions, sizeof(*ddr_regions), GFP_KERNEL);
 	if (!ddr_regions)
 		return -ENOMEM;
@@ -1613,7 +1616,7 @@ static int get_ddr_regions_info(void)
 
 	for (i = 0; i < num_ddr_regions; i++) {
 
-		pr_info("region%d: seg_start 0x%lx len 0x%lx granule 0x%lx seg_start_offset 0x%lx seg_start_idx 0x%lx\n",
+		pr_info("region%d: seg_start 0x%lx len 0x%lx granule 0x%lx seg_start_offset 0x%lx seg_start_idx 0x%x\n",
 				i, ddr_regions[i].start_address, ddr_regions[i].length,
 				ddr_regions[i].granule_size,
 				ddr_regions[i].segments_start_offset,
@@ -1697,7 +1700,7 @@ static int update_dram_end_address_and_movable_bitmap(phys_addr_t *bootmem_dram_
 	}
 
 	*bootmem_dram_end_addr = addr;
-	pr_debug("mem-offline: bootmem_dram_end_addr 0x%lx\n", *bootmem_dram_end_addr);
+	pr_debug("mem-offline: bootmem_dram_end_addr 0x%pa\n", bootmem_dram_end_addr);
 
 	num_entries = num_cells / (nr_address_cells + nr_size_cells);
 	pos = prop->value;
@@ -1724,7 +1727,7 @@ static int update_dram_end_address_and_movable_bitmap(phys_addr_t *bootmem_dram_
 		bitmap_set(movable_bitmap, new_start_bitmap, bitmap_size);
 	}
 
-	pr_debug("mem-offline: movable_bitmap is %lx\n", *movable_bitmap);
+	pr_debug("mem-offline: movable_bitmap is %*pbl\n", 1024, movable_bitmap);
 	return 0;
 }
 
@@ -1796,7 +1799,7 @@ static int mem_offline_driver_probe(struct platform_device *pdev)
 		goto err_free_mem_sec_state;
 	}
 
-	if (register_hotmemory_notifier(&hotplug_memory_callback_nb)) {
+	if (register_memory_notifier(&hotplug_memory_callback_nb)) {
 		pr_err("mem-offline: Registering memory hotplug notifier failed\n");
 		ret = -ENODEV;
 		goto err_sysfs_remove_group;
@@ -1857,4 +1860,4 @@ static void __exit mem_module_exit(void)
 module_exit(mem_module_exit);
 
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. Memory Offlining Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

@@ -15,8 +15,8 @@
 #include <linux/device.h>
 #include <linux/errno.h>
 #include <linux/mfd/syscon.h>
+#include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
@@ -40,6 +40,8 @@ static const struct exynos_soc_id {
 	const char *name;
 	unsigned int id;
 } soc_ids[] = {
+	/* List ordered by SoC name */
+	/* Compatible with: samsung,exynos4210-chipid */
 	{ "EXYNOS3250", 0xE3472000 },
 	{ "EXYNOS4210", 0x43200000 },	/* EVT0 revision */
 	{ "EXYNOS4210", 0x43210000 },
@@ -49,10 +51,14 @@ static const struct exynos_soc_id {
 	{ "EXYNOS5260", 0xE5260000 },
 	{ "EXYNOS5410", 0xE5410000 },
 	{ "EXYNOS5420", 0xE5420000 },
+	{ "EXYNOS5433", 0xE5433000 },
 	{ "EXYNOS5440", 0xE5440000 },
 	{ "EXYNOS5800", 0xE5422000 },
 	{ "EXYNOS7420", 0xE7420000 },
-	{ "EXYNOS5433", 0xE5433000 },
+	/* Compatible with: samsung,exynos850-chipid */
+	{ "EXYNOS7885", 0xE7885000 },
+	{ "EXYNOS850", 0xE3830000 },
+	{ "EXYNOSAUTOV9", 0xAAA80000 },
 };
 
 static const char *product_id_to_soc_id(unsigned int product_id)
@@ -169,13 +175,23 @@ static const struct exynos_chipid_variant exynos4210_chipid_drv_data = {
 	.sub_rev_shift	= 0,
 };
 
+static const struct exynos_chipid_variant exynos850_chipid_drv_data = {
+	.rev_reg	= 0x10,
+	.main_rev_shift	= 20,
+	.sub_rev_shift	= 16,
+};
+
 static const struct of_device_id exynos_chipid_of_device_ids[] = {
 	{
 		.compatible	= "samsung,exynos4210-chipid",
 		.data		= &exynos4210_chipid_drv_data,
+	}, {
+		.compatible	= "samsung,exynos850-chipid",
+		.data		= &exynos850_chipid_drv_data,
 	},
 	{ }
 };
+MODULE_DEVICE_TABLE(of, exynos_chipid_of_device_ids);
 
 static struct platform_driver exynos_chipid_driver = {
 	.driver = {
@@ -185,4 +201,11 @@ static struct platform_driver exynos_chipid_driver = {
 	.probe	= exynos_chipid_probe,
 	.remove	= exynos_chipid_remove,
 };
-builtin_platform_driver(exynos_chipid_driver);
+module_platform_driver(exynos_chipid_driver);
+
+MODULE_DESCRIPTION("Samsung Exynos ChipID controller and ASV driver");
+MODULE_AUTHOR("Bartlomiej Zolnierkiewicz <b.zolnierkie@samsung.com>");
+MODULE_AUTHOR("Krzysztof Kozlowski <krzk@kernel.org>");
+MODULE_AUTHOR("Pankaj Dubey <pankaj.dubey@samsung.com>");
+MODULE_AUTHOR("Sylwester Nawrocki <s.nawrocki@samsung.com>");
+MODULE_LICENSE("GPL");

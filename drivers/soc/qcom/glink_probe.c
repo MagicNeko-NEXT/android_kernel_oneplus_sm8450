@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/*
- * Copyright (c) 2017-2019, 2021, The Linux Foundation. All rights reserved.
- */
+/* Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved. */
 
 #include <linux/of.h>
 #include <linux/list.h>
@@ -9,7 +7,7 @@
 #include <linux/module.h>
 #include <linux/notifier.h>
 #include <linux/platform_device.h>
-#include <soc/qcom/subsystem_notif.h>
+#include <linux/remoteproc/qcom_rproc.h>
 #include <linux/rpmsg/qcom_glink.h>
 #include <linux/rpmsg.h>
 #include <linux/ipc_logging.h>
@@ -50,14 +48,13 @@ static int glink_probe_ssr_cb(struct notifier_block *this,
 	struct edge_info *einfo = container_of(this, struct edge_info, nb);
 
 	GLINK_INFO("received %ld for %s\n", code, einfo->ssr_label);
-
 	switch (code) {
-	case SUBSYS_AFTER_POWERUP:
+	case QCOM_SSR_AFTER_POWERUP:
 		trace_rproc_qcom_event(dev_name(einfo->dev),
 				"QCOM_SSR_AFTER_POWERUP", "glink_probe_ssr-enter");
 		einfo->register_fn(einfo);
 		break;
-	case SUBSYS_AFTER_SHUTDOWN:
+	case QCOM_SSR_AFTER_SHUTDOWN:
 		trace_rproc_qcom_event(dev_name(einfo->dev),
 				"QCOM_SSR_AFTER_SHUTDOWN", "glink_probe_ssr-enter");
 		einfo->unregister_fn(einfo);
@@ -133,7 +130,7 @@ static void probe_subsystem(struct device *dev, struct device_node *np)
 	if (ret < 0) {
 		GLINK_ERR(dev, "no qcom,glink-label for %s\n",
 			  einfo->ssr_label);
-		goto free_einfo;
+		return;
 	}
 
 	einfo->dev = dev;
@@ -142,7 +139,7 @@ static void probe_subsystem(struct device *dev, struct device_node *np)
 	ret = of_property_read_string(np, "transport", &transport);
 	if (ret < 0) {
 		GLINK_ERR(dev, "%s missing transport\n", einfo->ssr_label);
-		goto free_einfo;
+		return;
 	}
 
 	if (!strcmp(transport, "smem")) {
@@ -155,21 +152,17 @@ static void probe_subsystem(struct device *dev, struct device_node *np)
 
 	einfo->nb.notifier_call = glink_probe_ssr_cb;
 
-	handle = subsys_notif_register_notifier(einfo->ssr_label, &einfo->nb);
+	handle = qcom_register_ssr_notifier(einfo->ssr_label, &einfo->nb);
 	if (IS_ERR_OR_NULL(handle)) {
 		GLINK_ERR(dev, "could not register for SSR notifier for %s\n",
 			  einfo->ssr_label);
-		goto free_einfo;
+		return;
 	}
+
 	einfo->notifier_handle = handle;
 
 	list_add_tail(&einfo->list, &edge_infos);
 	GLINK_INFO("probe successful for %s\n", einfo->ssr_label);
-
-	return;
-
-free_einfo:
-	devm_kfree(dev, einfo);
 }
 
 static int glink_probe(struct platform_device *pdev)
@@ -191,7 +184,7 @@ static int glink_remove(struct platform_device *pdev)
 
 	for_each_available_child_of_node(pn, cn) {
 		list_for_each_entry_safe(einfo, tmp, &edge_infos, list) {
-			subsys_notif_unregister_notifier(einfo->notifier_handle,
+			qcom_unregister_ssr_notifier(einfo->notifier_handle,
 							 &einfo->nb);
 			list_del(&einfo->list);
 		}
@@ -242,4 +235,4 @@ static void __exit glink_probe_exit(void)
 module_exit(glink_probe_exit);
 
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. GLINK probe helper driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

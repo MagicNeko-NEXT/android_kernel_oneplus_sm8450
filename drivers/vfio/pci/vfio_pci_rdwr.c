@@ -18,7 +18,7 @@
 #include <linux/vgaarb.h>
 #include <linux/io-64-nonatomic-lo-hi.h>
 
-#include "vfio_pci_private.h"
+#include "vfio_pci_priv.h"
 
 #ifdef __LITTLE_ENDIAN
 #define vfio_ioread64	ioread64
@@ -39,7 +39,7 @@
 #define vfio_iowrite8	iowrite8
 
 #define VFIO_IOWRITE(size) \
-static int vfio_pci_iowrite##size(struct vfio_pci_device *vdev,		\
+static int vfio_pci_iowrite##size(struct vfio_pci_core_device *vdev,		\
 			bool test_mem, u##size val, void __iomem *io)	\
 {									\
 	if (test_mem) {							\
@@ -66,7 +66,7 @@ VFIO_IOWRITE(64)
 #endif
 
 #define VFIO_IOREAD(size) \
-static int vfio_pci_ioread##size(struct vfio_pci_device *vdev,		\
+static int vfio_pci_ioread##size(struct vfio_pci_core_device *vdev,		\
 			bool test_mem, u##size *val, void __iomem *io)	\
 {									\
 	if (test_mem) {							\
@@ -95,7 +95,7 @@ VFIO_IOREAD(32)
  * reads with -1.  This is intended for handling MSI-X vector tables and
  * leftover space for ROM BARs.
  */
-static ssize_t do_io_rw(struct vfio_pci_device *vdev, bool test_mem,
+static ssize_t do_io_rw(struct vfio_pci_core_device *vdev, bool test_mem,
 			void __iomem *io, char __user *buf,
 			loff_t off, size_t count, size_t x_start,
 			size_t x_end, bool iswrite)
@@ -201,7 +201,7 @@ static ssize_t do_io_rw(struct vfio_pci_device *vdev, bool test_mem,
 	return done;
 }
 
-static int vfio_pci_setup_barmap(struct vfio_pci_device *vdev, int bar)
+static int vfio_pci_setup_barmap(struct vfio_pci_core_device *vdev, int bar)
 {
 	struct pci_dev *pdev = vdev->pdev;
 	int ret;
@@ -225,7 +225,7 @@ static int vfio_pci_setup_barmap(struct vfio_pci_device *vdev, int bar)
 	return 0;
 }
 
-ssize_t vfio_pci_bar_rw(struct vfio_pci_device *vdev, char __user *buf,
+ssize_t vfio_pci_bar_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 			size_t count, loff_t *ppos, bool iswrite)
 {
 	struct pci_dev *pdev = vdev->pdev;
@@ -289,7 +289,8 @@ out:
 	return done;
 }
 
-ssize_t vfio_pci_vga_rw(struct vfio_pci_device *vdev, char __user *buf,
+#ifdef CONFIG_VFIO_PCI_VGA
+ssize_t vfio_pci_vga_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 			       size_t count, loff_t *ppos, bool iswrite)
 {
 	int ret;
@@ -356,6 +357,7 @@ ssize_t vfio_pci_vga_rw(struct vfio_pci_device *vdev, char __user *buf,
 
 	return done;
 }
+#endif
 
 static void vfio_pci_ioeventfd_do_write(struct vfio_pci_ioeventfd *ioeventfd,
 					bool test_mem)
@@ -385,7 +387,7 @@ static void vfio_pci_ioeventfd_do_write(struct vfio_pci_ioeventfd *ioeventfd,
 static int vfio_pci_ioeventfd_handler(void *opaque, void *unused)
 {
 	struct vfio_pci_ioeventfd *ioeventfd = opaque;
-	struct vfio_pci_device *vdev = ioeventfd->vdev;
+	struct vfio_pci_core_device *vdev = ioeventfd->vdev;
 
 	if (ioeventfd->test_mem) {
 		if (!down_read_trylock(&vdev->memory_lock))
@@ -411,8 +413,8 @@ static void vfio_pci_ioeventfd_thread(void *opaque, void *unused)
 	vfio_pci_ioeventfd_do_write(ioeventfd, ioeventfd->test_mem);
 }
 
-long vfio_pci_ioeventfd(struct vfio_pci_device *vdev, loff_t offset,
-			uint64_t data, int count, int fd)
+int vfio_pci_ioeventfd(struct vfio_pci_core_device *vdev, loff_t offset,
+		       uint64_t data, int count, int fd)
 {
 	struct pci_dev *pdev = vdev->pdev;
 	loff_t pos = offset & VFIO_PCI_OFFSET_MASK;
@@ -469,7 +471,7 @@ long vfio_pci_ioeventfd(struct vfio_pci_device *vdev, loff_t offset,
 		goto out_unlock;
 	}
 
-	ioeventfd = kzalloc(sizeof(*ioeventfd), GFP_KERNEL);
+	ioeventfd = kzalloc(sizeof(*ioeventfd), GFP_KERNEL_ACCOUNT);
 	if (!ioeventfd) {
 		ret = -ENOMEM;
 		goto out_unlock;

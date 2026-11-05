@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020, The Linux Foundation. All rights reserved.
- * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2021-2023, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/module.h>
@@ -12,15 +12,11 @@
 #include <linux/slab.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
-#include <linux/cpufreq.h>
-#include <linux/pm_opp.h>
-#include <linux/cpu.h>
 
 #define SDPM_DRIVER		"sdpm-clk-notify"
 #define CSR_MAX_VAL		7
 #define CSR_OFFSET		0xF00
 #define FREQ_HZ_TO_MHZ(f)	((f) / 1000000)
-#define FREQ_KHZ_TO_MHZ(f)	((f) / 1000)
 
 struct sdpm_clk_instance;
 struct sdpm_clk_data {
@@ -30,7 +26,6 @@ struct sdpm_clk_data {
 	struct notifier_block		reg_nb;
 	struct regulator		*reg;
 	uint8_t				reg_enable;
-	uint32_t			cpu_id;
 	uint32_t			csr_id;
 	unsigned long			last_freq;
 	struct mutex			sdpm_mutex;
@@ -52,39 +47,10 @@ static void sdpm_csr_write(struct sdpm_clk_data *sdpm_data,
 	sdpm_data->last_freq = clk_rate;
 
 	dev_dbg(sdpm_inst->dev, "clock:%s offset:0x%x frequency:%u\n",
-			(sdpm_data->clock_name) ? sdpm_data->clock_name :
-			"cpu", CSR_OFFSET + sdpm_data->csr_id * 4,
-			val);
+			sdpm_data->clock_name,
+			CSR_OFFSET + sdpm_data->csr_id * 4, val);
 	writel_relaxed(val,
 		sdpm_inst->regmap + CSR_OFFSET + sdpm_data->csr_id * 4);
-}
-
-static int sdpm_cpu_notifier(struct notifier_block *nb,
-					unsigned long event, void *data)
-{
-	struct cpufreq_freqs *freq_data = (struct cpufreq_freqs *)data;
-	struct sdpm_clk_data *sdpm_data = container_of(nb,
-				struct sdpm_clk_data, clk_rate_nb);
-
-	if (freq_data->policy->cpu != sdpm_data->cpu_id)
-		return NOTIFY_DONE;
-	dev_dbg(sdpm_data->sdpm_inst->dev, "CPU%d event:%lu\n",
-			freq_data->policy->cpu, event);
-	switch (event) {
-	case CPUFREQ_PRECHANGE:
-		if (freq_data->new > freq_data->old)
-			sdpm_csr_write(sdpm_data,
-					FREQ_KHZ_TO_MHZ(freq_data->new));
-		return NOTIFY_DONE;
-	case CPUFREQ_POSTCHANGE:
-		if (freq_data->new < freq_data->old)
-			sdpm_csr_write(sdpm_data,
-					FREQ_KHZ_TO_MHZ(freq_data->new));
-		return NOTIFY_DONE;
-	default:
-		return NOTIFY_DONE;
-	}
-	return NOTIFY_DONE;
 }
 
 static int sdpm_reg_notifier(struct notifier_block *nb, unsigned long event,
@@ -154,13 +120,9 @@ static int sdpm_clock_notifier(struct notifier_block *nb,
 static int sdpm_clk_device_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	int ret = 0, idx = 0, clk_ct = 0, csr = 0, csr_ct = 0, cpu = 0;
+	int ret = 0, idx = 0, clk_ct = 0, csr = 0, csr_ct = 0;
 	struct sdpm_clk_instance *sdpm_clk;
 	struct device_node *dev_node = dev->of_node;
-	struct device_node *cpu_phandle = NULL;
-	struct device *cpu_dev;
-	struct dev_pm_opp *opp = NULL;
-	unsigned long freq;
 	struct resource *res;
 
 	sdpm_clk = devm_kzalloc(dev, sizeof(*sdpm_clk), GFP_KERNEL);
@@ -173,7 +135,7 @@ static int sdpm_clk_device_probe(struct platform_device *pdev)
 		dev_err(dev, "Couldn't get MEM resource\n");
 		return -EINVAL;
 	}
-	dev_dbg(dev, "sdpm@0x%x size:%d\n", res->start,
+	dev_dbg(dev, "sdpm@0x%llx size:%llu\n", res->start,
 			resource_size(res));
 	dev_set_drvdata(dev, sdpm_clk);
 
@@ -195,13 +157,13 @@ static int sdpm_clk_device_probe(struct platform_device *pdev)
 		return ret;
 	}
 	csr_ct = ret;
-	if (clk_ct > csr_ct || (csr_ct - clk_ct > 1)) {
+	if (clk_ct != csr_ct) {
 		dev_err(dev, "Invalid csr:%d and clk:%d count.\n", csr_ct,
 				clk_ct);
 		return -EINVAL;
 	}
 	sdpm_clk->clk_ct = clk_ct;
-	sdpm_clk->clk_data = devm_kcalloc(dev, clk_ct + 1,
+	sdpm_clk->clk_data = devm_kcalloc(dev, clk_ct,
 				sizeof(*sdpm_clk->clk_data), GFP_KERNEL);
 	if (!sdpm_clk->clk_data)
 		return -ENOMEM;
@@ -217,11 +179,8 @@ static int sdpm_clk_device_probe(struct platform_device *pdev)
 
 		sdpm_clk->clk_data[idx].clk = devm_clk_get(dev,
 				sdpm_clk->clk_data[idx].clock_name);
-		if (IS_ERR(sdpm_clk->clk_data[idx].clk)) {
-			sdpm_clk->clk_data[idx].clk = NULL;
-			sdpm_clk->clk_data[idx].clock_name = NULL;
-			continue;
-		}
+		if (IS_ERR(sdpm_clk->clk_data[idx].clk))
+			return PTR_ERR(sdpm_clk->clk_data[idx].clk);
 
 		ret = of_property_read_u32_index(dev_node, "csr-id", idx, &csr);
 		if (ret < 0) {
@@ -251,8 +210,8 @@ static int sdpm_clk_device_probe(struct platform_device *pdev)
 		sdpm_clk->clk_data[idx].reg = devm_regulator_get(dev,
 					sdpm_clk->clk_data[idx].clock_name);
 		if (IS_ERR(sdpm_clk->clk_data[idx].reg)) {
-			dev_err(dev, "regulator:%s get err:%d\n",
-					dev, sdpm_clk->clk_data[idx].clock_name,
+			dev_err(dev, "regulator:%s get err:%ld\n",
+					sdpm_clk->clk_data[idx].clock_name,
 					PTR_ERR(sdpm_clk->clk_data[idx].reg));
 			if (PTR_ERR(sdpm_clk->clk_data[idx].reg)
 					== -EPROBE_DEFER)
@@ -264,52 +223,6 @@ static int sdpm_clk_device_probe(struct platform_device *pdev)
 					sdpm_clk->clk_data[idx].reg,
 					&sdpm_clk->clk_data[idx].reg_nb);
 		}
-	}
-	cpu_phandle = of_parse_phandle(dev_node, "cpu", 0);
-	if (!cpu_phandle)
-		return 0;
-
-	for_each_possible_cpu(cpu) {
-		cpu_dev = get_cpu_device(cpu);
-		if (!cpu_dev || cpu_dev->of_node != cpu_phandle)
-			continue;
-		sdpm_clk->clk_data[idx].clk = NULL;
-		sdpm_clk->clk_data[idx].clock_name = NULL;
-		sdpm_clk->clk_data[idx].reg = NULL;
-		sdpm_clk->clk_data[idx].reg_enable = 1;
-		ret = of_property_read_u32_index(dev_node, "csr-id", idx,
-							&csr);
-		if (ret < 0) {
-			dev_err(dev, "Couldn't get CSR for index:%d. %d\n",
-					idx, ret);
-			return ret;
-		}
-		if (ret > CSR_MAX_VAL) {
-			dev_err(dev, "Invalid CSR %d\n", csr);
-			return -EINVAL;
-		}
-		dev_dbg(dev, "CPU%d clock csr:%d initialized\n",
-				cpu, csr);
-		sdpm_clk->clk_data[idx].csr_id = csr;
-		sdpm_clk->clk_data[idx].cpu_id = cpu;
-		sdpm_clk->clk_data[idx].sdpm_inst = sdpm_clk;
-		sdpm_clk->clk_data[idx].clk_rate_nb.notifier_call =
-			sdpm_cpu_notifier;
-		mutex_init(&sdpm_clk->clk_data[idx].sdpm_mutex);
-		freq = UINT_MAX;
-		opp = dev_pm_opp_find_freq_floor(cpu_dev, &freq);
-		if (IS_ERR(opp)) {
-			dev_err(dev, "OPP for CPU%d fetch error:%d\n", cpu,
-					PTR_ERR(opp));
-			return PTR_ERR(opp);
-		}
-		sdpm_clk->clk_data[idx].last_freq = FREQ_HZ_TO_MHZ(freq);
-		sdpm_csr_write(&sdpm_clk->clk_data[idx],
-				sdpm_clk->clk_data[idx].last_freq);
-		dev_pm_opp_put(opp);
-		cpufreq_register_notifier(&sdpm_clk->clk_data[idx].clk_rate_nb,
-					CPUFREQ_TRANSITION_NOTIFIER);
-		break;
 	}
 
 	return 0;
@@ -329,8 +242,6 @@ static int sdpm_clk_device_remove(struct platform_device *pdev)
 		regulator_unregister_notifier(sdpm_clk->clk_data[idx].reg,
 					&sdpm_clk->clk_data[idx].reg_nb);
 	}
-	cpufreq_unregister_notifier(&sdpm_clk->clk_data[idx].clk_rate_nb,
-					CPUFREQ_TRANSITION_NOTIFIER);
 
 	return 0;
 }
@@ -350,4 +261,4 @@ static struct platform_driver sdpm_clk_device_driver = {
 };
 
 module_platform_driver(sdpm_clk_device_driver);
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

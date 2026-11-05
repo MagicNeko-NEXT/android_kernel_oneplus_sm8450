@@ -12,6 +12,7 @@
 #include <asm/insn.h>
 #include <asm/kvm_mmu.h>
 #include <asm/memory.h>
+#include <asm/patching.h>
 
 /*
  * The LSB of the HYP VA tag
@@ -109,6 +110,34 @@ __init void kvm_apply_hyp_relocations(void)
 	}
 }
 
+void kvm_apply_hyp_module_relocations(struct pkvm_el2_module *mod,
+				      kvm_nvhe_reloc_t *begin,
+				      kvm_nvhe_reloc_t *end)
+{
+	void *hyp_va = (void *)mod->token;
+	kvm_nvhe_reloc_t *rel;
+
+	for (rel = begin; rel < end; ++rel) {
+		u32 **ptr, *va;
+
+		/*
+		 * Each entry contains a 32-bit relative offset from itself
+		 * to a VA position in the module area.
+		 */
+		ptr = (u32 **)((char *)rel + *rel);
+
+		/* Read the module VA value at the relocation address. */
+		va = *ptr;
+
+		/* Convert the module VA of the reloc to a hyp VA */
+		WARN_ON(aarch64_insn_write_literal_u64(ptr,
+					(u64)(((void *)va - mod->sections.start) + hyp_va)));
+	}
+
+	sync_icache_aliases((unsigned long)mod->text.start,
+			    (unsigned long)mod->text.end);
+}
+
 static u32 compute_instruction(int n, u32 rd, u32 rn)
 {
 	u32 insn = AARCH64_BREAK_FAULT;
@@ -169,7 +198,7 @@ void __init kvm_update_va_mask(struct alt_instr *alt,
 		 * dictates it and we don't have any spare bits in the
 		 * address), NOP everything after masking the kernel VA.
 		 */
-		if (has_vhe() || (!tag_val && i > 0)) {
+		if (cpus_have_cap(ARM64_HAS_VIRT_HOST_EXTN) || (!tag_val && i > 0)) {
 			updptr[i] = cpu_to_le32(aarch64_insn_gen_nop());
 			continue;
 		}
@@ -193,7 +222,8 @@ void kvm_patch_vector_branch(struct alt_instr *alt,
 
 	BUG_ON(nr_inst != 4);
 
-	if (!cpus_have_const_cap(ARM64_SPECTRE_V3A) || WARN_ON_ONCE(has_vhe()))
+	if (!cpus_have_cap(ARM64_SPECTRE_V3A) ||
+	    WARN_ON_ONCE(cpus_have_cap(ARM64_HAS_VIRT_HOST_EXTN)))
 		return;
 
 	/*

@@ -15,13 +15,6 @@ use Cwd 'abs_path';
 use Term::ANSIColor qw(:constants);
 use Encode qw(decode encode);
 
-use constant BEFORE_SHORTTEXT => 0;
-use constant IN_SHORTTEXT_BLANKLINE => 1;
-use constant IN_SHORTTEXT => 2;
-use constant AFTER_SHORTTEXT => 3;
-use constant CHECK_NEXT_SHORTTEXT => 4;
-use constant SHORTTEXT_LIMIT => 75;
-
 my $P = $0;
 my $D = dirname(abs_path($P));
 
@@ -35,6 +28,7 @@ my %verbose_messages = ();
 my %verbose_emitted = ();
 my $tree = 1;
 my $chk_signoff = 1;
+my $chk_fixes_tag = 1;
 my $chk_patch = 1;
 my $tst_only;
 my $emacs = 0;
@@ -95,6 +89,7 @@ Options:
   -v, --verbose              verbose mode
   --no-tree                  run without a kernel tree
   --no-signoff               do not check for 'Signed-off-by' line
+  --no-fixes-tag             do not check for 'Fixes:' tag
   --patch                    treat FILE as patchfile (default)
   --emacs                    emacs compile window format
   --terse                    one line per report
@@ -302,6 +297,7 @@ GetOptions(
 	'v|verbose!'	=> \$verbose,
 	'tree!'		=> \$tree,
 	'signoff!'	=> \$chk_signoff,
+	'fixes-tag!'	=> \$chk_fixes_tag,
 	'patch!'	=> \$chk_patch,
 	'emacs!'	=> \$emacs,
 	'terse!'	=> \$terse,
@@ -519,6 +515,7 @@ our $Attribute	= qr{
 			__ro_after_init|
 			__kprobes|
 			$InitAttribute|
+			__aligned\s*\(.*\)|
 			____cacheline_aligned|
 			____cacheline_aligned_in_smp|
 			____cacheline_internodealigned_in_smp|
@@ -625,6 +622,7 @@ our $signature_tags = qr{(?xi:
 	Reviewed-by:|
 	Reported-by:|
 	Suggested-by:|
+	Assisted-by:|
 	To:|
 	Cc:
 )};
@@ -1263,6 +1261,7 @@ sub git_commit_info {
 }
 
 $chk_signoff = 0 if ($file);
+$chk_fixes_tag = 0 if ($file);
 
 my @rawlines = ();
 my @lines = ();
@@ -2574,33 +2573,6 @@ sub tabify {
 	return "$leading";
 }
 
-sub cleanup_continuation_headers {
-	# Collapse any header-continuation lines into a single line so they
-	# can be parsed meaningfully, as the parser only has one line
-	# of context to work with.
-	my $again;
-	do {
-		$again = 0;
-		foreach my $n (0 .. scalar(@rawlines) - 2) {
-			if ($rawlines[$n]=~/^\s*$/) {
-				# A blank line means there's no more chance
-				# of finding headers.  Shortcut to done.
-				return;
-			}
-			if ($rawlines[$n]=~/^[\x21-\x39\x3b-\x7e]+:/ &&
-			    $rawlines[$n+1]=~/^\s+/) {
-				# Continuation header.  Collapse it.
-				my $line = splice @rawlines, $n+1, 1;
-				$line=~s/^\s+/ /;
-				$rawlines[$n] .= $line;
-				# We've 'destabilized' the list, so restart.
-				$again = 1;
-				last;
-			}
-		}
-	} while ($again);
-}
-
 sub pos_last_openparen {
 	my ($line) = @_;
 
@@ -2661,8 +2633,6 @@ sub process {
 	my $prevrawline="";
 	my $stashline="";
 	my $stashrawline="";
-	my $subjectline="";
-	my $sublinenr="";
 
 	my $length;
 	my $indent;
@@ -2671,6 +2641,9 @@ sub process {
 
 	our $clean = 1;
 	my $signoff = 0;
+	my $fixes_tag = 0;
+	my $is_revert = 0;
+	my $needs_fixes_tag = "";
 	my $author = '';
 	my $authorsignoff = 0;
 	my $author_sob = '';
@@ -2726,16 +2699,11 @@ sub process {
 	my $setup_docs = 0;
 
 	my $camelcase_file_seeded = 0;
-	my $shorttext = BEFORE_SHORTTEXT;
-	my $shorttext_exspc = 0;
-	my $commit_text_present = 0;
 
 	my $checklicenseline = 1;
 
 	sanitise_line_reset();
-	cleanup_continuation_headers();
 	my $line;
-
 	foreach my $rawline (@rawlines) {
 		$linenr++;
 		$line = $rawline;
@@ -2950,105 +2918,12 @@ sub process {
 
 			next;
 		}
+
 		$here .= "FILE: $realfile:$realline:" if ($realcnt != 0);
 
 		my $hereline = "$here\n$rawline\n";
 		my $herecurr = "$here\n$rawline\n";
 		my $hereprev = "$here\n$prevrawline\n$rawline\n";
-
-		if ($shorttext != AFTER_SHORTTEXT) {
-			if ($shorttext == IN_SHORTTEXT_BLANKLINE && $line=~/\S/) {
-				# the subject line was just processed,
-				# a blank line must be next
-				WARN("NONBLANK_AFTER_SUMMARY",
-				     "non-blank line after summary line\n" . $herecurr);
-				$shorttext = IN_SHORTTEXT;
-				# this non-blank line may or may not be commit text -
-				# a warning has been generated so assume it is commit
-				# text and move on
-				$commit_text_present = 1;
-				# fall through and treat this line as IN_SHORTTEXT
-			}
-			if ($shorttext == IN_SHORTTEXT) {
-				if ($line=~/^---/ || $line=~/^diff.*/) {
-					if ($commit_text_present == 0) {
-						WARN("NO_COMMIT_TEXT",
-						     "please add commit text explaining " .
-						     "*why* the change is needed\n" .
-						     $herecurr);
-					}
-					$shorttext = AFTER_SHORTTEXT;
-				} elsif ($line=~/^\s*change-id:/i ||
-					 $line=~/^\s*signed-off-by:/i ||
-					 $line=~/^\s*crs-fixed:/i ||
-					 $line=~/^\s*acked-by:/i) {
-					# this is a tag, there must be commit
-					# text by now
-					if ($commit_text_present == 0) {
-						WARN("NO_COMMIT_TEXT",
-						     "please add commit text explaining " .
-						     "*why* the change is needed\n" .
-						     $herecurr);
-						# prevent duplicate warnings
-						$commit_text_present = 1;
-					}
-				} elsif ($line=~/\S/) {
-					$commit_text_present = 1;
-				}
-			} elsif ($shorttext == IN_SHORTTEXT_BLANKLINE) {
-				# case of non-blank line in this state handled above
-				$shorttext = IN_SHORTTEXT;
-			} elsif ($shorttext == CHECK_NEXT_SHORTTEXT) {
-# The Subject line doesn't have to be the last header in the patch.
-# Avoid moving to the IN_SHORTTEXT state until clear of all headers.
-# Per RFC5322, continuation lines must be folded, so any left-justified
-# text which looks like a header is definitely a header.
-				if ($line!~/^[\x21-\x39\x3b-\x7e]+:/) {
-					$shorttext = IN_SHORTTEXT;
-					# Check for Subject line followed by a blank line.
-					if (length($line) != 0) {
-						WARN("NONBLANK_AFTER_SUMMARY",
-						     "non-blank line after " .
-						     "summary line\n" .
-						     $sublinenr . $here .
-						     "\n" . $subjectline .
-						     "\n" . $line . "\n");
-						# this non-blank line may or may not
-						# be commit text - a warning has been
-						# generated so assume it is commit
-						# text and move on
-						$commit_text_present = 1;
-					}
-				}
-			# The next two cases are BEFORE_SHORTTEXT.
-			} elsif ($line=~/^Subject: \[[^\]]*\] (.*)/) {
-				# This is the subject line. Go to
-				# CHECK_NEXT_SHORTTEXT to wait for the commit
-				# text to show up.
-				$shorttext = CHECK_NEXT_SHORTTEXT;
-				$subjectline = $line;
-				$sublinenr = "#$linenr & ";
-# Check for Subject line less than line limit
-				if (length($1) > SHORTTEXT_LIMIT && !($1 =~ m/Revert\ \"/)) {
-					WARN("LONG_SUMMARY_LINE",
-					     "summary line over " .
-					     SHORTTEXT_LIMIT .
-					     " characters\n" . $herecurr);
-				}
-			} elsif ($line=~/^    (.*)/) {
-				# Indented format, this must be the summary
-				# line (i.e. git show). There will be no more
-				# headers so we are now in the shorttext.
-				$shorttext = IN_SHORTTEXT_BLANKLINE;
-				$shorttext_exspc = 4;
-				if (length($1) > SHORTTEXT_LIMIT && !($1 =~ m/Revert\ \"/)) {
-					WARN("LONG_SUMMARY_LINE",
-					     "summary line over " .
-					     SHORTTEXT_LIMIT .
-					     " characters\n" . $herecurr);
-				}
-			}
-		}
 
 		$cnt_lines++ if ($realcnt != 0);
 
@@ -3196,6 +3071,15 @@ sub process {
 				}
 			}
 
+			# Assisted-by uses AGENT_NAME:MODEL_VERSION format, not email
+			if ($sign_off =~ /^Assisted-by:/i) {
+				if ($email !~ /^\S+:\S+/) {
+					WARN("BAD_SIGN_OFF",
+					     "Assisted-by expects 'AGENT_NAME:MODEL_VERSION [TOOL1] [TOOL2]' format\n" . $herecurr);
+				}
+				next;
+			}
+
 			my ($email_name, $name_comment, $email_address, $comment) = parse_email($email);
 			my $suggested_email = format_email(($email_name, $name_comment, $email_address, $comment));
 			if ($suggested_email eq "") {
@@ -3286,7 +3170,7 @@ sub process {
 			$sig_nospace =~ s/\s//g;
 			$sig_nospace = lc($sig_nospace);
 			if (defined $signatures{$sig_nospace}) {
-				WARN("DUPLICATE_SIGN_OFF",
+				WARN("BAD_SIGN_OFF",
 				     "Duplicate signature\n" . $herecurr);
 			} else {
 				$signatures{$sig_nospace} = 1;
@@ -3322,38 +3206,44 @@ sub process {
 			}
 		}
 
+# These indicate a bug fix
+		if (!$in_header_lines && !$is_patch &&
+			$line =~ /^This reverts commit/) {
+			$is_revert = 1;
+		}
+
+		if (!$in_header_lines && !$is_patch &&
+		    $line =~ /((?:(?:BUG: K.|UB)SAN: |Call Trace:|stable\@|syzkaller))/) {
+			$needs_fixes_tag = $1;
+		}
 
 # Check Fixes: styles is correct
 		if (!$in_header_lines &&
-		    $line =~ /^\s*fixes:?\s*(?:commit\s*)?[0-9a-f]{5,}\b/i) {
-			my $orig_commit = "";
-			my $id = "0123456789ab";
-			my $title = "commit title";
-			my $tag_case = 1;
-			my $tag_space = 1;
-			my $id_length = 1;
-			my $id_case = 1;
+		    $line =~ /^\s*(fixes:?)\s*(?:commit\s*)?([0-9a-f]{5,40})(?:\s*($balanced_parens))?/i) {
+			my $tag = $1;
+			my $orig_commit = $2;
+			my $title;
 			my $title_has_quotes = 0;
-
-			if ($line =~ /(\s*fixes:?)\s+([0-9a-f]{5,})\s+($balanced_parens)/i) {
-				my $tag = $1;
-				$orig_commit = $2;
-				$title = $3;
-
-				$tag_case = 0 if $tag eq "Fixes:";
-				$tag_space = 0 if ($line =~ /^fixes:? [0-9a-f]{5,} ($balanced_parens)/i);
-
-				$id_length = 0 if ($orig_commit =~ /^[0-9a-f]{12}$/i);
-				$id_case = 0 if ($orig_commit !~ /[A-F]/);
-
+			$fixes_tag = 1;
+			if (defined $3) {
 				# Always strip leading/trailing parens then double quotes if existing
-				$title = substr($title, 1, -1);
+				$title = substr($3, 1, -1);
 				if ($title =~ /^".*"$/) {
 					$title = substr($title, 1, -1);
 					$title_has_quotes = 1;
 				}
+			} else {
+				$title = "commit title"
 			}
 
+
+			my $tag_case = not ($tag eq "Fixes:");
+			my $tag_space = not ($line =~ /^fixes:? [0-9a-f]{5,40} ($balanced_parens)/i);
+
+			my $id_length = not ($orig_commit =~ /^[0-9a-f]{12}$/i);
+			my $id_case = not ($orig_commit !~ /[A-F]/);
+
+			my $id = "0123456789ab";
 			my ($cid, $ctitle) = git_commit_info($orig_commit, $id,
 							     $title);
 
@@ -3398,7 +3288,7 @@ sub process {
 # Check for line lengths > 75 in commit log, warn once
 		if ($in_commit_log && !$commit_log_long_line &&
 		    length($line) > 75 &&
-		    !($line =~ /^\s*[a-zA-Z0-9_\/\.\-\,]+\s+\|\s+\d+/ ||
+		    !($line =~ /^\s*[a-zA-Z0-9_\/\.]+\s+\|\s+\d+/ ||
 					# file delta changes
 		      $line =~ /^\s*(?:[\w\.\-\+]*\/)++[\w\.\-\+]+:/ ||
 					# filename then :
@@ -3848,7 +3738,7 @@ sub process {
 				$compat2 =~ s/\,[a-zA-Z0-9]*\-/\,<\.\*>\-/;
 				my $compat3 = $compat;
 				$compat3 =~ s/\,([a-z]*)[0-9]*\-/\,$1<\.\*>\-/;
-				`grep -ERq "$compat|$compat2|$compat3" $dt_path`;
+				`grep -Erq "$compat|$compat2|$compat3" $dt_path`;
 				if ( $? >> 8 ) {
 					WARN("UNDOCUMENTED_DT_STRING",
 					     "DT compatible string \"$compat\" appears un-documented -- check $dt_path\n" . $herecurr);
@@ -3975,10 +3865,6 @@ sub process {
 
 			# URL ($rawline is used in case the URL is in a comment)
 			} elsif ($rawline =~ /^\+.*\b[a-z][\w\.\+\-]*:\/\/\S+/i) {
-				$msg_type = "";
-
-			# Long copyright statements are another special case
-			} elsif ($rawline =~ /^\+.\*.*copyright.*\(c\).*$/i) {
 				$msg_type = "";
 
 			# Otherwise set the alternate message types
@@ -4192,7 +4078,7 @@ sub process {
 		if ($prevline =~ /^[\+ ]};?\s*$/ &&
 		    $line =~ /^\+/ &&
 		    !($line =~ /^\+\s*$/ ||
-		      $line =~ /^\+\s*(?:EXPORT_SYMBOL|early_param)/ ||
+		      $line =~ /^\+\s*(?:EXPORT_SYMBOL|early_param|ALLOW_ERROR_INJECTION)/ ||
 		      $line =~ /^\+\s*MODULE_/i ||
 		      $line =~ /^\+\s*\#\s*(?:end|elif|else)/ ||
 		      $line =~ /^\+[a-z_]*init/ ||
@@ -5602,7 +5488,7 @@ sub process {
 
 # check spacing on parentheses
 		if ($line =~ /\(\s/ && $line !~ /\(\s*(?:\\)?$/ &&
-		    $line !~ /for\s*\(\s+;/ && $line !~ /^\+\s*[A-Z_][A-Z\d_]*\(\s*\d+(\,.*)?\)\,?$/) {
+		    $line !~ /for\s*\(\s+;/) {
 			if (ERROR("SPACING",
 				  "space prohibited after that open parenthesis '('\n" . $herecurr) &&
 			    $fix) {
@@ -6044,7 +5930,7 @@ sub process {
 		if ($realfile !~ m@/vmlinux.lds.h$@ &&
 		    $line =~ /^.\s*\#\s*define\s*$Ident(\()?/) {
 			my $ln = $linenr;
-			my $cnt = $realcnt - 1;
+			my $cnt = $realcnt;
 			my ($off, $dstat, $dcond, $rest);
 			my $ctx = '';
 			my $has_flow_statement = 0;
@@ -6082,12 +5968,6 @@ sub process {
 			{
 			}
 
-			# Extremely long macros may fall off the end of the
-			# available context without closing.  Give a dangling
-			# backslash the benefit of the doubt and allow it
-			# to gobble any hanging open-parens.
-			$dstat =~ s/\(.+\\$/1/;
-
 			# Flatten any obvious string concatenation.
 			while ($dstat =~ s/($String)\s*$Ident/$1/ ||
 			       $dstat =~ s/$Ident\s*($String)/$1/)
@@ -6103,7 +5983,6 @@ sub process {
 				MODULE_PARM_DESC|
 				DECLARE_PER_CPU|
 				DEFINE_PER_CPU|
-				CLK_[A-Z\d_]+|
 				__typeof__\(|
 				union|
 				struct|
@@ -6527,25 +6406,6 @@ sub process {
 			     "Avoid line continuations in quoted strings\n" . $herecurr);
 		}
 
-# read[bwl] & write[bwl] use too many barriers, use the _relaxed variants
-		if ($line =~ /\b((?:read|write)[bwl])\b/) {
-			ERROR("NON_RELAXED_IO",
-			      "Use of $1 is deprecated: use $1_relaxed\n\t" .
-			      "with appropriate memory barriers instead.\n" .
-			      $herecurr);
-		}
-
-# likewise, in/out[bwl] should be __raw_read/write[bwl]...
-		if ($line =~ /\b((in|out)([bwl]))\b/) {
-			my ($all, $pref, $suf) = ($1, $2, $3);
-			$pref =~ s/in/read/;
-			$pref =~ s/out/write/;
-			ERROR("NON_RELAXED_IO",
-			      "Use of $all is deprecated: use " .
-			      "__raw_$pref$suf\n\t" .
-			      "with appropriate memory barriers instead.\n" .
-			      $herecurr);
-		}
 # warn about #if 0
 		if ($line =~ /^.\s*\#\s*if\s+0\b/) {
 			WARN("IF_0",
@@ -7175,6 +7035,25 @@ sub process {
 			     "Prefer strscpy, strscpy_pad, or __nonstring over strncpy - see: https://github.com/KSPP/linux/issues/90\n" . $herecurr);
 		}
 
+# ethtool_sprintf uses that should likely be ethtool_puts
+		if ($line =~ /\bethtool_sprintf\s*\(\s*$FuncArg\s*,\s*$FuncArg\s*\)/) {
+			if (WARN("PREFER_ETHTOOL_PUTS",
+				 "Prefer ethtool_puts over ethtool_sprintf with only two arguments\n" . $herecurr) &&
+			    $fix) {
+				$fixed[$fixlinenr] =~ s/\bethtool_sprintf\s*\(\s*($FuncArg)\s*,\s*($FuncArg)/ethtool_puts($1, $7)/;
+			}
+		}
+
+		# use $rawline because $line loses %s via sanitization and thus we can't match against it.
+		if ($rawline =~ /\bethtool_sprintf\s*\(\s*$FuncArg\s*,\s*\"\%s\"\s*,\s*$FuncArg\s*\)/) {
+			if (WARN("PREFER_ETHTOOL_PUTS",
+				 "Prefer ethtool_puts over ethtool_sprintf with standalone \"%s\" specifier\n" . $herecurr) &&
+			    $fix) {
+				$fixed[$fixlinenr] =~ s/\bethtool_sprintf\s*\(\s*($FuncArg)\s*,\s*"\%s"\s*,\s*($FuncArg)/ethtool_puts($1, $7)/;
+			}
+		}
+
+
 # typecasts on min/max could be min_t/max_t
 		if ($perl_version_ok &&
 		    defined $stat &&
@@ -7475,12 +7354,6 @@ sub process {
 
 			WARN("DEFAULT_NO_BREAK",
 			     "switch default: should use break\n" . $herectx);
-		}
-
-# check for return codes on error paths
-		if ($line =~ /\breturn\s+-\d+/) {
-			ERROR("NO_ERROR_CODE",
-			      "illegal return value, please use an error code\n" . $herecurr);
 		}
 
 # check for gcc specific __FUNCTION__
@@ -7840,6 +7713,12 @@ sub process {
 	if (!$is_patch && $filename !~ /cover-letter\.patch$/) {
 		ERROR("NOT_UNIFIED_DIFF",
 		      "Does not appear to be a unified-diff format patch\n");
+	}
+	if ($is_patch && $has_commit_log && $chk_fixes_tag) {
+		if ($needs_fixes_tag ne "" && !$is_revert && !$fixes_tag) {
+			WARN("MISSING_FIXES_TAG",
+				 "The commit message has '$needs_fixes_tag', perhaps it also needs a 'Fixes:' tag?\n");
+		}
 	}
 	if ($is_patch && $has_commit_log && $chk_signoff) {
 		if ($signoff == 0) {

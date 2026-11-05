@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/module.h>
@@ -46,7 +47,7 @@ static int qcom_tlmm_vm_irqchip_probe(struct platform_device *pdev)
 
 	qcom_tlmm_vm_irqchip_data.domain->name = "qcom-tlmm-vm-irq-domain";
 
-	pr_info("qcom tlmm vm irq controller registered\n");
+	pr_debug("qcom tlmm vm irq controller registered\n");
 
 	return 0;
 }
@@ -69,7 +70,7 @@ static struct platform_driver qcom_tlmm_vm_irqchip_driver = {
 	.remove = qcom_tlmm_vm_irqchip_remove,
 	.driver = {
 		.name = "qcom_tlmm_vm_irqchip",
-	.of_match_table = qcom_tlmm_vm_irqchip_of_match,
+		.of_match_table = qcom_tlmm_vm_irqchip_of_match,
 	},
 };
 
@@ -91,4 +92,4 @@ static __exit void qcom_tlmm_vm_irqchip_exit(void)
 module_exit(qcom_tlmm_vm_irqchip_exit);
 
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. TLMM VM Irqchip Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

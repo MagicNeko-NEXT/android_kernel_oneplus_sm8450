@@ -5,21 +5,15 @@
 #define TRACE_INCLUDE_PATH trace/hooks
 #if !defined(_TRACE_HOOK_SYSCALL_CHECK_H) || defined(TRACE_HEADER_MULTI_READ)
 #define _TRACE_HOOK_SYSCALL_CHECK_H
-#include <linux/tracepoint.h>
 #include <trace/hooks/vendor_hooks.h>
 /*
  * Following tracepoints are not exported in tracefs and provide a
  * mechanism for vendor modules to hook and extend functionality
  */
-#ifdef __GENKSYMS__
 struct file;
 union bpf_attr;
-#else
-/* struct file */
-#include <linux/fs.h>
-/* union bpf_attr */
-#include <uapi/linux/bpf.h>
-#endif /* __GENKSYMS__ */
+struct timespec64;
+
 DECLARE_HOOK(android_vh_check_mmap_file,
 	TP_PROTO(const struct file *file, unsigned long prot,
 		unsigned long flag, unsigned long ret),
@@ -32,6 +26,14 @@ DECLARE_HOOK(android_vh_check_file_open,
 DECLARE_HOOK(android_vh_check_bpf_syscall,
 	TP_PROTO(int cmd, const union bpf_attr *attr, unsigned int size),
 	TP_ARGS(cmd, attr, size));
+
+DECLARE_HOOK(android_vh_check_nanosleep_syscall,
+    TP_PROTO(struct timespec64 *tu),
+    TP_ARGS(tu));
+
+DECLARE_HOOK(android_vh_destroy_inode,
+	TP_PROTO(struct inode *inode),
+	TP_ARGS(inode));
 
 #endif /* _TRACE_HOOK_SYSCALL_CHECK_H */
 /* This part must be outside protection */

@@ -49,21 +49,21 @@
 
 #include "rcu.h"
 
+EXPORT_TRACEPOINT_SYMBOL_GPL(rcu_stall_warning);
+
 #ifdef MODULE_PARAM_PREFIX
 #undef MODULE_PARAM_PREFIX
 #endif
 #define MODULE_PARAM_PREFIX "rcupdate."
 
 #ifndef CONFIG_TINY_RCU
-module_param(rcu_expedited, int, 0);
-module_param(rcu_normal, int, 0);
-static int rcu_normal_after_boot;
-module_param(rcu_normal_after_boot, int, 0);
+module_param(rcu_expedited, int, 0444);
+module_param(rcu_normal, int, 0444);
+static int rcu_normal_after_boot = IS_ENABLED(CONFIG_PREEMPT_RT);
+#if !defined(CONFIG_PREEMPT_RT) || defined(CONFIG_NO_HZ_FULL)
+module_param(rcu_normal_after_boot, int, 0444);
+#endif
 #endif /* #ifndef CONFIG_TINY_RCU */
-
-/* Minimum time in ms until RCU can consider in-kernel boot as completed. */
-static int boot_end_delay = CONFIG_RCU_BOOT_END_DELAY;
-module_param(boot_end_delay, int, 0444);
 
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
 /**
@@ -88,7 +88,7 @@ module_param(boot_end_delay, int, 0444);
  * and while lockdep is disabled.
  *
  * Note that if the CPU is in the idle loop from an RCU point of view (ie:
- * that we are in the section between rcu_idle_enter() and rcu_idle_exit())
+ * that we are in the section between ct_idle_enter() and ct_idle_exit())
  * then rcu_read_lock_held() sets ``*ret`` to false even if the CPU did an
  * rcu_read_lock().  The reason for this is that RCU ignores CPUs that are
  * in such a section, considering these as in extended quiescent state,
@@ -147,8 +147,45 @@ bool rcu_gp_is_normal(void)
 }
 EXPORT_SYMBOL_GPL(rcu_gp_is_normal);
 
-static atomic_t rcu_expedited_nesting = ATOMIC_INIT(1);
+static atomic_t rcu_async_hurry_nesting = ATOMIC_INIT(1);
+/*
+ * Should call_rcu() callbacks be processed with urgency or are
+ * they OK being executed with arbitrary delays?
+ */
+bool rcu_async_should_hurry(void)
+{
+	return !IS_ENABLED(CONFIG_RCU_LAZY) ||
+	       atomic_read(&rcu_async_hurry_nesting);
+}
+EXPORT_SYMBOL_GPL(rcu_async_should_hurry);
 
+/**
+ * rcu_async_hurry - Make future async RCU callbacks not lazy.
+ *
+ * After a call to this function, future calls to call_rcu()
+ * will be processed in a timely fashion.
+ */
+void rcu_async_hurry(void)
+{
+	if (IS_ENABLED(CONFIG_RCU_LAZY))
+		atomic_inc(&rcu_async_hurry_nesting);
+}
+EXPORT_SYMBOL_GPL(rcu_async_hurry);
+
+/**
+ * rcu_async_relax - Make future async RCU callbacks lazy.
+ *
+ * After a call to this function, future calls to call_rcu()
+ * will be processed in a lazy fashion.
+ */
+void rcu_async_relax(void)
+{
+	if (IS_ENABLED(CONFIG_RCU_LAZY))
+		atomic_dec(&rcu_async_hurry_nesting);
+}
+EXPORT_SYMBOL_GPL(rcu_async_relax);
+
+static atomic_t rcu_expedited_nesting = ATOMIC_INIT(1);
 /*
  * Should normal grace-period primitives be expedited?  Intended for
  * use within RCU.  Note that this function takes the rcu_expedited
@@ -190,35 +227,89 @@ void rcu_unexpedite_gp(void)
 }
 EXPORT_SYMBOL_GPL(rcu_unexpedite_gp);
 
+/*
+ * Minimum time in milliseconds from the start boot until RCU can consider
+ * in-kernel boot as completed.  This can also be tuned at runtime to end the
+ * boot earlier, by userspace init code writing the time in milliseconds (even
+ * 0) to: /sys/module/rcupdate/parameters/rcu_boot_end_delay. The sysfs node
+ * can also be used to extend the delay to be larger than the default, assuming
+ * the marking of boot complete has not yet occurred.
+ */
+static int rcu_boot_end_delay = CONFIG_RCU_BOOT_END_DELAY;
+
 static bool rcu_boot_ended __read_mostly;
+static bool rcu_boot_end_called __read_mostly;
+static DEFINE_MUTEX(rcu_boot_end_lock);
+
 /*
  * Inform RCU of the end of the in-kernel boot sequence. The boot sequence will
- * not be marked ended until at least boot_end_delay milliseconds have passed.
+ * not be marked ended until at least rcu_boot_end_delay milliseconds have passed.
  */
 void rcu_end_inkernel_boot(void);
-static void boot_rcu_work_fn(struct work_struct *work)
+static void rcu_boot_end_work_fn(struct work_struct *work)
 {
 	rcu_end_inkernel_boot();
 }
-static DECLARE_DELAYED_WORK(boot_rcu_work, boot_rcu_work_fn);
+static DECLARE_DELAYED_WORK(rcu_boot_end_work, rcu_boot_end_work_fn);
 
-void rcu_end_inkernel_boot(void)
+/* Must be called with rcu_boot_end_lock held. */
+static void rcu_end_inkernel_boot_locked(void)
 {
-	if (boot_end_delay) {
+	rcu_boot_end_called = true;
+
+	if (rcu_boot_ended)
+		return;
+
+	if (rcu_boot_end_delay) {
 		u64 boot_ms = div_u64(ktime_get_boot_fast_ns(), 1000000UL);
 
-		if (boot_ms < boot_end_delay) {
-			schedule_delayed_work(&boot_rcu_work,
-					msecs_to_jiffies(boot_end_delay - boot_ms));
+		if (boot_ms < rcu_boot_end_delay) {
+			schedule_delayed_work(&rcu_boot_end_work,
+					msecs_to_jiffies(rcu_boot_end_delay - boot_ms));
 			return;
 		}
 	}
 
+	cancel_delayed_work(&rcu_boot_end_work);
 	rcu_unexpedite_gp();
+	rcu_async_relax();
 	if (rcu_normal_after_boot)
 		WRITE_ONCE(rcu_normal, 1);
 	rcu_boot_ended = true;
 }
+
+void rcu_end_inkernel_boot(void)
+{
+	mutex_lock(&rcu_boot_end_lock);
+	rcu_end_inkernel_boot_locked();
+	mutex_unlock(&rcu_boot_end_lock);
+}
+
+static int param_set_rcu_boot_end(const char *val, const struct kernel_param *kp)
+{
+	uint end_ms;
+	int ret = kstrtouint(val, 0, &end_ms);
+
+	if (ret)
+		return ret;
+	/*
+	 * rcu_end_inkernel_boot() should be called at least once during init
+	 * before we can allow param changes to end the boot.
+	 */
+	mutex_lock(&rcu_boot_end_lock);
+	rcu_boot_end_delay = end_ms;
+	if (!rcu_boot_ended && rcu_boot_end_called) {
+		rcu_end_inkernel_boot_locked();
+	}
+	mutex_unlock(&rcu_boot_end_lock);
+	return ret;
+}
+
+static const struct kernel_param_ops rcu_boot_end_ops = {
+	.set = param_set_rcu_boot_end,
+	.get = param_get_uint,
+};
+module_param_cb(rcu_boot_end_delay, &rcu_boot_end_ops, &rcu_boot_end_delay, 0644);
 
 /*
  * Let rcutorture know when it is OK to turn it up to eleven.
@@ -240,11 +331,12 @@ void rcu_test_sync_prims(void)
 {
 	if (!IS_ENABLED(CONFIG_PROVE_RCU))
 		return;
+	pr_info("Running RCU synchronous self tests\n");
 	synchronize_rcu();
 	synchronize_rcu_expedited();
 }
 
-#if !defined(CONFIG_TINY_RCU) || defined(CONFIG_SRCU)
+#if !defined(CONFIG_TINY_RCU)
 
 /*
  * Switch to run-time mode once RCU has fully initialized.
@@ -259,7 +351,7 @@ static int __init rcu_set_runtime_mode(void)
 }
 core_initcall(rcu_set_runtime_mode);
 
-#endif /* #if !defined(CONFIG_TINY_RCU) || defined(CONFIG_SRCU) */
+#endif /* #if !defined(CONFIG_TINY_RCU) */
 
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
 static struct lock_class_key rcu_lock_key;
@@ -267,7 +359,7 @@ struct lockdep_map rcu_lock_map = {
 	.name = "rcu_read_lock",
 	.key = &rcu_lock_key,
 	.wait_type_outer = LD_WAIT_FREE,
-	.wait_type_inner = LD_WAIT_CONFIG, /* XXX PREEMPT_RCU ? */
+	.wait_type_inner = LD_WAIT_CONFIG, /* PREEMPT_RT implies PREEMPT_RCU */
 };
 EXPORT_SYMBOL_GPL(rcu_lock_map);
 
@@ -276,7 +368,7 @@ struct lockdep_map rcu_bh_lock_map = {
 	.name = "rcu_read_lock_bh",
 	.key = &rcu_bh_lock_key,
 	.wait_type_outer = LD_WAIT_FREE,
-	.wait_type_inner = LD_WAIT_CONFIG, /* PREEMPT_LOCK also makes BH preemptible */
+	.wait_type_inner = LD_WAIT_CONFIG, /* PREEMPT_RT makes BH preemptible. */
 };
 EXPORT_SYMBOL_GPL(rcu_bh_lock_map);
 
@@ -427,6 +519,13 @@ void __wait_rcu_gp(bool checktiny, int n, call_rcu_func_t *crcu_array,
 }
 EXPORT_SYMBOL_GPL(__wait_rcu_gp);
 
+void finish_rcuwait(struct rcuwait *w)
+{
+	rcu_assign_pointer(w->task, NULL);
+	__set_current_state(TASK_RUNNING);
+}
+EXPORT_SYMBOL_GPL(finish_rcuwait);
+
 #ifdef CONFIG_DEBUG_OBJECTS_RCU_HEAD
 void init_rcu_head(struct rcu_head *head)
 {
@@ -520,6 +619,12 @@ EXPORT_SYMBOL_GPL(rcu_cpu_stall_suppress);
 module_param(rcu_cpu_stall_suppress, int, 0644);
 int rcu_cpu_stall_timeout __read_mostly = CONFIG_RCU_CPU_STALL_TIMEOUT;
 module_param(rcu_cpu_stall_timeout, int, 0644);
+int rcu_exp_cpu_stall_timeout __read_mostly = CONFIG_RCU_EXP_CPU_STALL_TIMEOUT;
+module_param(rcu_exp_cpu_stall_timeout, int, 0644);
+int rcu_cpu_stall_cputime __read_mostly = IS_ENABLED(CONFIG_RCU_CPU_STALL_CPUTIME);
+module_param(rcu_cpu_stall_cputime, int, 0644);
+bool rcu_exp_stall_task_details __read_mostly;
+module_param(rcu_exp_stall_task_details, bool, 0644);
 #endif /* #ifdef CONFIG_RCU_STALL_COMMON */
 
 // Suppress boot-time RCU CPU stall warnings and rcutorture writer stall
@@ -527,6 +632,19 @@ module_param(rcu_cpu_stall_timeout, int, 0644);
 int rcu_cpu_stall_suppress_at_boot __read_mostly; // !0 = suppress boot stalls.
 EXPORT_SYMBOL_GPL(rcu_cpu_stall_suppress_at_boot);
 module_param(rcu_cpu_stall_suppress_at_boot, int, 0444);
+
+/**
+ * get_completed_synchronize_rcu - Return a pre-completed polled state cookie
+ *
+ * Returns a value that will always be treated by functions like
+ * poll_state_synchronize_rcu() as a cookie whose grace period has already
+ * completed.
+ */
+unsigned long get_completed_synchronize_rcu(void)
+{
+	return RCU_GET_STATE_COMPLETED;
+}
+EXPORT_SYMBOL_GPL(get_completed_synchronize_rcu);
 
 #ifdef CONFIG_PROVE_RCU
 
@@ -545,6 +663,7 @@ static void test_callback(struct rcu_head *r)
 }
 
 DEFINE_STATIC_SRCU(early_srcu);
+static unsigned long early_srcu_cookie;
 
 struct early_boot_kfree_rcu {
 	struct rcu_head rh;
@@ -553,12 +672,15 @@ struct early_boot_kfree_rcu {
 static void early_boot_test_call_rcu(void)
 {
 	static struct rcu_head head;
+	int idx;
 	static struct rcu_head shead;
 	struct early_boot_kfree_rcu *rhp;
 
+	idx = srcu_down_read(&early_srcu);
+	srcu_up_read(&early_srcu, idx);
 	call_rcu(&head, test_callback);
-	if (IS_ENABLED(CONFIG_SRCU))
-		call_srcu(&early_srcu, &shead, test_callback);
+	early_srcu_cookie = start_poll_synchronize_srcu(&early_srcu);
+	call_srcu(&early_srcu, &shead, test_callback);
 	rhp = kmalloc(sizeof(*rhp), GFP_KERNEL);
 	if (!WARN_ON_ONCE(!rhp))
 		kfree_rcu(rhp, rh);
@@ -581,10 +703,10 @@ static int rcu_verify_early_boot_tests(void)
 	if (rcu_self_test) {
 		early_boot_test_counter++;
 		rcu_barrier();
-		if (IS_ENABLED(CONFIG_SRCU)) {
-			early_boot_test_counter++;
-			srcu_barrier(&early_srcu);
-		}
+		early_boot_test_counter++;
+		srcu_barrier(&early_srcu);
+		WARN_ON_ONCE(!poll_state_synchronize_srcu(&early_srcu, early_srcu_cookie));
+		cleanup_srcu_struct(&early_srcu);
 	}
 	if (rcu_self_test_counter != early_boot_test_counter) {
 		WARN_ON(1);

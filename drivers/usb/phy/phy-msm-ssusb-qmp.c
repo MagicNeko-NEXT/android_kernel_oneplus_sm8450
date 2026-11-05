@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2013-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/module.h>
@@ -52,9 +53,6 @@ enum core_ldo_levels {
 #define SW_PORTSELECT		BIT(0)
 /* port select mux: 1 - sw control. 0 - HW control*/
 #define SW_PORTSELECT_MX	BIT(1)
-/* port select polarity: 1 - invert polarity of portselect from gpio */
-#define PORTSELECT_POLARITY	BIT(2)
-#define HW_PORT_SELECT		BIT(3)
 
 /* USB3_DP_PHY_USB3_DP_COM_SWI_CTRL bits */
 
@@ -79,6 +77,9 @@ enum core_ldo_levels {
 #define DP_MODE			BIT(1) /* enables DP mode */
 #define USB3_DP_COMBO_MODE	(USB3_MODE | DP_MODE) /*enables combo mode */
 
+/* USB3_DP_COM_TYPEC_STATUS */
+#define PORTSELECT_RAW		BIT(0)
+
 enum qmp_phy_rev_reg {
 	USB3_PHY_PCS_STATUS,
 	USB3_PHY_AUTONOMOUS_MODE_CTRL,
@@ -97,8 +98,10 @@ enum qmp_phy_rev_reg {
 	USB3_DP_COM_PHY_MODE_CTRL,
 	USB3_DP_COM_TYPEC_CTRL,
 	USB3_PCS_MISC_CLAMP_ENABLE,
+	USB3_DP_COM_TYPEC_STATUS,
 	USB3_PHY_REG_MAX,
 };
+#define PHY_REG_SIZE (USB3_PHY_REG_MAX * sizeof(u32))
 
 enum qmp_phy_type {
 	USB3,
@@ -147,7 +150,6 @@ struct msm_ssphy_qmp {
 	int			reg_offset_cnt;
 	struct qmp_reg_val	*qmp_phy_init_seq;
 	int			init_seq_len;
-	bool			invert_ps_polarity;
 	enum qmp_phy_type	phy_type;
 };
 
@@ -327,7 +329,6 @@ static int msm_ssusb_qmp_ldo_enable(struct msm_ssphy_qmp *phy, int on)
 		dev_err(phy->phy.dev, "Unable to enable %s\n", "core_ldo");
 		goto unset_core_ldo;
 	}
-
 	if (phy->refgen) {
 		rc = regulator_set_load(phy->refgen, USB3PHY_REFGEN_HPM_LOAD);
 		if (rc < 0) {
@@ -350,19 +351,18 @@ static int msm_ssusb_qmp_ldo_enable(struct msm_ssphy_qmp *phy, int on)
 		}
 	}
 
-
 	return 0;
 
 disable_refgen:
 	rc = regulator_disable(phy->refgen);
 	if (rc)
-		dev_err(phy->phy.dev, "Unable to disable %s\n", "refgen");
+		dev_err(phy->phy.dev, "Unable to disable refgen\n");
 
 unset_refgen:
 	rc = regulator_set_voltage(phy->refgen, phy->refgen_levels[0], phy->refgen_levels[2]);
 	if (rc)
 		dev_err(phy->phy.dev,
-				"Unable to set (0) voltage for refgen:%s\n", "refgen");
+				"Unable to set (0) voltage for refgen:refgen\n");
 
 put_refgen_lpm:
 	rc = regulator_set_load(phy->refgen, 0);
@@ -452,18 +452,17 @@ static void usb_qmp_update_portselect_phymode(struct msm_ssphy_qmp *phy)
 
 	switch (phy->phy_type) {
 	case USB3_AND_DP:
-		/*
-		 * if port select inversion is enabled, enable it only for the input to the PHY.
-		 * The lane selection based on PHY flags will not get affected.
-		 */
-		if (val < 0 && phy->invert_ps_polarity)
-			writel_relaxed(PORTSELECT_POLARITY | HW_PORT_SELECT,
-				phy->base + phy->phy_reg[USB3_DP_COM_TYPEC_CTRL]);
-
 		writel_relaxed(0x01,
 			phy->base + phy->phy_reg[USB3_DP_COM_SW_RESET]);
 		writel_relaxed(0x00,
 			phy->base + phy->phy_reg[USB3_DP_COM_SW_RESET]);
+
+		if (phy->phy_reg[USB3_DP_COM_TYPEC_STATUS]) {
+			u32 status = readl_relaxed(phy->base +
+					phy->phy_reg[USB3_DP_COM_TYPEC_STATUS]);
+			dev_dbg(phy->phy.dev, "hw port select %s\n",
+					status & PORTSELECT_RAW ? "CC2" : "CC1");
+		}
 
 		if (!(phy->phy.flags & PHY_USB_DP_CONCURRENT_MODE))
 			/* override hardware control for reset of qmp phy */
@@ -530,8 +529,7 @@ static void usb_qmp_powerup_phy(struct msm_ssphy_qmp *phy)
 		 * msm_ssphy_qmp_init() writes 0x0 to DP_COM_SW_RESET before
 		 * initializing PHY.
 		 */
-
-		/* intentional fall-through */
+		fallthrough;
 	case USB3_OR_DP:
 	case USB3:
 		/* power up USB3 PHY */
@@ -985,14 +983,18 @@ static int usb3_get_regulators(struct msm_ssphy_qmp  *phy)
 
 	phy->vdd = devm_regulator_get(dev, "vdd");
 	if (IS_ERR(phy->vdd)) {
-		dev_err(dev, "unable to get vdd supply\n");
-		return PTR_ERR(phy->vdd);
+		ret = PTR_ERR(phy->vdd);
+		if (ret != -EPROBE_DEFER)
+			dev_err(dev, "fail to get vdd supply\n");
+		return ret;
 	}
 
 	phy->core_ldo = devm_regulator_get(dev, "core");
 	if (IS_ERR(phy->core_ldo)) {
-		dev_err(dev, "unable to get core ldo supply\n");
-		return PTR_ERR(phy->core_ldo);
+		ret = PTR_ERR(phy->core_ldo);
+		if (ret != -EPROBE_DEFER)
+			dev_err(dev, "fail to get core ldo supply\n");
+		return ret;
 	}
 
 	phy->usb3_dp_phy_gdsc = devm_regulator_get(dev, "usb3_dp_phy_gdsc");
@@ -1002,18 +1004,17 @@ static int usb3_get_regulators(struct msm_ssphy_qmp  *phy)
 			dev_err(dev, "fail to get usb3_dp_phy_gdsc(%d)\n", ret);
 			return ret;
 		}
-		dev_err(dev, "usb3_dp_phy_gdsc optional regulator missing\n");
+		dev_dbg(dev, "usb3_dp_phy_gdsc optional regulator missing\n");
 	}
 
 	if (of_property_read_bool(dev->of_node, "refgen-supply")) {
 		phy->refgen = devm_regulator_get_optional(dev, "refgen");
 		if (IS_ERR(phy->refgen))
-			dev_err(dev, "unable to get refgen supply\n");
+			dev_err(dev, "fail to get refgen supply\n");
 	}
 
 	return 0;
 }
-
 static int msm_ssphy_qmp_probe(struct platform_device *pdev)
 {
 	struct msm_ssphy_qmp *phy;
@@ -1065,7 +1066,7 @@ static int msm_ssphy_qmp_probe(struct platform_device *pdev)
 
 	of_get_property(dev->of_node, "qcom,qmp-phy-reg-offset", &size);
 	if (size) {
-		phy->phy_reg = devm_kzalloc(dev, size, GFP_KERNEL);
+		phy->phy_reg = devm_kzalloc(dev, PHY_REG_SIZE, GFP_KERNEL);
 		if (phy->phy_reg) {
 			phy->reg_offset_cnt = (size / sizeof(*phy->phy_reg));
 			if (phy->reg_offset_cnt > USB3_PHY_REG_MAX) {
@@ -1203,7 +1204,7 @@ static int msm_ssphy_qmp_probe(struct platform_device *pdev)
 	}
 
 	if (of_get_property(dev->of_node, "qcom,refgen-voltage-level", &len) &&
-		len == sizeof(phy->refgen_levels)) {
+			len == sizeof(phy->refgen_levels)) {
 		ret = of_property_read_u32_array(dev->of_node,
 				"qcom,refgen-voltage-level",
 				(u32 *) phy->refgen_levels,
@@ -1216,9 +1217,6 @@ static int msm_ssphy_qmp_probe(struct platform_device *pdev)
 				&phy->vdd_max_uA) || !phy->vdd_max_uA)
 		phy->vdd_max_uA = USB_SSPHY_HPM_LOAD;
 
-	phy->invert_ps_polarity = of_property_read_bool(dev->of_node,
-					"qcom,invert-ps-polarity");
-
 	platform_set_drvdata(pdev, phy);
 
 	phy->phy.dev			= dev;
@@ -1227,11 +1225,13 @@ static int msm_ssphy_qmp_probe(struct platform_device *pdev)
 	phy->phy.notify_connect		= msm_ssphy_qmp_notify_connect;
 	phy->phy.notify_disconnect	= msm_ssphy_qmp_notify_disconnect;
 
-	ret = usb_add_phy_dev(&phy->phy);
-
 	ret = usb3_get_regulators(phy);
 	if (ret)
 		goto err;
+
+	/* Placed at the end to ensure the probe is complete */
+	ret = usb_add_phy_dev(&phy->phy);
+
 err:
 	return ret;
 }
@@ -1261,4 +1261,4 @@ static struct platform_driver msm_ssphy_qmp_driver = {
 module_platform_driver(msm_ssphy_qmp_driver);
 
 MODULE_DESCRIPTION("MSM USB SS QMP PHY driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

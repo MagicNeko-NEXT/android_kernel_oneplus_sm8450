@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2016-2018, 2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
-
-#define pr_fmt(fmt) "I2C PMIC: %s: " fmt, __func__
 
 #include <linux/bitops.h>
 #include <linux/i2c.h>
@@ -83,7 +82,7 @@ static void i2c_pmic_sync_type_polarity(struct i2c_pmic *chip,
 				  periph->addr | INT_SET_TYPE_OFFSET,
 				  periph->cached[IRQ_SET_TYPE]);
 		if (rc < 0) {
-			pr_err("Couldn't set periph 0x%04x irqs 0x%02x type rc=%d\n",
+			dev_err(chip->dev, "Couldn't set periph 0x%04x irqs 0x%02x type rc=%d\n",
 				periph->addr, periph->cached[IRQ_SET_TYPE], rc);
 			return;
 		}
@@ -97,7 +96,7 @@ static void i2c_pmic_sync_type_polarity(struct i2c_pmic *chip,
 				  periph->addr | INT_POL_HIGH_OFFSET,
 				  periph->cached[IRQ_POL_HIGH]);
 		if (rc < 0) {
-			pr_err("Couldn't set periph 0x%04x irqs 0x%02x polarity high rc=%d\n",
+			dev_err(chip->dev, "Couldn't set periph 0x%04x irqs 0x%02x polarity high rc=%d\n",
 				periph->addr, periph->cached[IRQ_POL_HIGH], rc);
 			return;
 		}
@@ -111,7 +110,7 @@ static void i2c_pmic_sync_type_polarity(struct i2c_pmic *chip,
 				  periph->addr | INT_POL_LOW_OFFSET,
 				  periph->cached[IRQ_POL_LOW]);
 		if (rc < 0) {
-			pr_err("Couldn't set periph 0x%04x irqs 0x%02x polarity low rc=%d\n",
+			dev_err(chip->dev, "Couldn't set periph 0x%04x irqs 0x%02x polarity low rc=%d\n",
 				periph->addr, periph->cached[IRQ_POL_LOW], rc);
 			return;
 		}
@@ -135,7 +134,7 @@ static void i2c_pmic_sync_enable(struct i2c_pmic *chip,
 		rc = regmap_write(chip->regmap,
 				  periph->addr | INT_EN_CLR_OFFSET, en_clr);
 		if (rc < 0) {
-			pr_err("Couldn't disable periph 0x%04x irqs 0x%02x rc=%d\n",
+			dev_err(chip->dev, "Couldn't disable periph 0x%04x irqs 0x%02x rc=%d\n",
 				periph->addr, en_clr, rc);
 			return;
 		}
@@ -146,7 +145,7 @@ static void i2c_pmic_sync_enable(struct i2c_pmic *chip,
 		rc = regmap_write(chip->regmap,
 				  periph->addr | INT_EN_SET_OFFSET, en_set);
 		if (rc < 0) {
-			pr_err("Couldn't enable periph 0x%04x irqs 0x%02x rc=%d\n",
+			dev_err(chip->dev, "Couldn't enable periph 0x%04x irqs 0x%02x rc=%d\n",
 				periph->addr, en_set, rc);
 			return;
 		}
@@ -218,8 +217,8 @@ static int i2c_pmic_irq_set_type(struct irq_data *d, unsigned int irq_type)
 	return 0;
 }
 
-#ifdef CONFIG_PM_SLEEP
-static int i2c_pmic_irq_set_wake(struct irq_data *d, unsigned int on)
+static int __maybe_unused i2c_pmic_irq_set_wake(struct irq_data *d,
+						unsigned int on)
 {
 	struct i2c_pmic_periph *periph = irq_data_get_irq_chip_data(d);
 
@@ -230,9 +229,6 @@ static int i2c_pmic_irq_set_wake(struct irq_data *d, unsigned int on)
 
 	return 0;
 }
-#else
-#define i2c_pmic_irq_set_wake NULL
-#endif
 
 static struct irq_chip i2c_pmic_irq_chip = {
 	.name			= "i2c_pmic_irq_chip",
@@ -241,7 +237,7 @@ static struct irq_chip i2c_pmic_irq_chip = {
 	.irq_disable		= i2c_pmic_irq_disable,
 	.irq_enable		= i2c_pmic_irq_enable,
 	.irq_set_type		= i2c_pmic_irq_set_type,
-	.irq_set_wake		= i2c_pmic_irq_set_wake,
+	.irq_set_wake		= pm_sleep_ptr(i2c_pmic_irq_set_wake),
 };
 
 static struct i2c_pmic_periph *i2c_pmic_find_periph(struct i2c_pmic *chip,
@@ -253,7 +249,7 @@ static struct i2c_pmic_periph *i2c_pmic_find_periph(struct i2c_pmic *chip,
 		if (chip->periph[i].addr == (hwirq & 0xFF00))
 			return &chip->periph[i];
 
-	pr_err_ratelimited("Couldn't find periph struct for hwirq 0x%04lx\n",
+	dev_err_ratelimited(chip->dev, "Couldn't find periph struct for hwirq 0x%04lx\n",
 			   hwirq);
 	return NULL;
 }
@@ -315,7 +311,8 @@ static void i2c_pmic_irq_ack_now(struct i2c_pmic *chip, u16 hwirq)
 			  (hwirq & 0xFF00) | INT_LATCHED_CLR_OFFSET,
 			  hwirq & 0xFF);
 	if (rc < 0)
-		pr_err_ratelimited("Couldn't ack 0x%04x rc=%d\n", hwirq, rc);
+		dev_err_ratelimited(chip->dev, "Couldn't ack 0x%04x rc=%d\n",
+				    hwirq, rc);
 }
 
 static void i2c_pmic_irq_disable_now(struct i2c_pmic *chip, u16 hwirq)
@@ -333,7 +330,7 @@ static void i2c_pmic_irq_disable_now(struct i2c_pmic *chip, u16 hwirq)
 			  (hwirq & 0xFF00) | INT_EN_CLR_OFFSET,
 			  hwirq & 0xFF);
 	if (rc < 0) {
-		pr_err_ratelimited("Couldn't disable irq 0x%04x rc=%d\n",
+		dev_err_ratelimited(chip->dev, "Couldn't disable irq 0x%04x rc=%d\n",
 				   hwirq, rc);
 		goto unlock;
 	}
@@ -356,7 +353,7 @@ static void i2c_pmic_periph_status_handler(struct i2c_pmic *chip,
 		hwirq = periph_address | BIT(i);
 		virq = irq_find_mapping(chip->domain, hwirq);
 		if (virq == 0) {
-			pr_err_ratelimited("Couldn't find mapping; disabling 0x%04x\n",
+			dev_err_ratelimited(chip->dev, "Couldn't find mapping; disabling 0x%04x\n",
 					   hwirq);
 			i2c_pmic_irq_disable_now(chip, hwirq);
 			continue;
@@ -382,7 +379,7 @@ static void i2c_pmic_summary_status_handler(struct i2c_pmic *chip,
 				 periph[i].addr | INT_LATCHED_STS_OFFSET,
 				 &periph_status);
 		if (rc < 0) {
-			pr_err_ratelimited("Couldn't read 0x%04x | INT_LATCHED_STS rc=%d\n",
+			dev_err_ratelimited(chip->dev, "Couldn't read 0x%04x | INT_LATCHED_STS rc=%d\n",
 					   periph[i].addr, rc);
 			continue;
 		}
@@ -402,7 +399,7 @@ static irqreturn_t i2c_pmic_irq_handler(int irq, void *dev_id)
 	mutex_lock(&chip->irq_complete);
 	chip->irq_waiting = true;
 	if (!chip->resume_completed) {
-		pr_debug("IRQ triggered before device-resume\n");
+		dev_dbg(chip->dev, "IRQ triggered before device-resume\n");
 		disable_irq_nosync(irq);
 		mutex_unlock(&chip->irq_complete);
 		return IRQ_HANDLED;
@@ -413,7 +410,7 @@ static irqreturn_t i2c_pmic_irq_handler(int irq, void *dev_id)
 		rc = regmap_read(chip->regmap, I2C_INTR_STATUS_BASE + i,
 				&summary_status);
 		if (rc < 0) {
-			pr_err_ratelimited("Couldn't read I2C_INTR_STATUS%d rc=%d\n",
+			dev_err_ratelimited(chip->dev, "Couldn't read I2C_INTR_STATUS%d rc=%d\n",
 					   i, rc);
 			continue;
 		}
@@ -437,20 +434,20 @@ static int i2c_pmic_parse_dt(struct i2c_pmic *chip)
 	u32 temp;
 
 	if (!node) {
-		pr_err("missing device tree\n");
+		dev_err(chip->dev, "missing device tree\n");
 		return -EINVAL;
 	}
 
 	chip->num_periphs = of_property_count_u32_elems(node,
 							"qcom,periph-map");
 	if (chip->num_periphs < 0) {
-		pr_err("missing qcom,periph-map property rc=%d\n",
+		dev_err(chip->dev, "missing qcom,periph-map property rc=%d\n",
 			chip->num_periphs);
 		return chip->num_periphs;
 	}
 
 	if (chip->num_periphs == 0) {
-		pr_err("qcom,periph-map must contain at least one address\n");
+		dev_err(chip->dev, "qcom,periph-map must contain at least one address\n");
 		return -EINVAL;
 	}
 
@@ -463,7 +460,7 @@ static int i2c_pmic_parse_dt(struct i2c_pmic *chip)
 		rc = of_property_read_u32_index(node, "qcom,periph-map",
 						i, &temp);
 		if (rc < 0) {
-			pr_err("Couldn't read qcom,periph-map[%d] rc=%d\n",
+			dev_err(chip->dev, "Couldn't read qcom,periph-map[%d] rc=%d\n",
 			       i, rc);
 			return rc;
 		}
@@ -507,7 +504,8 @@ static int i2c_pmic_determine_initial_status(struct i2c_pmic *chip)
 				chip->periph[i].addr | INT_SET_TYPE_OFFSET,
 				chip->periph[i].cached, IRQ_MAX_REGS);
 		if (rc < 0) {
-			pr_err("Couldn't read irq data rc=%d\n", rc);
+			dev_err(chip->dev, "Couldn't read irq data rc=%d\n",
+				rc);
 			return rc;
 		}
 
@@ -533,14 +531,14 @@ static int i2c_pmic_toggle_stat(struct i2c_pmic *chip)
 				chip->periph[0].addr | INT_EN_SET_OFFSET,
 				INT_0_BIT);
 	if (rc < 0) {
-		pr_err("Couldn't write to int_en_set rc=%d\n", rc);
+		dev_err(chip->dev, "Couldn't write to int_en_set rc=%d\n", rc);
 		return rc;
 	}
 
 	rc = regmap_write(chip->regmap, chip->periph[0].addr | INT_TEST_OFFSET,
 				INT_TEST_MODE_EN_BIT);
 	if (rc < 0) {
-		pr_err("Couldn't write to int_test rc=%d\n", rc);
+		dev_err(chip->dev, "Couldn't write to int_test rc=%d\n", rc);
 		return rc;
 	}
 
@@ -549,7 +547,8 @@ static int i2c_pmic_toggle_stat(struct i2c_pmic *chip)
 				chip->periph[0].addr | INT_TEST_VAL_OFFSET,
 				INT_0_BIT);
 		if (rc < 0) {
-			pr_err("Couldn't write to int_test_val rc=%d\n", rc);
+			dev_err(chip->dev, "Couldn't write to int_test_val rc=%d\n",
+				rc);
 			goto exit;
 		}
 
@@ -559,7 +558,8 @@ static int i2c_pmic_toggle_stat(struct i2c_pmic *chip)
 				chip->periph[0].addr | INT_TEST_VAL_OFFSET,
 				0);
 		if (rc < 0) {
-			pr_err("Couldn't write to int_test_val rc=%d\n", rc);
+			dev_err(chip->dev, "Couldn't write to int_test_val rc=%d\n",
+				rc);
 			goto exit;
 		}
 
@@ -567,7 +567,8 @@ static int i2c_pmic_toggle_stat(struct i2c_pmic *chip)
 				chip->periph[0].addr | INT_LATCHED_CLR_OFFSET,
 				INT_0_BIT);
 		if (rc < 0) {
-			pr_err("Couldn't write to int_latched_clr rc=%d\n", rc);
+			dev_err(chip->dev, "Couldn't write to int_latched_clr rc=%d\n",
+				rc);
 			goto exit;
 		}
 
@@ -587,8 +588,7 @@ static struct regmap_config i2c_pmic_regmap_config = {
 	.max_register	= 0xFFFF,
 };
 
-static int i2c_pmic_probe(struct i2c_client *client,
-			  const struct i2c_device_id *id)
+static int i2c_pmic_probe(struct i2c_client *client)
 {
 	struct i2c_pmic *chip;
 	int rc = 0;
@@ -605,6 +605,7 @@ static int i2c_pmic_probe(struct i2c_client *client,
 	devm_regmap_qti_debugfs_register(chip->dev, chip->regmap);
 
 	i2c_set_clientdata(client, chip);
+	chip->summary_irq = -EINVAL;
 	if (!of_property_read_bool(chip->dev->of_node, "interrupt-controller"))
 		goto probe_children;
 
@@ -617,13 +618,14 @@ static int i2c_pmic_probe(struct i2c_client *client,
 
 	rc = i2c_pmic_parse_dt(chip);
 	if (rc < 0) {
-		pr_err("Couldn't parse device tree rc=%d\n", rc);
+		dev_err(chip->dev, "Couldn't parse device tree rc=%d\n", rc);
 		goto cleanup;
 	}
 
 	rc = i2c_pmic_determine_initial_status(chip);
 	if (rc < 0) {
-		pr_err("Couldn't determine initial status rc=%d\n", rc);
+		dev_err(chip->dev, "Couldn't determine initial status rc=%d\n",
+			rc);
 		goto cleanup;
 	}
 
@@ -631,7 +633,7 @@ static int i2c_pmic_probe(struct i2c_client *client,
 		chip->pinctrl = devm_pinctrl_get_select(chip->dev,
 							chip->pinctrl_name);
 		if (IS_ERR(chip->pinctrl)) {
-			pr_err("Couldn't select %s pinctrl rc=%ld\n",
+			dev_err(chip->dev, "Couldn't select %s pinctrl rc=%ld\n",
 				chip->pinctrl_name, PTR_ERR(chip->pinctrl));
 			rc = PTR_ERR(chip->pinctrl);
 			goto cleanup;
@@ -643,7 +645,7 @@ static int i2c_pmic_probe(struct i2c_client *client,
 
 	rc = i2c_pmic_toggle_stat(chip);
 	if (rc < 0) {
-		pr_err("Couldn't toggle stat rc=%d\n", rc);
+		dev_err(chip->dev, "Couldn't toggle stat rc=%d\n", rc);
 		goto cleanup;
 	}
 
@@ -652,7 +654,8 @@ static int i2c_pmic_probe(struct i2c_client *client,
 				       IRQF_ONESHOT | IRQF_SHARED,
 				       "i2c_pmic_stat_irq", chip);
 	if (rc < 0) {
-		pr_err("Couldn't request irq %d rc=%d\n", client->irq, rc);
+		dev_err(chip->dev, "Couldn't request irq %d rc=%d\n",
+			client->irq, rc);
 		goto cleanup;
 	}
 
@@ -661,7 +664,7 @@ static int i2c_pmic_probe(struct i2c_client *client,
 
 probe_children:
 	of_platform_populate(chip->dev->of_node, NULL, NULL, chip->dev);
-	pr_info("I2C PMIC probe successful\n");
+	dev_dbg(chip->dev, "I2C PMIC probe successful\n");
 	return rc;
 
 cleanup:
@@ -671,7 +674,7 @@ cleanup:
 	return rc;
 }
 
-static int i2c_pmic_remove(struct i2c_client *client)
+static void i2c_pmic_remove(struct i2c_client *client)
 {
 	struct i2c_pmic *chip = i2c_get_clientdata(client);
 
@@ -679,26 +682,27 @@ static int i2c_pmic_remove(struct i2c_client *client)
 	if (chip->domain)
 		irq_domain_remove(chip->domain);
 	i2c_set_clientdata(client, NULL);
-	return 0;
 }
 
-#ifdef CONFIG_PM_SLEEP
-static int i2c_pmic_suspend_noirq(struct device *dev)
+static int __maybe_unused i2c_pmic_suspend_noirq(struct device *dev)
 {
 	struct i2c_pmic *chip = dev_get_drvdata(dev);
 
 	if (chip->irq_waiting) {
-		pr_err_ratelimited("Aborting suspend, an interrupt was detected while suspending\n");
+		dev_err_ratelimited(dev, "Aborting suspend, an interrupt was detected while suspending\n");
 		return -EBUSY;
 	}
 	return 0;
 }
 
-static int i2c_pmic_suspend(struct device *dev)
+static int __maybe_unused i2c_pmic_suspend(struct device *dev)
 {
 	struct i2c_pmic *chip = dev_get_drvdata(dev);
 	struct i2c_pmic_periph *periph;
 	int rc = 0, i;
+
+	if (chip->summary_irq < 0)
+		return 0;
 
 	for (i = 0; i < chip->num_periphs; i++) {
 		periph = &chip->periph[i];
@@ -706,7 +710,7 @@ static int i2c_pmic_suspend(struct device *dev)
 		rc = regmap_write(chip->regmap,
 				  periph->addr | INT_EN_CLR_OFFSET, 0xFF);
 		if (rc < 0) {
-			pr_err_ratelimited("Couldn't clear 0x%04x irqs rc=%d\n",
+			dev_err_ratelimited(dev, "Couldn't clear 0x%04x irqs rc=%d\n",
 				periph->addr, rc);
 			continue;
 		}
@@ -715,7 +719,7 @@ static int i2c_pmic_suspend(struct device *dev)
 				  periph->addr | INT_EN_SET_OFFSET,
 				  periph->wake);
 		if (rc < 0)
-			pr_err_ratelimited("Couldn't enable 0x%04x wake irqs 0x%02x rc=%d\n",
+			dev_err_ratelimited(dev, "Couldn't enable 0x%04x wake irqs 0x%02x rc=%d\n",
 			       periph->addr, periph->wake, rc);
 	}
 	if (!rc) {
@@ -727,11 +731,14 @@ static int i2c_pmic_suspend(struct device *dev)
 	return rc;
 }
 
-static int i2c_pmic_resume(struct device *dev)
+static int __maybe_unused i2c_pmic_resume(struct device *dev)
 {
 	struct i2c_pmic *chip = dev_get_drvdata(dev);
 	struct i2c_pmic_periph *periph;
 	int rc = 0, i;
+
+	if (chip->summary_irq < 0)
+		return 0;
 
 	for (i = 0; i < chip->num_periphs; i++) {
 		periph = &chip->periph[i];
@@ -739,7 +746,7 @@ static int i2c_pmic_resume(struct device *dev)
 		rc = regmap_write(chip->regmap,
 				  periph->addr | INT_EN_CLR_OFFSET, 0xFF);
 		if (rc < 0) {
-			pr_err("Couldn't clear 0x%04x irqs rc=%d\n",
+			dev_err(dev, "Couldn't clear 0x%04x irqs rc=%d\n",
 				periph->addr, rc);
 			continue;
 		}
@@ -748,8 +755,8 @@ static int i2c_pmic_resume(struct device *dev)
 				  periph->addr | INT_EN_SET_OFFSET,
 				  periph->synced[IRQ_EN_SET]);
 		if (rc < 0)
-			pr_err("Couldn't restore 0x%04x synced irqs 0x%02x rc=%d\n",
-			       periph->addr, periph->synced[IRQ_EN_SET], rc);
+			dev_err(dev, "Couldn't restore 0x%04x synced irqs 0x%02x rc=%d\n",
+				periph->addr, periph->synced[IRQ_EN_SET], rc);
 	}
 
 	mutex_lock(&chip->irq_complete);
@@ -765,49 +772,35 @@ static int i2c_pmic_resume(struct device *dev)
 
 	return rc;
 }
-#else
-static int i2c_pmic_suspend(struct device *dev)
-{
-	return 0;
-}
-static int i2c_pmic_resume(struct device *dev)
-{
-	return 0;
-}
-static int i2c_pmic_suspend_noirq(struct device *dev)
-{
-	return 0
-}
-#endif
-static const struct dev_pm_ops i2c_pmic_pm_ops = {
-	.suspend	= i2c_pmic_suspend,
-	.suspend_noirq	= i2c_pmic_suspend_noirq,
-	.resume		= i2c_pmic_resume,
+
+static const struct dev_pm_ops __maybe_unused i2c_pmic_pm_ops = {
+	.suspend	= pm_sleep_ptr(i2c_pmic_suspend),
+	.suspend_noirq	= pm_sleep_ptr(i2c_pmic_suspend_noirq),
+	.resume		= pm_sleep_ptr(i2c_pmic_resume),
 };
 
 static const struct of_device_id i2c_pmic_match_table[] = {
 	{ .compatible = "qcom,i2c-pmic", },
-	{ },
+	{ }
 };
 
 static const struct i2c_device_id i2c_pmic_id[] = {
 	{ "i2c-pmic", 0 },
-	{ },
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, i2c_pmic_id);
 
 static struct i2c_driver i2c_pmic_driver = {
 	.driver		= {
 		.name		= "i2c_pmic",
-		.pm		= &i2c_pmic_pm_ops,
+		.pm		= pm_sleep_ptr(&i2c_pmic_pm_ops),
 		.of_match_table	= i2c_pmic_match_table,
 	},
 	.probe		= i2c_pmic_probe,
 	.remove		= i2c_pmic_remove,
 	.id_table	= i2c_pmic_id,
 };
-
 module_i2c_driver(i2c_pmic_driver);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_ALIAS("i2c:i2c_pmic");

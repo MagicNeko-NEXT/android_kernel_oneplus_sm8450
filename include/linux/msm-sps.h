@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 /* Smart-Peripheral-Switch (SPS) API. */
 
@@ -8,7 +9,7 @@
 #define _SPS_H_
 
 #include <linux/errno.h>
-#include <linux/types.h>	/* u32 */
+#include <linux/types.h>
 
 #if defined(CONFIG_PHYS_ADDR_T_64BIT) || defined(CONFIG_ARM_LPAE)
 

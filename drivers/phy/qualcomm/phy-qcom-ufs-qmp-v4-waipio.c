@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2021, Linux Foundation. All rights reserved.
+ * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include "phy-qcom-ufs-qmp-v4-waipio.h"
@@ -293,7 +293,7 @@ static int ufs_qcom_phy_qmp_v4_probe(struct platform_device *pdev)
 
 	phy_set_drvdata(generic_phy, phy);
 
-	strlcpy(phy->common_cfg.name, UFS_PHY_NAME,
+	strscpy(phy->common_cfg.name, UFS_PHY_NAME,
 		sizeof(phy->common_cfg.name));
 
 out:
@@ -317,4 +317,4 @@ static struct platform_driver ufs_qcom_phy_qmp_v4_driver = {
 module_platform_driver(ufs_qcom_phy_qmp_v4_driver);
 
 MODULE_DESCRIPTION("Universal Flash Storage (UFS) QCOM PHY QMP v4 WAIPIO");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

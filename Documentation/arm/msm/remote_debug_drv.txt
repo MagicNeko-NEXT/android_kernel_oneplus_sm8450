@@ -43,7 +43,7 @@ Debug Agent:    Software that runs on the Linux Android platform
                 1) User mode Debug Agent application that discovers
                 processes running on the subsystems and creates
                 TCP/IP sockets for the host to connect to. In addition
-                to this, it creates an info (or meta) port that
+                to this, it creates an info port that
                 users can connect to discover the various
                 processes and their corresponding debug ports.
 
@@ -274,7 +274,7 @@ SMQ Out's Last Sent Index and Index Free Read:
 
   The starting index of the free block(s) is updated in the SMQOut's Last Sent
   Index. This update keeps track of which index was last written to and the
-  producer uses it to determine where the the next allocation could be done.
+  producer uses it to determine where the next allocation could be done.
 
   Every allocation, a producer updates the Index Free Read from its
   collaborating consumer's Index Free Write field (if they are unequal).

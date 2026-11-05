@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef __UCSI_GLINK_H__
@@ -11,10 +12,6 @@
 
 struct ucsi_glink_constat_info {
 	enum typec_accessory acc;
-	bool partner_usb;
-	bool partner_alternate_mode;
-	bool partner_change;
-	bool connect;
 };
 
 struct notifier_block;

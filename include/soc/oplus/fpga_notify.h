@@ -1,1 +1,1 @@
-../../../../gki-modules/oplus/kernel/device_info/oplus_fpga/fpga_notify/fpga_notify.h
+../../../../sm8450-modules/oplus/kernel/device_info/oplus_fpga/fpga_notify/fpga_notify.h

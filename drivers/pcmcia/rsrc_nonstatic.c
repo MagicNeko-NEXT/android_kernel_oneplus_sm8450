@@ -188,7 +188,7 @@ static void do_io_probe(struct pcmcia_socket *s, unsigned int base,
 	int any;
 	u_char *b, hole, most;
 
-	dev_info(&s->dev, "cs: IO port probe %#x-%#x:", base, base+num-1);
+	pr_info("%s: cs: IO port probe %#x-%#x:", dev_name(&s->dev), base, base+num-1);
 
 	/* First, what does a floating port look like? */
 	b = kzalloc(256, GFP_KERNEL);
@@ -257,7 +257,7 @@ static void do_io_probe(struct pcmcia_socket *s, unsigned int base,
 
 /*======================================================================*/
 
-/**
+/*
  * readable() - iomem validation function for cards with a valid CIS
  */
 static int readable(struct pcmcia_socket *s, struct resource *res,
@@ -288,7 +288,7 @@ static int readable(struct pcmcia_socket *s, struct resource *res,
 	return 0;
 }
 
-/**
+/*
  * checksum() - iomem validation function for simple memory cards
  */
 static int checksum(struct pcmcia_socket *s, struct resource *res,
@@ -343,9 +343,9 @@ static int checksum(struct pcmcia_socket *s, struct resource *res,
  */
 static int do_validate_mem(struct pcmcia_socket *s,
 			   unsigned long base, unsigned long size,
-			   int validate (struct pcmcia_socket *s,
-					 struct resource *res,
-					 unsigned int *value))
+			   int (*validate)(struct pcmcia_socket *s,
+					   struct resource *res,
+					   unsigned int *value))
 {
 	struct socket_data *s_data = s->resource_data;
 	struct resource *res1, *res2;
@@ -396,22 +396,22 @@ static int do_validate_mem(struct pcmcia_socket *s,
  * do_mem_probe() checks a memory region for use by the PCMCIA subsystem.
  * To do so, the area is split up into sensible parts, and then passed
  * into the @validate() function. Only if @validate() and @fallback() fail,
- * the area is marked as unavaibale for use by the PCMCIA subsystem. The
+ * the area is marked as unavailable for use by the PCMCIA subsystem. The
  * function returns the size of the usable memory area.
  */
 static int do_mem_probe(struct pcmcia_socket *s, u_long base, u_long num,
-			int validate (struct pcmcia_socket *s,
-				      struct resource *res,
-				      unsigned int *value),
-			int fallback (struct pcmcia_socket *s,
-				      struct resource *res,
-				      unsigned int *value))
+			int (*validate)(struct pcmcia_socket *s,
+					struct resource *res,
+					unsigned int *value),
+			int (*fallback)(struct pcmcia_socket *s,
+					struct resource *res,
+					unsigned int *value))
 {
 	struct socket_data *s_data = s->resource_data;
 	u_long i, j, bad, fail, step;
 
-	dev_info(&s->dev, "cs: memory probe 0x%06lx-0x%06lx:",
-		 base, base+num-1);
+	pr_info("%s: cs: memory probe 0x%06lx-0x%06lx:",
+	       dev_name(&s->dev), base, base+num-1);
 	bad = fail = 0;
 	step = (num < 0x20000) ? 0x2000 : ((num>>4) & ~0x1fff);
 	/* don't allow too large steps */
@@ -1086,7 +1086,7 @@ static ssize_t show_io_db(struct device *dev,
 	for (p = data->io_db.next; p != &data->io_db; p = p->next) {
 		if (ret > (PAGE_SIZE - 10))
 			continue;
-		ret += scnprintf(&buf[ret], (PAGE_SIZE - ret - 1),
+		ret += sysfs_emit_at(buf, ret,
 				"0x%08lx - 0x%08lx\n",
 				((unsigned long) p->base),
 				((unsigned long) p->base + p->num - 1));
@@ -1143,7 +1143,7 @@ static ssize_t show_mem_db(struct device *dev,
 	     p = p->next) {
 		if (ret > (PAGE_SIZE - 10))
 			continue;
-		ret += scnprintf(&buf[ret], (PAGE_SIZE - ret - 1),
+		ret += sysfs_emit_at(buf, ret,
 				"0x%08lx - 0x%08lx\n",
 				((unsigned long) p->base),
 				((unsigned long) p->base + p->num - 1));
@@ -1152,7 +1152,7 @@ static ssize_t show_mem_db(struct device *dev,
 	for (p = data->mem_db.next; p != &data->mem_db; p = p->next) {
 		if (ret > (PAGE_SIZE - 10))
 			continue;
-		ret += scnprintf(&buf[ret], (PAGE_SIZE - ret - 1),
+		ret += sysfs_emit_at(buf, ret,
 				"0x%08lx - 0x%08lx\n",
 				((unsigned long) p->base),
 				((unsigned long) p->base + p->num - 1));
@@ -1204,8 +1204,7 @@ static const struct attribute_group rsrc_attributes = {
 	.attrs = pccard_rsrc_attributes,
 };
 
-static int pccard_sysfs_add_rsrc(struct device *dev,
-					   struct class_interface *class_intf)
+static int pccard_sysfs_add_rsrc(struct device *dev)
 {
 	struct pcmcia_socket *s = dev_get_drvdata(dev);
 
@@ -1214,8 +1213,7 @@ static int pccard_sysfs_add_rsrc(struct device *dev,
 	return sysfs_create_group(&dev->kobj, &rsrc_attributes);
 }
 
-static void pccard_sysfs_remove_rsrc(struct device *dev,
-					       struct class_interface *class_intf)
+static void pccard_sysfs_remove_rsrc(struct device *dev)
 {
 	struct pcmcia_socket *s = dev_get_drvdata(dev);
 

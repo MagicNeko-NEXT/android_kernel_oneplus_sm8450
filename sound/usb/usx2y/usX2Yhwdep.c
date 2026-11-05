@@ -55,21 +55,13 @@ static int snd_us428ctls_mmap(struct snd_hwdep *hw, struct file *filp, struct vm
 		return -EBUSY;
 
 	/* if userspace tries to mmap beyond end of our buffer, fail */
-	if (size > PAGE_ALIGN(sizeof(struct us428ctls_sharedmem))) {
-		snd_printd("%lu > %lu\n", size, (unsigned long)sizeof(struct us428ctls_sharedmem));
+	if (size > US428_SHAREDMEM_PAGES) {
+		snd_printd("%lu > %lu\n", size, (unsigned long)US428_SHAREDMEM_PAGES);
 		return -EINVAL;
 	}
 
-	if (!us428->us428ctls_sharedmem) {
-		init_waitqueue_head(&us428->us428ctls_wait_queue_head);
-		us428->us428ctls_sharedmem = alloc_pages_exact(sizeof(struct us428ctls_sharedmem), GFP_KERNEL);
-		if (!us428->us428ctls_sharedmem)
-			return -ENOMEM;
-		memset(us428->us428ctls_sharedmem, -1, sizeof(struct us428ctls_sharedmem));
-		us428->us428ctls_sharedmem->ctl_snapshot_last = -2;
-	}
 	area->vm_ops = &us428ctls_vm_ops;
-	area->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+	vm_flags_set(area, VM_DONTEXPAND | VM_DONTDUMP);
 	area->vm_private_data = hw->private_data;
 	return 0;
 }
@@ -220,7 +212,6 @@ static int snd_usx2y_hwdep_dsp_load(struct snd_hwdep *hw,
 		err = usx2y_create_alsa_devices(hw->card);
 		if (err) {
 			snd_printk(KERN_ERR "usx2y_create_alsa_devices error %i\n", err);
-			snd_card_free(hw->card);
 			return err;
 		}
 		priv->chip_status |= USX2Y_STAT_CHIP_INIT;
@@ -233,18 +224,26 @@ int usx2y_hwdep_new(struct snd_card *card, struct usb_device *device)
 {
 	int err;
 	struct snd_hwdep *hw;
+	struct usx2ydev	*us428 = usx2y(card);
 
 	err = snd_hwdep_new(card, SND_USX2Y_LOADER_ID, 0, &hw);
 	if (err < 0)
 		return err;
 
 	hw->iface = SNDRV_HWDEP_IFACE_USX2Y;
-	hw->private_data = usx2y(card);
+	hw->private_data = us428;
 	hw->ops.dsp_status = snd_usx2y_hwdep_dsp_status;
 	hw->ops.dsp_load = snd_usx2y_hwdep_dsp_load;
 	hw->ops.mmap = snd_us428ctls_mmap;
 	hw->ops.poll = snd_us428ctls_poll;
 	hw->exclusive = 1;
 	sprintf(hw->name, "/dev/bus/usb/%03d/%03d", device->bus->busnum, device->devnum);
+
+	us428->us428ctls_sharedmem = alloc_pages_exact(US428_SHAREDMEM_PAGES, GFP_KERNEL);
+	if (!us428->us428ctls_sharedmem)
+		return -ENOMEM;
+	memset(us428->us428ctls_sharedmem, -1, US428_SHAREDMEM_PAGES);
+	us428->us428ctls_sharedmem->ctl_snapshot_last = -2;
+
 	return 0;
 }

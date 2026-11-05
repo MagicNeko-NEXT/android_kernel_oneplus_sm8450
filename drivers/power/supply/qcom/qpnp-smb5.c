@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2018-2020 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/debugfs.h>
@@ -218,7 +219,6 @@ struct smb_dt_props {
 	int			term_current_src;
 	int			term_current_thresh_hi_ma;
 	int			term_current_thresh_lo_ma;
-	int			disable_suspend_on_collapse;
 };
 
 struct smb5 {
@@ -307,7 +307,7 @@ static int smb5_chg_config_init(struct smb5 *chip)
 {
 	struct smb_charger *chg = &chip->chg;
 	struct device_node *node = chg->dev->of_node;
-	int subtype = (u8)of_device_get_match_data(chg->dev);
+	int subtype = (u8)(unsigned long)of_device_get_match_data(chg->dev);
 
 	switch (subtype) {
 	case PM8150B:
@@ -446,10 +446,14 @@ static int smb5_parse_dt_misc(struct smb5 *chip, struct device_node *node)
 	chg->sw_jeita_enabled = of_property_read_bool(node,
 				"qcom,sw-jeita-enable");
 
+	chg->jeita_arb_enable = of_property_read_bool(node,
+				"qcom,jeita-arb-enable");
+
 	chg->pd_not_supported = chg->pd_not_supported ||
 			of_property_read_bool(node, "qcom,usb-pd-disable");
 
-	chg->lpd_disabled = of_property_read_bool(node, "qcom,lpd-disable");
+	chg->lpd_disabled = chg->lpd_disabled ||
+			of_property_read_bool(node, "qcom,lpd-disable");
 
 	rc = of_property_read_u32(node, "qcom,wd-bark-time-secs",
 					&chip->dt.wd_bark_time);
@@ -552,7 +556,7 @@ static int smb5_parse_dt_misc(struct smb5 *chip, struct device_node *node)
 	of_property_read_u32(node, "qcom,connector-internal-pull-kohm",
 					&chg->connector_pull_up);
 
-	chip->dt.disable_suspend_on_collapse = of_property_read_bool(node,
+	chg->disable_suspend_on_collapse = of_property_read_bool(node,
 					"qcom,disable-suspend-on-collapse");
 	chg->smb_pull_up = -EINVAL;
 	of_property_read_u32(node, "qcom,smb-internal-pull-kohm",
@@ -835,6 +839,7 @@ static enum power_supply_property smb5_usb_props[] = {
 	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN,
 	POWER_SUPPLY_PROP_SCOPE,
 	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
+	POWER_SUPPLY_PROP_POWER_NOW,
 };
 
 static int smb5_usb_get_prop(struct power_supply *psy,
@@ -880,6 +885,13 @@ static int smb5_usb_get_prop(struct power_supply *psy,
 		val->intval = get_client_vote(chg->usb_icl_votable,
 					      USB_PSY_VOTER);
 		break;
+	case POWER_SUPPLY_PROP_POWER_NOW:
+		/* Show power rating for QC3+ adapter. */
+		if (chg->real_charger_type == QTI_POWER_SUPPLY_TYPE_USB_HVDCP_3P5)
+			val->intval = chg->qc3p5_detected_mw;
+		else
+			rc = -ENODATA;
+		break;
 	default:
 		pr_err("get prop %d is not supported in usb\n", psp);
 		rc = -EINVAL;
@@ -906,6 +918,9 @@ static int smb5_usb_set_prop(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
 		rc = smblib_set_prop_sdp_current_max(chg, val->intval);
 		break;
+	case POWER_SUPPLY_PROP_POWER_NOW:
+			chg->qc3p5_detected_mw = val->intval;
+		break;
 	default:
 		pr_err("Set prop %d is not supported in usb psy\n",
 				psp);
@@ -921,6 +936,7 @@ static int smb5_usb_prop_is_writeable(struct power_supply *psy,
 {
 	switch (psp) {
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+	case POWER_SUPPLY_PROP_POWER_NOW:
 		return 1;
 	default:
 		break;
@@ -1120,6 +1136,7 @@ static int smb5_dc_set_prop(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
 		rc = vote(chg->dc_suspend_votable, WBC_VOTER,
 			(bool)val->intval, 0);
+		break;
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		rc = smblib_set_prop_dc_current_max(chg, val);
 		break;
@@ -1218,8 +1235,7 @@ static int smb5_batt_get_prop(struct power_supply *psy,
 		rc = smblib_get_prop_batt_present(chg, pval);
 		break;
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
-		/* For battery, INPUT_CURRENT_LIMIT equates to INPUT_SUSPEND */
-		rc = smblib_get_prop_input_current_limit_usb(chg, pval);
+		rc = smblib_get_prop_input_suspend(chg, pval);
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
 		rc = smblib_get_prop_batt_charge_type(chg, pval);
@@ -1313,7 +1329,7 @@ static int smb5_batt_set_prop(struct power_supply *psy,
 		rc = smblib_set_prop_batt_status(chg, val);
 		break;
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
-		rc = smblib_set_prop_input_current_limit_usb(chg, val);
+		rc = smblib_set_prop_input_suspend(chg, val);
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
 		rc = smblib_set_prop_system_temp_level(chg, val);
@@ -1384,7 +1400,7 @@ static int smb5_init_batt_psy(struct smb5 *chip)
  * VBUS REGULATOR REGISTRATION *
  ******************************/
 
-static struct regulator_ops smb5_vbus_reg_ops = {
+static const struct regulator_ops smb5_vbus_reg_ops = {
 	.enable = smblib_vbus_regulator_enable,
 	.disable = smblib_vbus_regulator_disable,
 	.is_enabled = smblib_vbus_regulator_is_enabled,
@@ -1426,7 +1442,7 @@ static int smb5_init_vbus_regulator(struct smb5 *chip)
  * VCONN REGULATOR REGISTRATION *
  ******************************/
 
-static struct regulator_ops smb5_vconn_reg_ops = {
+static const struct regulator_ops smb5_vconn_reg_ops = {
 	.enable = smblib_vconn_regulator_enable,
 	.disable = smblib_vconn_regulator_disable,
 	.is_enabled = smblib_vconn_regulator_is_enabled,
@@ -1482,14 +1498,12 @@ static int smb5_configure_typec(struct smb_charger *chg)
 	}
 
 	/*
-	 * Across reboot, standard typeC cables get detected as legacy cables
-	 * due to VBUS attachment prior to CC attach/dettach. To handle this,
-	 * "early_usb_attach" flag is used, which assumes that across reboot,
-	 * the cable connected can be standard typeC. However, its jurisdiction
-	 * is limited to PD capable designs only. Hence, for non-PD type designs
-	 * reset legacy cable detection by disabling/enabling typeC mode.
+	 * Across reboot, standard typeC cables get detected as legacy
+	 * cables due to VBUS attachment prior to CC attach/detach.
+	 * Reset the legacy detection logic by enabling/disabling the typeC mode.
 	 */
-	if (chg->pd_not_supported && (value & TYPEC_LEGACY_CABLE_STATUS_BIT)) {
+
+	if (value & TYPEC_LEGACY_CABLE_STATUS_BIT) {
 		val = QTI_POWER_SUPPLY_TYPEC_PR_NONE;
 		rc = smblib_set_prop_typec_power_role(chg, val);
 		if (rc < 0) {
@@ -1506,6 +1520,9 @@ static int smb5_configure_typec(struct smb_charger *chg)
 			dev_err(chg->dev, "Couldn't enable TYPEC rc=%d\n", rc);
 			return rc;
 		}
+
+		/*delay after enabling typeC*/
+		msleep(100);
 	}
 
 	smblib_apsd_enable(chg, true);
@@ -2135,7 +2152,7 @@ static int smb5_init_hw(struct smb5 *chip)
 	mask = USBIN_AICL_PERIODIC_RERUN_EN_BIT | USBIN_AICL_ADC_EN_BIT
 			| USBIN_AICL_EN_BIT | SUSPEND_ON_COLLAPSE_USBIN_BIT;
 	val = USBIN_AICL_PERIODIC_RERUN_EN_BIT | USBIN_AICL_EN_BIT;
-	if (!chip->dt.disable_suspend_on_collapse)
+	if (!chg->disable_suspend_on_collapse)
 		val |= SUSPEND_ON_COLLAPSE_USBIN_BIT;
 	if (chip->dt.adc_based_aicl)
 		val |= USBIN_AICL_ADC_EN_BIT;
@@ -2233,6 +2250,7 @@ static int smb5_init_hw(struct smb5 *chip)
 	case 0:
 		rc = smblib_masked_write(chg, CHGR_CFG2_REG,
 				CHARGER_INHIBIT_BIT, 0);
+		break;
 	default:
 		break;
 	}
@@ -2339,7 +2357,7 @@ static int smb5_determine_initial_status(struct smb5 *chip)
 	chg->early_usb_attach = val.intval;
 
 	if (chg->iio_chan_list_qg)
-		smblib_suspend_on_debug_battery(chg);
+		smblib_config_charger_on_debug_battery(chg);
 
 	smb5_usb_plugin_irq_handler(0, &irq_data);
 	smb5_dc_plugin_irq_handler(0, &irq_data);
@@ -2786,10 +2804,8 @@ static void smb5_create_debugfs(struct smb5 *chip)
 		pr_err("Couldn't create force_dc_psy_update file rc=%ld\n",
 			(long)file);
 
-	file = debugfs_create_u32("debug_mask", 0600, chip->dfs_root,
+	debugfs_create_u32("debug_mask", 0600, chip->dfs_root,
 			&__debug_mask);
-	if (IS_ERR_OR_NULL(file))
-		pr_err("Couldn't create debug_mask file rc=%ld\n", (long)file);
 }
 
 #else
@@ -2871,8 +2887,8 @@ static int smb5_init_typec_class(struct smb5 *chip)
 	return rc;
 }
 
-static int smb5_of_xlate(struct iio_dev *indio_dev,
-				const struct of_phandle_args *iiospec)
+static int smb5_fwnode_xlate(struct iio_dev *indio_dev,
+				const struct fwnode_reference_args *iiospec)
 {
 	struct smb5 *iio_chip = iio_priv(indio_dev);
 	struct iio_chan_spec *iio_chan = iio_chip->iio_chan_ids;
@@ -2908,7 +2924,7 @@ static int smb5_write_raw(struct iio_dev *indio_dev,
 static const struct iio_info smb5_iio_info = {
 	.read_raw = smb5_read_raw,
 	.write_raw = smb5_write_raw,
-	.of_xlate = smb5_of_xlate,
+	.fwnode_xlate = smb5_fwnode_xlate,
 };
 
 static int smb5_direct_iio_read(struct device *dev, int iio_chan_no, int *val)
@@ -3270,4 +3286,4 @@ static struct platform_driver smb5_driver = {
 module_platform_driver(smb5_driver);
 
 MODULE_DESCRIPTION("QPNP SMB5 Charger Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

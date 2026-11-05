@@ -172,4 +172,4 @@ static void __exit qcom_icc_debug_exit(void)
 module_exit(qcom_icc_debug_exit);
 
 MODULE_DESCRIPTION("QCOM ICC debug library");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

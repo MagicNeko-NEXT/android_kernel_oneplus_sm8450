@@ -32,7 +32,7 @@ u64 __hyp_vmemmap;
  */
 static struct hyp_page *__find_buddy_nocheck(struct hyp_pool *pool,
 					     struct hyp_page *p,
-					     unsigned int order)
+					     u8 order)
 {
 	phys_addr_t addr = hyp_page_to_phys(p);
 
@@ -51,64 +51,92 @@ static struct hyp_page *__find_buddy_nocheck(struct hyp_pool *pool,
 /* Find a buddy page currently available for allocation */
 static struct hyp_page *__find_buddy_avail(struct hyp_pool *pool,
 					   struct hyp_page *p,
-					   unsigned int order)
+					   u8 order)
 {
 	struct hyp_page *buddy = __find_buddy_nocheck(pool, p, order);
 
-	if (!buddy || buddy->order != order || list_empty(&buddy->node))
+	if (!buddy)
+		return NULL;
+
+	if (buddy->order != order || hyp_refcount_get(buddy->refcount))
 		return NULL;
 
 	return buddy;
 
 }
 
+/*
+ * Pages that are available for allocation are tracked in free-lists, so we use
+ * the pages themselves to store the list nodes to avoid wasting space. As the
+ * allocator always returns zeroed pages (which are zeroed on the hyp_put_page()
+ * path to optimize allocation speed), we also need to clean-up the list node in
+ * each page when we take it out of the list.
+ */
+static inline void page_remove_from_list(struct hyp_page *p)
+{
+	struct list_head *node = hyp_page_to_virt(p);
+
+	__list_del_entry(node);
+	memset(node, 0, sizeof(*node));
+}
+
+static inline void page_add_to_list(struct hyp_page *p, struct list_head *head)
+{
+	struct list_head *node = hyp_page_to_virt(p);
+
+	INIT_LIST_HEAD(node);
+	list_add_tail(node, head);
+}
+
+static inline struct hyp_page *node_to_page(struct list_head *node)
+{
+	return hyp_virt_to_page(node);
+}
+
 static void __hyp_attach_page(struct hyp_pool *pool,
 			      struct hyp_page *p)
 {
-	unsigned int order = p->order;
+	phys_addr_t phys = hyp_page_to_phys(p);
 	struct hyp_page *buddy;
+	u8 order = p->order;
 
 	memset(hyp_page_to_virt(p), 0, PAGE_SIZE << p->order);
+
+	/* Skip coalescing for 'external' pages being freed into the pool. */
+	if (phys < pool->range_start || phys >= pool->range_end)
+		goto insert;
 
 	/*
 	 * Only the first struct hyp_page of a high-order page (otherwise known
 	 * as the 'head') should have p->order set. The non-head pages should
 	 * have p->order = HYP_NO_ORDER. Here @p may no longer be the head
-	 * after coallescing, so make sure to mark it HYP_NO_ORDER proactively.
+	 * after coalescing, so make sure to mark it HYP_NO_ORDER proactively.
 	 */
 	p->order = HYP_NO_ORDER;
-	for (; (order + 1) < pool->max_order; order++) {
+	for (; (order + 1) <= pool->max_order; order++) {
 		buddy = __find_buddy_avail(pool, p, order);
 		if (!buddy)
 			break;
 
-		/* Take the buddy out of its list, and coallesce with @p */
-		list_del_init(&buddy->node);
+		/* Take the buddy out of its list, and coalesce with @p */
+		page_remove_from_list(buddy);
 		buddy->order = HYP_NO_ORDER;
 		p = min(p, buddy);
 	}
 
+insert:
 	/* Mark the new head, and insert it */
 	p->order = order;
-	list_add_tail(&p->node, &pool->free_area[order]);
-}
-
-static void hyp_attach_page(struct hyp_page *p)
-{
-	struct hyp_pool *pool = hyp_page_to_pool(p);
-
-	hyp_spin_lock(&pool->lock);
-	__hyp_attach_page(pool, p);
-	hyp_spin_unlock(&pool->lock);
+	page_add_to_list(p, &pool->free_area[order]);
 }
 
 static struct hyp_page *__hyp_extract_page(struct hyp_pool *pool,
 					   struct hyp_page *p,
-					   unsigned int order)
+					   u8 order)
 {
 	struct hyp_page *buddy;
 
-	list_del_init(&p->node);
+	page_remove_from_list(p);
 	while (p->order > order) {
 		/*
 		 * The buddy of order n - 1 currently has HYP_NO_ORDER as it
@@ -116,24 +144,65 @@ static struct hyp_page *__hyp_extract_page(struct hyp_pool *pool,
 		 * __find_buddy_nocheck() to find it and inject it in the
 		 * free_list[n - 1], effectively splitting @p in half.
 		 */
+		buddy = __find_buddy_nocheck(pool, p, p->order - 1);
+		if (!buddy)
+			return p;
 		p->order--;
-		buddy = __find_buddy_nocheck(pool, p, p->order);
 		buddy->order = p->order;
-		list_add_tail(&buddy->node, &pool->free_area[buddy->order]);
+		page_add_to_list(buddy, &pool->free_area[buddy->order]);
 	}
 
 	return p;
 }
 
-void hyp_put_page(void *addr)
+static void update_free_pages(struct hyp_pool *pool, u64 free_pages)
+{
+	WRITE_ONCE(pool->free_pages, free_pages);
+	if (pool->min_free_pages > free_pages)
+		WRITE_ONCE(pool->min_free_pages, free_pages);
+}
+
+static void __hyp_put_page(struct hyp_pool *pool, struct hyp_page *p)
+{
+	u64 free_pages;
+	u16 seen_refcount, old_refcount;
+
+	for (old_refcount = READ_ONCE(p->refcount); ; old_refcount = seen_refcount) {
+		WARN_ON(old_refcount == 0);
+		if (old_refcount == 1) {
+			/*
+			 * Acquire the pool lock before we drop the refcount to
+			 * zero, thus avoiding a race with __find_buddy_avail()
+			 * finding us before we initialise our in-page
+			 * list_head.
+			 */
+			hyp_spin_lock(&pool->lock);
+		}
+		seen_refcount = cmpxchg_relaxed(
+			&p->refcount, old_refcount, old_refcount-1);
+		if (seen_refcount == old_refcount)
+			break;
+		if (old_refcount == 1)
+			hyp_spin_unlock(&pool->lock);
+	}
+
+	if (old_refcount == 1) {
+		free_pages = pool->free_pages + (1ULL << p->order);
+		__hyp_attach_page(pool, p);
+		update_free_pages(pool, free_pages);
+		hyp_spin_unlock(&pool->lock);
+	}
+}
+
+void hyp_put_page(struct hyp_pool *pool, void *addr)
 {
 	struct hyp_page *p = hyp_virt_to_page(addr);
 
-	if (hyp_page_ref_dec_and_test(p))
-		hyp_attach_page(p);
+	BUG_ON(p->order > pool->max_order);
+	__hyp_put_page(pool, p);
 }
 
-void hyp_get_page(void *addr)
+void hyp_get_page(struct hyp_pool *pool, void *addr)
 {
 	struct hyp_page *p = hyp_virt_to_page(addr);
 
@@ -142,7 +211,7 @@ void hyp_get_page(void *addr)
 
 void hyp_split_page(struct hyp_page *p)
 {
-	unsigned short order = p->order;
+	u8 order = p->order;
 	unsigned int i;
 
 	p->order = 0;
@@ -154,33 +223,59 @@ void hyp_split_page(struct hyp_page *p)
 	}
 }
 
-void *hyp_alloc_pages(struct hyp_pool *pool, unsigned int order)
+void *hyp_alloc_pages(struct hyp_pool *pool, u8 order)
 {
-	unsigned int i = order;
 	struct hyp_page *p;
+	u8 i = order;
+	u64 free_pages;
 
 	hyp_spin_lock(&pool->lock);
 
 	/* Look for a high-enough-order page */
-	while (i < pool->max_order && list_empty(&pool->free_area[i]))
+	while (i <= pool->max_order && list_empty(&pool->free_area[i]))
 		i++;
-	if (i >= pool->max_order) {
+	if (i > pool->max_order) {
 		hyp_spin_unlock(&pool->lock);
 		return NULL;
 	}
 
 	/* Extract it from the tree at the right order */
-	p = list_first_entry(&pool->free_area[i], struct hyp_page, node);
+	p = node_to_page(pool->free_area[i].next);
 	p = __hyp_extract_page(pool, p, order);
 
-	hyp_spin_unlock(&pool->lock);
 	hyp_set_page_refcounted(p);
+
+	free_pages = pool->free_pages - (1ULL << p->order);
+	update_free_pages(pool, free_pages);
+	hyp_spin_unlock(&pool->lock);
 
 	return hyp_page_to_virt(p);
 }
 
-int hyp_pool_init(struct hyp_pool *pool, u64 pfn, unsigned int nr_pages,
-		  unsigned int reserved_pages)
+/*
+ * Return how many pages are free at the moment.
+ * Instead of walking the free areas list + synchronization
+ * we can just keep track for allocation/deallocation in one variable
+ * with free_pages size, all updates to this variable are protected only
+ * read is not.
+ */
+u64 hyp_pool_free_pages(struct hyp_pool *pool)
+{
+	return READ_ONCE(pool->free_pages);
+}
+
+u64 hyp_pool_min_free_pages(struct hyp_pool *pool)
+{
+	return READ_ONCE(pool->min_free_pages);
+}
+
+/*
+ * empty_alloc alloc set true when pool has no pages initially, but we still want
+ * to use it in the future, which means nr_pages only has to be valid to init
+ * the free areas.
+ */
+static int __hyp_pool_init(struct hyp_pool *pool, u64 pfn, unsigned int nr_pages,
+			   unsigned int reserved_pages, bool empty_alloc)
 {
 	phys_addr_t phys = hyp_pfn_to_phys(pfn);
 	struct hyp_page *p;
@@ -188,22 +283,40 @@ int hyp_pool_init(struct hyp_pool *pool, u64 pfn, unsigned int nr_pages,
 
 	hyp_spin_lock_init(&pool->lock);
 	pool->max_order = min(MAX_ORDER, get_order(nr_pages << PAGE_SHIFT));
-	for (i = 0; i < pool->max_order; i++)
+	for (i = 0; i <= pool->max_order; i++)
 		INIT_LIST_HEAD(&pool->free_area[i]);
+
+	if (empty_alloc) {
+		/* All pages are attached from outside. */
+		pool->range_start = -1ULL;
+		pool->range_end = 0;
+		return 0;
+	}
+
 	pool->range_start = phys;
 	pool->range_end = phys + (nr_pages << PAGE_SHIFT);
 
 	/* Init the vmemmap portion */
 	p = hyp_phys_to_page(phys);
-	memset(p, 0, sizeof(*p) * nr_pages);
-	for (i = 0; i < nr_pages; i++) {
-		p[i].pool = pool;
-		INIT_LIST_HEAD(&p[i].node);
-	}
+	for (i = 0; i < nr_pages; i++)
+		hyp_set_page_refcounted(&p[i]);
 
 	/* Attach the unused pages to the buddy tree */
 	for (i = reserved_pages; i < nr_pages; i++)
-		__hyp_attach_page(pool, &p[i]);
+		__hyp_put_page(pool, &p[i]);
+
+	pool->min_free_pages = pool->free_pages;
 
 	return 0;
+}
+
+int hyp_pool_init(struct hyp_pool *pool, u64 pfn, unsigned int nr_pages,
+		    unsigned int reserved_pages)
+{
+	return __hyp_pool_init(pool, pfn, nr_pages, reserved_pages, false);
+}
+
+int hyp_pool_init_empty(struct hyp_pool *pool, unsigned int nr_pages)
+{
+	return __hyp_pool_init(pool, 0, nr_pages, 0, true);
 }

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2015, Sony Mobile Communications Inc.
- * Copyright (c) 2013, 2018-2019 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/module.h>
@@ -26,14 +27,12 @@ static int qcom_smd_qrtr_callback(struct rpmsg_device *rpdev,
 	int rc;
 
 	if (!qdev) {
-		pr_err_ratelimited("%s:Not ready\n", __func__);
+		pr_err_ratelimited("%s: Not ready\n", __func__);
 		return -EAGAIN;
 	}
 
 	rc = qrtr_endpoint_post(&qdev->ep, data, len);
 	if (rc == -EINVAL) {
-		print_hex_dump(KERN_INFO, "qrtr: ", DUMP_PREFIX_OFFSET, 16, 1,
-			       data, 32, 1);
 		dev_err(qdev->dev, "invalid ipcrouter packet\n");
 		/* return 0 to let smd drop the packet */
 		rc = 0;
@@ -69,11 +68,10 @@ static int qcom_smd_qrtr_probe(struct rpmsg_device *rpdev)
 {
 	struct qrtr_array svc_arr = {NULL, 0};
 	struct qrtr_smd_dev *qdev;
-	int size;
 	u32 net_id;
+	int size;
 	bool rt;
 	int rc;
-	pr_info("%s:Entered\n", __func__);
 
 	qdev = devm_kzalloc(&rpdev->dev, sizeof(*qdev), GFP_KERNEL);
 	if (!qdev)
@@ -82,6 +80,9 @@ static int qcom_smd_qrtr_probe(struct rpmsg_device *rpdev)
 	qdev->channel = rpdev->ept;
 	qdev->dev = &rpdev->dev;
 	qdev->ep.xmit = qcom_smd_qrtr_send;
+
+	/* data callback runs in threaded context */
+	qdev->ep.in_thread = true;
 
 	rc = of_property_read_u32(rpdev->dev.of_node, "qcom,net-id", &net_id);
 	if (rc < 0)
@@ -103,13 +104,13 @@ static int qcom_smd_qrtr_probe(struct rpmsg_device *rpdev)
 	rc = qrtr_endpoint_register(&qdev->ep, net_id, rt, &svc_arr);
 	kfree(svc_arr.arr);
 	if (rc) {
-		dev_err(qdev->dev, "endpoint register failed: %d\n", rc, rt);
+		dev_err(qdev->dev, "endpoint register failed: %d\n", rc);
 		return rc;
 	}
 
 	dev_set_drvdata(&rpdev->dev, qdev);
 
-	pr_info("%s:SMD QRTR driver probed\n", __func__);
+	pr_debug("SMD QRTR driver probed\n");
 
 	return 0;
 }

@@ -62,6 +62,7 @@
 #include <linux/of_address.h>
 #include <linux/list.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/slab.h>
@@ -81,6 +82,7 @@
 #include <linux/swiotlb.h>
 #include <linux/dma-direct.h>
 #endif
+
 
 
 /* The alignment to use between consumer and producer parts of vring.
@@ -151,7 +153,7 @@ static int vm_finalize_features(struct virtio_device *vdev)
 	/* Give virtio_ring a chance to accept features. */
 	vring_transport_features(vdev);
 
-	/* Make sure there is are no mixed devices */
+	/* Make sure there are no mixed devices */
 	if (vm_dev->version == 2 &&
 			!__virtio_test_bit(vdev, VIRTIO_F_VERSION_1)) {
 		dev_err(&vdev->dev, "New virtio-mmio devices (version 2) must provide VIRTIO_F_VERSION_1 feature!\n");
@@ -169,8 +171,8 @@ static int vm_finalize_features(struct virtio_device *vdev)
 	return 0;
 }
 
-static void vm_get(struct virtio_device *vdev, unsigned offset,
-		   void *buf, unsigned len)
+static void vm_get(struct virtio_device *vdev, unsigned int offset,
+		   void *buf, unsigned int len)
 {
 	struct virtio_mmio_device *vm_dev = to_virtio_mmio_device(vdev);
 	void __iomem *base = vm_dev->base + VIRTIO_MMIO_CONFIG;
@@ -211,8 +213,8 @@ static void vm_get(struct virtio_device *vdev, unsigned offset,
 	}
 }
 
-static void vm_set(struct virtio_device *vdev, unsigned offset,
-		   const void *buf, unsigned len)
+static void vm_set(struct virtio_device *vdev, unsigned int offset,
+		   const void *buf, unsigned int len)
 {
 	struct virtio_mmio_device *vm_dev = to_virtio_mmio_device(vdev);
 	void __iomem *base = vm_dev->base + VIRTIO_MMIO_CONFIG;
@@ -278,6 +280,11 @@ static void vm_set_status(struct virtio_device *vdev, u8 status)
 	/* We should never be setting status to 0. */
 	BUG_ON(status == 0);
 
+	/*
+	 * Per memory-barriers.txt, wmb() is not needed to guarantee
+	 * that the cache coherent memory writes have completed
+	 * before writing to the MMIO region.
+	 */
 	writel(status, vm_dev->base + VIRTIO_MMIO_STATUS);
 }
 
@@ -304,6 +311,20 @@ static bool vm_notify(struct virtqueue *vq)
 	/* We write the queue's selector into the notification register to
 	 * signal the other end */
 	writel(vq->index, vm_dev->base + VIRTIO_MMIO_QUEUE_NOTIFY);
+	return true;
+}
+
+static bool vm_notify_with_data(struct virtqueue *vq)
+{
+	struct virtio_mmio_device *vm_dev = to_virtio_mmio_device(vq->vdev);
+	u32 data = vring_notification_data(vq);
+
+#ifdef CONFIG_GH_VIRTIO_DEBUG
+	trace_virtio_mmio_vm_notify(vq->vdev->index, vq->index);
+#endif
+
+	writel(data, vm_dev->base + VIRTIO_MMIO_QUEUE_NOTIFY);
+
 	return true;
 }
 
@@ -377,16 +398,29 @@ static void vm_del_vqs(struct virtio_device *vdev)
 	free_irq(platform_get_irq(vm_dev->pdev, 0), vm_dev);
 }
 
-static struct virtqueue *vm_setup_vq(struct virtio_device *vdev, unsigned index,
+static void vm_synchronize_cbs(struct virtio_device *vdev)
+{
+	struct virtio_mmio_device *vm_dev = to_virtio_mmio_device(vdev);
+
+	synchronize_irq(platform_get_irq(vm_dev->pdev, 0));
+}
+
+static struct virtqueue *vm_setup_vq(struct virtio_device *vdev, unsigned int index,
 				  void (*callback)(struct virtqueue *vq),
 				  const char *name, bool ctx)
 {
 	struct virtio_mmio_device *vm_dev = to_virtio_mmio_device(vdev);
+	bool (*notify)(struct virtqueue *vq);
 	struct virtio_mmio_vq_info *info;
 	struct virtqueue *vq;
 	unsigned long flags;
 	unsigned int num;
 	int err;
+
+	if (__virtio_test_bit(vdev, VIRTIO_F_NOTIFICATION_DATA))
+		notify = vm_notify_with_data;
+	else
+		notify = vm_notify;
 
 	if (!name)
 		return NULL;
@@ -416,11 +450,13 @@ static struct virtqueue *vm_setup_vq(struct virtio_device *vdev, unsigned index,
 
 	/* Create the vring */
 	vq = vring_create_virtqueue(index, num, VIRTIO_MMIO_VRING_ALIGN, vdev,
-				 true, true, ctx, vm_notify, callback, name);
+				 true, true, ctx, notify, callback, name);
 	if (!vq) {
 		err = -ENOMEM;
 		goto error_new_virtqueue;
 	}
+
+	vq->num_max = num;
 
 	/* Activate the queue */
 	writel(virtqueue_get_vring_size(vq), vm_dev->base + VIRTIO_MMIO_QUEUE_NUM);
@@ -487,7 +523,7 @@ error_available:
 	return ERR_PTR(err);
 }
 
-static int vm_find_vqs(struct virtio_device *vdev, unsigned nvqs,
+static int vm_find_vqs(struct virtio_device *vdev, unsigned int nvqs,
 		       struct virtqueue *vqs[],
 		       vq_callback_t *callbacks[],
 		       const char * const names[],
@@ -505,6 +541,9 @@ static int vm_find_vqs(struct virtio_device *vdev, unsigned nvqs,
 			dev_name(&vdev->dev), vm_dev);
 	if (err)
 		return err;
+
+	if (of_property_read_bool(vm_dev->pdev->dev.of_node, "wakeup-source"))
+		enable_irq_wake(irq);
 
 	for (i = 0; i < nvqs; ++i) {
 		if (!names[i]) {
@@ -573,6 +612,7 @@ static const struct virtio_config_ops virtio_mmio_config_ops = {
 	.finalize_features = vm_finalize_features,
 	.bus_name	= vm_bus_name,
 	.get_shm_region = vm_get_shm_region,
+	.synchronize_cbs = vm_synchronize_cbs,
 };
 
 #ifdef CONFIG_PM_SLEEP
@@ -638,18 +678,18 @@ static int virtio_get_shm(struct device_node *np, phys_addr_t *base,
 	of_node_put(shm_np);
 
 	if (!*base || !*size) {
-		pr_err("%s: Invalid memory-region base %llx size %d\n", __func__, *base, *size);
+		pr_err("%s: Invalid memory-region base %llx size %zu\n", __func__, *base, *size);
 		return -EINVAL;
 	}
 
 	val = of_get_property(np, "dma_base", &len);
 	if (!val || len != 8) {
-		pr_err("%s: Invalid dma_base prop val %llx size %d\n", __func__, val, len);
+		pr_err("%s: Invalid dma_base prop val %p size %d\n", __func__, (void *) val, len);
 		return -EINVAL;
 	}
 	*dma_base = __be64_to_cpup(val);
 
-	pr_debug("%s: shm base %llx size %llx dma_base %llx\n", __func__, *base, *size, *dma_base);
+	pr_debug("%s: shm base %llx size %zx dma_base %llx\n", __func__, *base, *size, *dma_base);
 
 	return 0;
 }
@@ -680,7 +720,7 @@ static int __init virtio_swiotlb_init(void)
 	if (!nslabs)
 		return -EINVAL;
 
-	vbase = __ioremap(base, size, __pgprot(PROT_NORMAL));
+	vbase = ioremap_cache(base, size);
 	if (!vbase)
 		return -EINVAL;
 
@@ -763,9 +803,9 @@ static void virtio_unmap_page(struct device *dev, dma_addr_t dev_addr,
 			size_t size, enum dma_data_direction dir,
 			unsigned long attrs)
 {
-	BUG_ON(!is_swiotlb_buffer(dev_addr));
+	BUG_ON(!is_swiotlb_buffer(dev, dev_addr));
 
-	swiotlb_tbl_unmap_single(dev, dev_addr, size, size, dir, attrs);
+	swiotlb_tbl_unmap_single(dev, dev_addr, size, dir, attrs);
 }
 
 size_t virtio_max_mapping_size(struct device *dev)
@@ -829,8 +869,7 @@ static int setup_virtio_dma_ops(struct platform_device *pdev)
 		return -ENOMEM;
 
 	/* Note: Mapped as 'normal/cacheable' memory */
-	vmem_pool->virt_base = __ioremap(ring_base, ring_size,
-						__pgprot(PROT_NORMAL));
+	vmem_pool->virt_base = ioremap_cache(ring_base, ring_size);
 	if (!vmem_pool->virt_base) {
 		pr_err("Unable to ioremap %pK size %lx\n",
 					(void *)ring_base, ring_size);
@@ -844,7 +883,7 @@ static int setup_virtio_dma_ops(struct platform_device *pdev)
 	vm_dev->mem_pool = vmem_pool;
 	set_dma_ops(&pdev->dev, &virtio_dma_ops);
 
-	dev_dbg(&pdev->dev, "virtio_mem_pool: virt_base %llx pages %lx\n",
+	dev_dbg(&pdev->dev, "virtio_mem_pool: virt_base %p pages %lx\n",
 					vmem_pool->virt_base, pages);
 	return 0;
 }
@@ -979,7 +1018,7 @@ static int vm_cmdline_set(const char *device,
 	int err;
 	struct resource resources[2] = {};
 	char *str;
-	long long int base, size;
+	long long base, size;
 	unsigned int irq;
 	int processed, consumed = 0;
 	struct platform_device *pdev;
@@ -1109,7 +1148,7 @@ static struct platform_driver virtio_mmio_driver = {
 		.of_match_table	= virtio_mmio_match,
 		.acpi_match_table = ACPI_PTR(virtio_mmio_acpi_match),
 #if IS_ENABLED(CONFIG_PM_SLEEP) && !IS_ENABLED(CONFIG_VIRTIO_MMIO_SWIOTLB)
-		.pm = &virtio_mmio_pm_ops,
+		.pm	= &virtio_mmio_pm_ops,
 #endif
 	},
 };

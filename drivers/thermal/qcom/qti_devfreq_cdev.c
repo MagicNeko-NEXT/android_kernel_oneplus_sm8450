@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2021-2023, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "%s:%s " fmt, KBUILD_MODNAME, __func__
@@ -50,7 +51,7 @@ static int devfreq_cdev_set_state(struct thermal_cooling_device *cdev,
 	pr_debug("cdev:%s Limit:%lu\n", cdev->type, freq);
 	ret = dev_pm_qos_update_request(&cdev_data->qos_max_freq_req, freq);
 	if (ret < 0) {
-		pr_err("Error placing qos request:%u. cdev:%s err:%d\n",
+		pr_err("Error placing qos request:%lu. cdev:%s err:%d\n",
 				freq, cdev->type, ret);
 		return ret;
 	}
@@ -97,7 +98,7 @@ static void devfreq_cdev_work(struct work_struct *work)
 	df = devfreq_get_devfreq_by_node(cdev_data->np);
 	if (IS_ERR(df)) {
 		ret = PTR_ERR(df);
-		pr_err("Devfreq not available:%d\n", ret);
+		pr_debug("Devfreq not available:%d\n", ret);
 		if (--cdev_data->retry_cnt)
 			queue_delayed_work(system_highpri_wq,
 					&cdev_data->register_work,
@@ -124,7 +125,7 @@ static void devfreq_cdev_work(struct work_struct *work)
 		dev_pm_opp_put(opp);
 
 		freq_table[i] = DIV_ROUND_UP(freq, 1000); //hz to khz
-		pr_debug("%d. freq table:%d\n", i, freq_table[i]);
+		pr_debug("%d. freq table:%lu\n", i, freq_table[i]);
 	}
 	cdev_data->max_state = freq_ct-1;
 	cdev_data->freq_table = freq_table;
@@ -137,7 +138,7 @@ static void devfreq_cdev_work(struct work_struct *work)
 	cdev_data->cdev = thermal_cooling_device_register(DEVFREQ_CDEV_NAME,
 						cdev_data, &devfreq_cdev_ops);
 	if (IS_ERR(cdev_data->cdev)) {
-		pr_err("Cdev register failed for gpu, ret:%d\n",
+		pr_err("Cdev register failed for gpu, ret:%ld\n",
 			PTR_ERR(cdev_data->cdev));
 		cdev_data->cdev = NULL;
 		goto qos_exit;
@@ -207,4 +208,4 @@ static void __exit devfreq_cdev_exit(void)
 module_exit(devfreq_cdev_exit);
 
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. devfreq cooling device driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

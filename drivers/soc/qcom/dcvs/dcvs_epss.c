@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "qcom-dcvs-epss: " fmt
@@ -47,7 +48,7 @@ int populate_l3_table(struct device *dev, u32 **freq_table)
 	unsigned long freq, prev_freq = 0;
 	struct resource res;
 	void __iomem *ftbl_base;
-	unsigned int ftbl_row_size = FTBL_ROW_SIZE;
+	unsigned int ftbl_row_size;
 	u32 *tmp_l3_table;
 
 	idx = of_property_match_string(dev->of_node, "reg-names", "l3tbl-base");
@@ -68,9 +69,17 @@ int populate_l3_table(struct device *dev, u32 **freq_table)
 		return -ENOMEM;
 	}
 
+	ret = of_property_read_u32(dev->of_node, "qcom,ftbl-row-size",
+						&ftbl_row_size);
+	if (ret < 0)
+		ftbl_row_size = FTBL_ROW_SIZE;
+
 	tmp_l3_table = kcalloc(MAX_L3_ENTRIES, sizeof(*tmp_l3_table), GFP_KERNEL);
-	if (!tmp_l3_table)
+	if (!tmp_l3_table) {
+		iounmap(ftbl_base);
 		return -ENOMEM;
+	}
+
 	for (idx = 0; idx < MAX_L3_ENTRIES; idx++) {
 		data = readl_relaxed(ftbl_base + idx * ftbl_row_size);
 		src = ((data & SRC_MASK) >> SRC_SHIFT);
@@ -87,8 +96,10 @@ int populate_l3_table(struct device *dev, u32 **freq_table)
 	len = idx;
 
 	*freq_table = devm_kzalloc(dev, len * sizeof(**freq_table), GFP_KERNEL);
-	if (!*freq_table)
+	if (!*freq_table) {
+		iounmap(ftbl_base);
 		return -ENOMEM;
+	}
 
 	for (idx = 0; idx < len; idx++)
 		(*freq_table)[idx] = tmp_l3_table[idx];
@@ -192,35 +203,43 @@ static int populate_percpu_offsets(struct device *dev, u32 **cpu_offsets)
 	int ret, len;
 	struct device_node *of_node = dev->of_node;
 
-	if (of_parse_phandle(of_node, PERCPU_OFFSETS, 0))
-		of_node = of_parse_phandle(of_node, PERCPU_OFFSETS, 0);
+	of_node = of_parse_phandle(of_node, PERCPU_OFFSETS, 0);
+	if (!of_node)
+		of_node = dev->of_node;
 
 	if (!of_find_property(of_node, PERCPU_OFFSETS, &len)) {
 		dev_err(dev, "Unable to find percpu offsets prop!\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
 	len /= sizeof(**cpu_offsets);
 	if (len != num_possible_cpus()) {
 		dev_err(dev, "Invalid percpu offsets table len=%d\n", len);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
 
 	*cpu_offsets = devm_kzalloc(dev, len * sizeof(**cpu_offsets),
 								GFP_KERNEL);
-	if (!*cpu_offsets)
-		return -ENOMEM;
+	if (!*cpu_offsets) {
+		ret = -ENOMEM;
+		goto out;
+	}
 
 	ret = of_property_read_u32_array(of_node, PERCPU_OFFSETS, *cpu_offsets,
 									len);
 	if (ret < 0) {
 		dev_err(dev, "Error reading percpu offsets from DT: %d\n", ret);
-		return ret;
+		goto out;
 	}
 
+out:
+	if (of_node != dev->of_node)
+		of_node_put(of_node);
 	return ret;
 }
 
-int setup_epss_l3_device(struct device *dev, struct dcvs_hw *hw,
+static int setup_epss_l3_device(struct device *dev, struct dcvs_hw *hw,
 					struct dcvs_path *path, bool shared)
 {
 	int ret = 0;
@@ -247,6 +266,7 @@ int setup_epss_l3_device(struct device *dev, struct dcvs_hw *hw,
 
 	return ret;
 }
+
 int setup_epss_l3_sp_device(struct device *dev, struct dcvs_hw *hw,
 					struct dcvs_path *path)
 {

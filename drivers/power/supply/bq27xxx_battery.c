@@ -39,6 +39,7 @@
  * https://www.ti.com/product/bq27z561
  * https://www.ti.com/product/bq28z610
  * https://www.ti.com/product/bq34z100-g1
+ * https://www.ti.com/product/bq78z100
  */
 
 #include <linux/device.h>
@@ -535,6 +536,27 @@ static u8
 		[BQ27XXX_REG_DCAP] = 0x3c,
 		[BQ27XXX_REG_AP] = 0x22,
 		BQ27XXX_DM_REG_ROWS,
+	},
+	bq78z100_regs[BQ27XXX_REG_MAX] = {
+		[BQ27XXX_REG_CTRL] = 0x00,
+		[BQ27XXX_REG_TEMP] = 0x06,
+		[BQ27XXX_REG_INT_TEMP] = 0x28,
+		[BQ27XXX_REG_VOLT] = 0x08,
+		[BQ27XXX_REG_AI] = 0x14,
+		[BQ27XXX_REG_FLAGS] = 0x0a,
+		[BQ27XXX_REG_TTE] = 0x16,
+		[BQ27XXX_REG_TTF] = 0x18,
+		[BQ27XXX_REG_TTES] = 0x1c,
+		[BQ27XXX_REG_TTECP] = INVALID_REG_ADDR,
+		[BQ27XXX_REG_NAC] = INVALID_REG_ADDR,
+		[BQ27XXX_REG_RC] = 0x10,
+		[BQ27XXX_REG_FCC] = 0x12,
+		[BQ27XXX_REG_CYCT] = 0x2a,
+		[BQ27XXX_REG_AE] = INVALID_REG_ADDR,
+		[BQ27XXX_REG_SOC] = 0x2c,
+		[BQ27XXX_REG_DCAP] = 0x3c,
+		[BQ27XXX_REG_AP] = 0x22,
+		BQ27XXX_DM_REG_ROWS,
 	};
 
 static enum power_supply_property bq27000_props[] = {
@@ -846,6 +868,26 @@ static enum power_supply_property bq34z100_props[] = {
 	POWER_SUPPLY_PROP_MANUFACTURER,
 };
 
+static enum power_supply_property bq78z100_props[] = {
+	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_PRESENT,
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
+	POWER_SUPPLY_PROP_TEMP,
+	POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW,
+	POWER_SUPPLY_PROP_TIME_TO_FULL_NOW,
+	POWER_SUPPLY_PROP_TECHNOLOGY,
+	POWER_SUPPLY_PROP_CHARGE_FULL,
+	POWER_SUPPLY_PROP_CHARGE_NOW,
+	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+	POWER_SUPPLY_PROP_CYCLE_COUNT,
+	POWER_SUPPLY_PROP_POWER_AVG,
+	POWER_SUPPLY_PROP_HEALTH,
+	POWER_SUPPLY_PROP_MANUFACTURER,
+};
+
 struct bq27xxx_dm_reg {
 	u8 subclass_id;
 	u8 offset;
@@ -857,32 +899,13 @@ enum bq27xxx_dm_reg_id {
 	BQ27XXX_DM_DESIGN_CAPACITY = 0,
 	BQ27XXX_DM_DESIGN_ENERGY,
 	BQ27XXX_DM_TERMINATE_VOLTAGE,
-#ifdef CONFIG_BATTERY_BQ27XXX_RESIST_TABLE_UPDATES_NVM
-	BQ27XXX_DM_TAPER_RATE,
-	BQ27XXX_DM_QMAX,
-	BQ27XXX_RAM_R_a0_0,
-	BQ27XXX_RAM_R_a0_1,
-	BQ27XXX_RAM_R_a0_2,
-	BQ27XXX_RAM_R_a0_3,
-	BQ27XXX_RAM_R_a0_4,
-	BQ27XXX_RAM_R_a0_5,
-	BQ27XXX_RAM_R_a0_6,
-	BQ27XXX_RAM_R_a0_7,
-	BQ27XXX_RAM_R_a0_8,
-	BQ27XXX_RAM_R_a0_9,
-	BQ27XXX_RAM_R_a0_10,
-	BQ27XXX_RAM_R_a0_11,
-	BQ27XXX_RAM_R_a0_12,
-	BQ27XXX_RAM_R_a0_13,
-	BQ27XXX_RAM_R_a0_14,
-#endif
 };
 
-#define bq27000_dm_regs 0
-#define bq27010_dm_regs 0
-#define bq2750x_dm_regs 0
-#define bq2751x_dm_regs 0
-#define bq2752x_dm_regs 0
+#define bq27000_dm_regs NULL
+#define bq27010_dm_regs NULL
+#define bq2750x_dm_regs NULL
+#define bq2751x_dm_regs NULL
+#define bq2752x_dm_regs NULL
 
 #if 0 /* not yet tested */
 static struct bq27xxx_dm_reg bq27500_dm_regs[] = {
@@ -891,24 +914,24 @@ static struct bq27xxx_dm_reg bq27500_dm_regs[] = {
 	[BQ27XXX_DM_TERMINATE_VOLTAGE] = { 80, 48, 2, 1000, 32767 },
 };
 #else
-#define bq27500_dm_regs 0
+#define bq27500_dm_regs NULL
 #endif
 
 /* todo create data memory definitions from datasheets and test on chips */
-#define bq27510g1_dm_regs 0
-#define bq27510g2_dm_regs 0
-#define bq27510g3_dm_regs 0
-#define bq27520g1_dm_regs 0
-#define bq27520g2_dm_regs 0
-#define bq27520g3_dm_regs 0
-#define bq27520g4_dm_regs 0
-#define bq27521_dm_regs 0
-#define bq27530_dm_regs 0
-#define bq27531_dm_regs 0
-#define bq27541_dm_regs 0
-#define bq27542_dm_regs 0
-#define bq27546_dm_regs 0
-#define bq27742_dm_regs 0
+#define bq27510g1_dm_regs NULL
+#define bq27510g2_dm_regs NULL
+#define bq27510g3_dm_regs NULL
+#define bq27520g1_dm_regs NULL
+#define bq27520g2_dm_regs NULL
+#define bq27520g3_dm_regs NULL
+#define bq27520g4_dm_regs NULL
+#define bq27521_dm_regs NULL
+#define bq27530_dm_regs NULL
+#define bq27531_dm_regs NULL
+#define bq27541_dm_regs NULL
+#define bq27542_dm_regs NULL
+#define bq27546_dm_regs NULL
+#define bq27742_dm_regs NULL
 
 #if 0 /* not yet tested */
 static struct bq27xxx_dm_reg bq27545_dm_regs[] = {
@@ -917,7 +940,7 @@ static struct bq27xxx_dm_reg bq27545_dm_regs[] = {
 	[BQ27XXX_DM_TERMINATE_VOLTAGE] = { 80, 67, 2, 2800,  3700 },
 };
 #else
-#define bq27545_dm_regs 0
+#define bq27545_dm_regs NULL
 #endif
 
 static struct bq27xxx_dm_reg bq27411_dm_regs[] = {
@@ -930,25 +953,6 @@ static struct bq27xxx_dm_reg bq27421_dm_regs[] = {
 	[BQ27XXX_DM_DESIGN_CAPACITY]   = { 82, 10, 2,    0,  8000 },
 	[BQ27XXX_DM_DESIGN_ENERGY]     = { 82, 12, 2,    0, 32767 },
 	[BQ27XXX_DM_TERMINATE_VOLTAGE] = { 82, 16, 2, 2500,  3700 },
-#ifdef CONFIG_BATTERY_BQ27XXX_RESIST_TABLE_UPDATES_NVM
-	[BQ27XXX_DM_TAPER_RATE]        = { 82, 27, 2,    0,  2000 }, /* Taper rate */
-	[BQ27XXX_DM_QMAX]              = { 82,  0, 2,    0, 32767 },
-	[BQ27XXX_RAM_R_a0_0]           = { 89,  0, 2,    0, 32767 },
-	[BQ27XXX_RAM_R_a0_1]           = { 89,  2, 2,    0, 32767 },
-	[BQ27XXX_RAM_R_a0_2]           = { 89,  4, 2,    0, 32767 },
-	[BQ27XXX_RAM_R_a0_3]           = { 89,  6, 2,    0, 32767 },
-	[BQ27XXX_RAM_R_a0_4]           = { 89,  8, 2,    0, 32767 },
-	[BQ27XXX_RAM_R_a0_5]           = { 89, 10, 2,    0, 32767 },
-	[BQ27XXX_RAM_R_a0_6]           = { 89, 12, 2,    0, 32767 },
-	[BQ27XXX_RAM_R_a0_7]           = { 89, 14, 2,    0, 32767 },
-	[BQ27XXX_RAM_R_a0_8]           = { 89, 16, 2,    0, 32767 },
-	[BQ27XXX_RAM_R_a0_9]           = { 89, 18, 2,    0, 32767 },
-	[BQ27XXX_RAM_R_a0_10]          = { 89, 20, 2,    0, 32767 },
-	[BQ27XXX_RAM_R_a0_11]          = { 89, 22, 2,    0, 32767 },
-	[BQ27XXX_RAM_R_a0_12]          = { 89, 24, 2,    0, 32767 },
-	[BQ27XXX_RAM_R_a0_13]          = { 89, 26, 2,    0, 32767 },
-	[BQ27XXX_RAM_R_a0_14]          = { 89, 28, 2,    0, 32767 },
-#endif
 };
 
 static struct bq27xxx_dm_reg bq27425_dm_regs[] = {
@@ -966,7 +970,7 @@ static struct bq27xxx_dm_reg bq27426_dm_regs[] = {
 #if 0 /* not yet tested */
 #define bq27441_dm_regs bq27421_dm_regs
 #else
-#define bq27441_dm_regs 0
+#define bq27441_dm_regs NULL
 #endif
 
 #if 0 /* not yet tested */
@@ -976,12 +980,13 @@ static struct bq27xxx_dm_reg bq27621_dm_regs[] = {
 	[BQ27XXX_DM_TERMINATE_VOLTAGE] = { 82, 9, 2, 2500,  3700 },
 };
 #else
-#define bq27621_dm_regs 0
+#define bq27621_dm_regs NULL
 #endif
 
-#define bq27z561_dm_regs 0
-#define bq28z610_dm_regs 0
-#define bq34z100_dm_regs 0
+#define bq27z561_dm_regs NULL
+#define bq28z610_dm_regs NULL
+#define bq34z100_dm_regs NULL
+#define bq78z100_dm_regs NULL
 
 #define BQ27XXX_O_ZERO		BIT(0)
 #define BQ27XXX_O_OTDC		BIT(1) /* has OTC/OTD overtemperature flags */
@@ -1040,6 +1045,7 @@ static struct {
 	[BQ28Z610]  = BQ27XXX_DATA(bq28z610,  0         , BQ27Z561_O_BITS),
 	[BQ34Z100]  = BQ27XXX_DATA(bq34z100,  0         , BQ27XXX_O_OTDC | BQ27XXX_O_SOC_SI | \
 							  BQ27XXX_O_HAS_CI | BQ27XXX_O_MUL_CHEM),
+	[BQ78Z100]  = BQ27XXX_DATA(bq78z100,  0         , BQ27Z561_O_BITS),
 };
 
 static DEFINE_MUTEX(bq27xxx_list_lock);
@@ -1071,12 +1077,12 @@ struct bq27xxx_dm_buf {
 	.block = (di)->dm_regs[i].offset / BQ27XXX_DM_SZ, \
 }
 
-static inline u16 *bq27xxx_dm_reg_ptr(struct bq27xxx_dm_buf *buf,
+static inline __be16 *bq27xxx_dm_reg_ptr(struct bq27xxx_dm_buf *buf,
 				      struct bq27xxx_dm_reg *reg)
 {
 	if (buf->class == reg->subclass_id &&
 	    buf->block == reg->offset / BQ27XXX_DM_SZ)
-		return (u16 *) (buf->data + reg->offset % BQ27XXX_DM_SZ);
+		return (__be16 *) (buf->data + reg->offset % BQ27XXX_DM_SZ);
 
 	return NULL;
 }
@@ -1085,30 +1091,10 @@ static const char * const bq27xxx_dm_reg_name[] = {
 	[BQ27XXX_DM_DESIGN_CAPACITY] = "design-capacity",
 	[BQ27XXX_DM_DESIGN_ENERGY] = "design-energy",
 	[BQ27XXX_DM_TERMINATE_VOLTAGE] = "terminate-voltage",
-#ifdef CONFIG_BATTERY_BQ27XXX_RESIST_TABLE_UPDATES_NVM
-	[BQ27XXX_DM_TAPER_RATE] = "Taper-rate",
-	[BQ27XXX_DM_QMAX]       = "QMAX-Cell",
-	[BQ27XXX_RAM_R_a0_0]    = "R_a0_0",
-	[BQ27XXX_RAM_R_a0_1]    = "R_a0_1",
-	[BQ27XXX_RAM_R_a0_2]    = "R_a0_2",
-	[BQ27XXX_RAM_R_a0_3]    = "R_a0_3",
-	[BQ27XXX_RAM_R_a0_4]    = "R_a0_4",
-	[BQ27XXX_RAM_R_a0_5]    = "R_a0_5",
-	[BQ27XXX_RAM_R_a0_6]    = "R_a0_6",
-	[BQ27XXX_RAM_R_a0_7]    = "R_a0_7",
-	[BQ27XXX_RAM_R_a0_8]    = "R_a0_8",
-	[BQ27XXX_RAM_R_a0_9]    = "R_a0_9",
-	[BQ27XXX_RAM_R_a0_10]   = "R_a0_10",
-	[BQ27XXX_RAM_R_a0_11]   = "R_a0_11",
-	[BQ27XXX_RAM_R_a0_12]   = "R_a0_12",
-	[BQ27XXX_RAM_R_a0_13]   = "R_a0_13",
-	[BQ27XXX_RAM_R_a0_14]   = "R_a0_14",
-#endif
-
 };
 
 
-static bool bq27xxx_dt_to_nvm;
+static bool bq27xxx_dt_to_nvm = true;
 module_param_named(dt_monitored_battery_updates_nvm, bq27xxx_dt_to_nvm, bool, 0444);
 MODULE_PARM_DESC(dt_monitored_battery_updates_nvm,
 	"Devicetree monitored-battery config updates data memory on NVM/flash chips.\n"
@@ -1176,7 +1162,7 @@ static inline int bq27xxx_write(struct bq27xxx_device_info *di, int reg_index,
 		return -EINVAL;
 
 	if (!di->bus.write)
-		return -EPERM;
+		return -EOPNOTSUPP;
 
 	ret = di->bus.write(di, di->regs[reg_index], value, single);
 	if (ret < 0)
@@ -1195,7 +1181,7 @@ static inline int bq27xxx_read_block(struct bq27xxx_device_info *di, int reg_ind
 		return -EINVAL;
 
 	if (!di->bus.read_bulk)
-		return -EPERM;
+		return -EOPNOTSUPP;
 
 	ret = di->bus.read_bulk(di, di->regs[reg_index], data, len);
 	if (ret < 0)
@@ -1214,7 +1200,7 @@ static inline int bq27xxx_write_block(struct bq27xxx_device_info *di, int reg_in
 		return -EINVAL;
 
 	if (!di->bus.write_bulk)
-		return -EPERM;
+		return -EOPNOTSUPP;
 
 	ret = di->bus.write_bulk(di, di->regs[reg_index], data, len);
 	if (ret < 0)
@@ -1320,7 +1306,7 @@ static void bq27xxx_battery_update_dm_block(struct bq27xxx_device_info *di,
 {
 	struct bq27xxx_dm_reg *reg = &di->dm_regs[reg_id];
 	const char *str = bq27xxx_dm_reg_name[reg_id];
-	u16 *prev = bq27xxx_dm_reg_ptr(buf, reg);
+	__be16 *prev = bq27xxx_dm_reg_ptr(buf, reg);
 
 	if (prev == NULL) {
 		dev_warn(di->dev, "buffer does not match %s dm spec\n", str);
@@ -1437,8 +1423,7 @@ static int bq27xxx_battery_write_dm_block(struct bq27xxx_device_info *di,
 
 	BQ27XXX_MSLEEP(1);
 
-	ret = bq27xxx_write_block(di, BQ27XXX_DM_DATA, buf->data,
-				  (BQ27XXX_DM_SZ-1));
+	ret = bq27xxx_write_block(di, BQ27XXX_DM_DATA, buf->data, BQ27XXX_DM_SZ);
 	if (ret < 0)
 		goto out;
 
@@ -1479,10 +1464,6 @@ static void bq27xxx_battery_set_config(struct bq27xxx_device_info *di,
 	struct bq27xxx_dm_buf bd = BQ27XXX_DM_BUF(di, BQ27XXX_DM_DESIGN_CAPACITY);
 	struct bq27xxx_dm_buf bt = BQ27XXX_DM_BUF(di, BQ27XXX_DM_TERMINATE_VOLTAGE);
 	bool updated;
-#ifdef CONFIG_BATTERY_BQ27XXX_RESIST_TABLE_UPDATES_NVM
-	struct bq27xxx_dm_buf rt = BQ27XXX_DM_BUF(di, BQ27XXX_RAM_R_a0_0);
-	u32 i, taper_rate;
-#endif
 
 	if (bq27xxx_battery_unseal(di) < 0)
 		return;
@@ -1490,30 +1471,13 @@ static void bq27xxx_battery_set_config(struct bq27xxx_device_info *di,
 	if (info->charge_full_design_uah != -EINVAL &&
 	    info->energy_full_design_uwh != -EINVAL) {
 		bq27xxx_battery_read_dm_block(di, &bd);
-
-		/* assume design energy, taper_rate & capacity are in same block */
+		/* assume design energy & capacity are in same block */
 		bq27xxx_battery_update_dm_block(di, &bd,
 					BQ27XXX_DM_DESIGN_CAPACITY,
 					info->charge_full_design_uah / 1000);
 		bq27xxx_battery_update_dm_block(di, &bd,
 					BQ27XXX_DM_DESIGN_ENERGY,
 					info->energy_full_design_uwh / 1000);
-
-#ifdef CONFIG_BATTERY_BQ27XXX_RESIST_TABLE_UPDATES_NVM
-		bq27xxx_battery_read_dm_block(di, &rt);
-		/* update Taper rate based on the capacity and term current */
-		taper_rate = (u32)((info->charge_full_design_uah * 10) /
-				    info->charge_term_current_ua);
-		bq27xxx_battery_update_dm_block(di, &bd, BQ27XXX_DM_TAPER_RATE,
-						taper_rate);
-		/* update the QMAX-CELL0 and resistance table */
-		bq27xxx_battery_update_dm_block(di, &bd, BQ27XXX_DM_QMAX,
-						 di->qmax_cell0);
-		for (i = 0 ; i < 15; i++)
-			bq27xxx_battery_update_dm_block(di, &rt,
-							(i + BQ27XXX_RAM_R_a0_0),
-							di->resist_table[i]);
-#endif
 	}
 
 	if (info->voltage_min_design_uv != -EINVAL) {
@@ -1530,19 +1494,6 @@ static void bq27xxx_battery_set_config(struct bq27xxx_device_info *di,
 	bq27xxx_battery_write_dm_block(di, &bd);
 	bq27xxx_battery_write_dm_block(di, &bt);
 
-#ifdef CONFIG_BATTERY_BQ27XXX_RESIST_TABLE_UPDATES_NVM
-	bq27xxx_battery_write_dm_block(di, &rt);
-
-	bq27xxx_battery_read_dm_block(di, &bd);
-	for (i = 0; i < BQ27XXX_DM_SZ; i++)
-		dev_dbg(di->dev, "BQ27xxx: DM_NVM[%d]: 0x%04x\n", i, bd.data[i]);
-
-	bq27xxx_battery_read_dm_block(di, &rt);
-	for (i = 0; i < BQ27XXX_DM_SZ; i++)
-		dev_dbg(di->dev, "BQ27xxx: Resisiatnce table DM_NVM[%d]:0x%04x\n",
-			i, rt.data[i]);
-#endif
-
 	bq27xxx_battery_seal(di);
 
 	if (updated && !(di->opts & BQ27XXX_O_CFGUP)) {
@@ -1554,7 +1505,7 @@ static void bq27xxx_battery_set_config(struct bq27xxx_device_info *di,
 
 static void bq27xxx_battery_settings(struct bq27xxx_device_info *di)
 {
-	struct power_supply_battery_info info = {};
+	struct power_supply_battery_info *info;
 	unsigned int min, max;
 
 	if (power_supply_get_battery_info(di->bat, &info) < 0)
@@ -1565,43 +1516,43 @@ static void bq27xxx_battery_settings(struct bq27xxx_device_info *di)
 		return;
 	}
 
-	if (info.energy_full_design_uwh != info.charge_full_design_uah) {
-		if (info.energy_full_design_uwh == -EINVAL)
+	if (info->energy_full_design_uwh != info->charge_full_design_uah) {
+		if (info->energy_full_design_uwh == -EINVAL)
 			dev_warn(di->dev, "missing battery:energy-full-design-microwatt-hours\n");
-		else if (info.charge_full_design_uah == -EINVAL)
+		else if (info->charge_full_design_uah == -EINVAL)
 			dev_warn(di->dev, "missing battery:charge-full-design-microamp-hours\n");
 	}
 
 	/* assume min == 0 */
 	max = di->dm_regs[BQ27XXX_DM_DESIGN_ENERGY].max;
-	if (info.energy_full_design_uwh > max * 1000) {
+	if (info->energy_full_design_uwh > max * 1000) {
 		dev_err(di->dev, "invalid battery:energy-full-design-microwatt-hours %d\n",
-			info.energy_full_design_uwh);
-		info.energy_full_design_uwh = -EINVAL;
+			info->energy_full_design_uwh);
+		info->energy_full_design_uwh = -EINVAL;
 	}
 
 	/* assume min == 0 */
 	max = di->dm_regs[BQ27XXX_DM_DESIGN_CAPACITY].max;
-	if (info.charge_full_design_uah > max * 1000) {
+	if (info->charge_full_design_uah > max * 1000) {
 		dev_err(di->dev, "invalid battery:charge-full-design-microamp-hours %d\n",
-			info.charge_full_design_uah);
-		info.charge_full_design_uah = -EINVAL;
+			info->charge_full_design_uah);
+		info->charge_full_design_uah = -EINVAL;
 	}
 
 	min = di->dm_regs[BQ27XXX_DM_TERMINATE_VOLTAGE].min;
 	max = di->dm_regs[BQ27XXX_DM_TERMINATE_VOLTAGE].max;
-	if ((info.voltage_min_design_uv < min * 1000 ||
-	     info.voltage_min_design_uv > max * 1000) &&
-	     info.voltage_min_design_uv != -EINVAL) {
+	if ((info->voltage_min_design_uv < min * 1000 ||
+	     info->voltage_min_design_uv > max * 1000) &&
+	     info->voltage_min_design_uv != -EINVAL) {
 		dev_err(di->dev, "invalid battery:voltage-min-design-microvolt %d\n",
-			info.voltage_min_design_uv);
-		info.voltage_min_design_uv = -EINVAL;
+			info->voltage_min_design_uv);
+		info->voltage_min_design_uv = -EINVAL;
 	}
 
-	if ((info.energy_full_design_uwh != -EINVAL &&
-	     info.charge_full_design_uah != -EINVAL) ||
-	     info.voltage_min_design_uv  != -EINVAL)
-		bq27xxx_battery_set_config(di, &info);
+	if ((info->energy_full_design_uwh != -EINVAL &&
+	     info->charge_full_design_uah != -EINVAL) ||
+	     info->voltage_min_design_uv  != -EINVAL)
+		bq27xxx_battery_set_config(di, info);
 }
 
 /*
@@ -2020,10 +1971,10 @@ static int bq27xxx_battery_capacity_level(struct bq27xxx_device_info *di,
 	if (di->opts & BQ27XXX_O_ZERO) {
 		if (di->cache.flags & BQ27000_FLAG_FC)
 			level = POWER_SUPPLY_CAPACITY_LEVEL_FULL;
-		else if (di->cache.flags & BQ27000_FLAG_EDV1)
-			level = POWER_SUPPLY_CAPACITY_LEVEL_LOW;
 		else if (di->cache.flags & BQ27000_FLAG_EDVF)
 			level = POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
+		else if (di->cache.flags & BQ27000_FLAG_EDV1)
+			level = POWER_SUPPLY_CAPACITY_LEVEL_LOW;
 		else
 			level = POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
 	} else if (di->opts & BQ27Z561_O_BITS) {
@@ -2036,10 +1987,10 @@ static int bq27xxx_battery_capacity_level(struct bq27xxx_device_info *di,
 	} else {
 		if (di->cache.flags & BQ27XXX_FLAG_FC)
 			level = POWER_SUPPLY_CAPACITY_LEVEL_FULL;
-		else if (di->cache.flags & BQ27XXX_FLAG_SOC1)
-			level = POWER_SUPPLY_CAPACITY_LEVEL_LOW;
 		else if (di->cache.flags & BQ27XXX_FLAG_SOCF)
 			level = POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
+		else if (di->cache.flags & BQ27XXX_FLAG_SOC1)
+			level = POWER_SUPPLY_CAPACITY_LEVEL_LOW;
 		else
 			level = POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
 	}

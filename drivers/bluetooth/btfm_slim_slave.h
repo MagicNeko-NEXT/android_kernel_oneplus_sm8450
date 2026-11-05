@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #ifndef BTFM_SLIM_SLAVE_H
@@ -75,7 +76,6 @@
 #define CHRKVER3_SB_PGD_PORT_TX2_FM			4
 #define SLAVE_SB_PGD_PORT_RX_SCO			16
 #define SLAVE_SB_PGD_PORT_RX_A2P			17
-#define SLAVE_SB_PGD_PORT_TX_A2DP			2
 
 enum {
 	QCA_CHEROKEE_SOC_ID_0200  = 0x40010200,
@@ -120,7 +120,6 @@ enum {
 enum {
 	QCA_MOSELLE_SOC_ID_0100 = 0x40140100,
 	QCA_MOSELLE_SOC_ID_0110 = 0x40140110,
-	QCA_MOSELLE_SOC_ID_0120 = 0x40140120,
 };
 
 enum {

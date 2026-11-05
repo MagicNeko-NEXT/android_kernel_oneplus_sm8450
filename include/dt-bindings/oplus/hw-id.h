@@ -3,14 +3,16 @@
 #ifndef _DT_BINDINGS_OPLUS_HW_ID_H
 #define _DT_BINDINGS_OPLUS_HW_ID_H
 
-#define OPLUS_PRE_EVB1    1
-#define OPLUS_PRE_EVB2    2
+#define OPLUS_PRE_T0    1
+#define OPLUS_PRE_T1    2
 #define OPLUS_EVB1        8
 #define OPLUS_EVB2        9
 #define OPLUS_EVB3       10
 #define OPLUS_EVB4       11
 #define OPLUS_EVB5       12
 #define OPLUS_EVB6       13
+#define OPLUS_EVB7       14
+#define OPLUS_EVB8       15
 #define OPLUS_T0         16
 #define OPLUS_T1         17
 #define OPLUS_T2         18

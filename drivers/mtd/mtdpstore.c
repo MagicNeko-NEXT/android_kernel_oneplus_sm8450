@@ -401,7 +401,7 @@ static void mtdpstore_notify_add(struct mtd_info *mtd)
 	/*
 	 * kmsg_size must be aligned to 4096 Bytes, which is limited by
 	 * psblk. The default value of kmsg_size is 64KB. If kmsg_size
-	 * is larger than erasesize, some errors will occur since mtdpsotre
+	 * is larger than erasesize, some errors will occur since mtdpstore
 	 * is designed on it.
 	 */
 	if (mtd->erasesize < info->kmsg_size) {
@@ -426,13 +426,13 @@ static void mtdpstore_notify_add(struct mtd_info *mtd)
 	if (!cxt->rmmap || !cxt->usedmap || !cxt->badmap)
 		return;
 
-	cxt->dev.total_size = mtd->size;
 	/* just support dmesg right now */
 	cxt->dev.flags = PSTORE_FLAGS_DMESG;
-	cxt->dev.read = mtdpstore_read;
-	cxt->dev.write = mtdpstore_write;
-	cxt->dev.erase = mtdpstore_erase;
-	cxt->dev.panic_write = mtdpstore_panic_write;
+	cxt->dev.zone.read = mtdpstore_read;
+	cxt->dev.zone.write = mtdpstore_write;
+	cxt->dev.zone.erase = mtdpstore_erase;
+	cxt->dev.zone.panic_write = mtdpstore_panic_write;
+	cxt->dev.zone.total_size = mtd->size;
 
 	ret = register_pstore_device(&cxt->dev);
 	if (ret) {

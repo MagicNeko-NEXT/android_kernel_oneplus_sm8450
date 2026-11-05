@@ -1,733 +1,432 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2019-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2019-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023, Linaro Ltd
  */
-
-#define pr_fmt(fmt)	"UCSI: %s: " fmt, __func__
-
-#include <clocksource/arm_arch_timer.h>
-#include <linux/device.h>
-#include <linux/ipc_logging.h>
+#include <linux/auxiliary_bus.h>
 #include <linux/module.h>
-#include <linux/notifier.h>
-#include <linux/of_platform.h>
-#include <linux/platform_device.h>
-#include <linux/slab.h>
+#include <linux/mutex.h>
+#include <linux/property.h>
+#include <linux/soc/qcom/pdr.h>
+#include <linux/usb/typec_mux.h>
+#include <linux/gpio/consumer.h>
 #include <linux/soc/qcom/pmic_glink.h>
-#include <linux/usb/typec.h>
-#include <linux/usb/ucsi_glink.h>
-
 #include "ucsi.h"
 
-/* PPM specific definitions */
-#define MSG_OWNER_UC			32779
-#define MSG_TYPE_REQ_RESP		1
-#define UCSI_BUF_SIZE			48
+#define PMIC_GLINK_MAX_PORTS	2
 
-#define UC_NOTIFY_RECEIVER_UCSI		0x0
-#define UC_UCSI_READ_BUF_REQ		0x11
-#define UC_UCSI_WRITE_BUF_REQ		0x12
-#define UC_UCSI_USBC_NOTIFY_IND		0x13
+#define UCSI_BUF_SIZE                   48
 
-/* Generic definitions */
-#define CMD_PENDING			1
-#define UCSI_LOG_BUF_SIZE		256
-#define NUM_LOG_PAGES			10
-#define UCSI_WAIT_TIME_MS		5000
+#define MSG_TYPE_REQ_RESP               1
+#define UCSI_BUF_SIZE                   48
 
-#define ucsi_dbg(fmt, ...) \
-	do { \
-		ipc_log_string(ucsi_ipc_log, fmt, ##__VA_ARGS__); \
-		pr_debug(fmt, ##__VA_ARGS__); \
-	} while (0)
+#define UC_NOTIFY_RECEIVER_UCSI         0x0
+#define UC_UCSI_READ_BUF_REQ            0x11
+#define UC_UCSI_WRITE_BUF_REQ           0x12
+#define UC_UCSI_USBC_NOTIFY_IND         0x13
 
 struct ucsi_read_buf_req_msg {
-	struct pmic_glink_hdr	hdr;
+	struct pmic_glink_hdr   hdr;
 };
 
 struct ucsi_read_buf_resp_msg {
-	struct pmic_glink_hdr	hdr;
-	u8			buf[UCSI_BUF_SIZE];
-	u32			ret_code;
+	struct pmic_glink_hdr   hdr;
+	u8                      buf[UCSI_BUF_SIZE];
+	u32                     ret_code;
 };
 
 struct ucsi_write_buf_req_msg {
-	struct pmic_glink_hdr	hdr;
-	u8			buf[UCSI_BUF_SIZE];
-	u32			reserved;
+	struct pmic_glink_hdr   hdr;
+	u8                      buf[UCSI_BUF_SIZE];
+	u32                     reserved;
 };
 
 struct ucsi_write_buf_resp_msg {
-	struct pmic_glink_hdr	hdr;
-	u32			ret_code;
+	struct pmic_glink_hdr   hdr;
+	u32                     ret_code;
 };
 
 struct ucsi_notify_ind_msg {
-	struct pmic_glink_hdr	hdr;
-	u32			notification;
-	u32			receiver;
-	u32			reserved;
+	struct pmic_glink_hdr   hdr;
+	u32                     notification;
+	u32                     receiver;
+	u32                     reserved;
 };
 
-struct constat_info_entry {
-	struct list_head		node;
-	struct ucsi_glink_constat_info	constat_info;
+struct pmic_glink_ucsi {
+	struct device *dev;
+
+	struct gpio_desc *port_orientation[PMIC_GLINK_MAX_PORTS];
+	struct typec_switch *port_switch[PMIC_GLINK_MAX_PORTS];
+
+	struct pmic_glink_client *client;
+
+	struct ucsi *ucsi;
+	struct completion read_ack;
+	struct completion write_ack;
+	struct completion sync_ack;
+	bool sync_pending;
+	struct mutex lock;	/* protects concurrent access to PMIC Glink interface */
+
+	int sync_val;
+
+	struct work_struct notify_work;
+	struct work_struct register_work;
+	spinlock_t state_lock;
+	bool ucsi_registered;
+	bool pd_running;
+
+	u8 read_buf[UCSI_BUF_SIZE];
 };
 
-struct ucsi_dev {
-	struct device			*dev;
-	struct ucsi			*ucsi;
-	struct pmic_glink_client	*client;
-	struct completion		read_ack;
-	struct completion		write_ack;
-	struct completion		sync_write_ack;
-	struct mutex			read_lock;
-	struct mutex			write_lock;
-	struct mutex			notify_lock;
-	struct mutex			state_lock;
-	struct ucsi_read_buf_resp_msg	rx_buf;
-	unsigned long			flags;
-	atomic_t			rx_valid;
-	unsigned long			cmd_requested_flags;
-	struct list_head		constat_info_list;
-	struct work_struct		notify_work;
-	struct work_struct		setup_work;
-	atomic_t			state;
-};
-
-struct remoteproc_ts {
-	u32	hh;
-	u32	mm;
-	u32	ss;
-	u32	dec;
-};
-
-static void *ucsi_ipc_log;
-static RAW_NOTIFIER_HEAD(ucsi_glink_notifier);
-
-int register_ucsi_glink_notifier(struct notifier_block *nb)
+static int pmic_glink_ucsi_read(struct ucsi *__ucsi, unsigned int offset,
+				void *val, size_t val_len)
 {
-	return raw_notifier_chain_register(&ucsi_glink_notifier, nb);
-}
-EXPORT_SYMBOL(register_ucsi_glink_notifier);
+	struct pmic_glink_ucsi *ucsi = ucsi_get_drvdata(__ucsi);
+	struct ucsi_read_buf_req_msg req = {};
+	unsigned long left;
+	int ret;
 
-int unregister_ucsi_glink_notifier(struct notifier_block *nb)
-{
-	return raw_notifier_chain_unregister(&ucsi_glink_notifier, nb);
-}
-EXPORT_SYMBOL(unregister_ucsi_glink_notifier);
+	req.hdr.owner = PMIC_GLINK_OWNER_USBC;
+	req.hdr.type = MSG_TYPE_REQ_RESP;
+	req.hdr.opcode = UC_UCSI_READ_BUF_REQ;
 
-static char *offset_to_name(unsigned int offset)
-{
-	char *type;
+	mutex_lock(&ucsi->lock);
+	memset(ucsi->read_buf, 0, sizeof(ucsi->read_buf));
+	reinit_completion(&ucsi->read_ack);
 
-	switch (offset) {
-	case UCSI_VERSION:
-		type = "VER:";
-		break;
-	case UCSI_CCI:
-		type = "CCI:";
-		break;
-	case UCSI_CONTROL:
-		type = "CONTROL:";
-		break;
-	case UCSI_MESSAGE_IN:
-		type = "MSG_IN:";
-		break;
-	case UCSI_MESSAGE_OUT:
-		type = "MSG_OUT:";
-		break;
-	default:
-		type = "UNKNOWN:";
-		break;
+	ret = pmic_glink_send(ucsi->client, &req, sizeof(req));
+	if (ret < 0) {
+		dev_err(ucsi->dev, "failed to send UCSI read request: %d\n", ret);
+		goto out_unlock;
 	}
 
-	return type;
-}
-
-#define CLK_FREQ_KHZ		19200
-
-static void get_remoteproc_timestamp(struct remoteproc_ts *ts)
-{
-	u64 us = (arch_timer_read_counter() * 1000 / CLK_FREQ_KHZ);
-	u64 ss = div64_u64(us, 1000000);
-
-	ts->dec = (u32)(us - (ss * 1000000llu));
-	ts->hh = (u32)div64_u64(ss, 3600);
-	ts->mm = (u32)(div64_u64(ss, 60) - (ts->hh * 60));
-	ts->ss = (u32)(ss - (ts->hh * 3600 + ts->mm * 60));
-}
-
-static void ucsi_log(const char *prefix, unsigned int offset, u8 *buf,
-				size_t len)
-{
-	char str[UCSI_LOG_BUF_SIZE] = { 0 };
-	u32 i, pos = 0;
-	struct remoteproc_ts ts;
-
-	get_remoteproc_timestamp(&ts);
-
-	for (i = 0; i < len && pos < sizeof(str) - 1; i++)
-		pos += scnprintf(str + pos, sizeof(str) - pos, "%02x ", buf[i]);
-
-	str[pos] = '\0';
-
-	ucsi_dbg("%s %s %s (%02u:%02u:%02u.%06u)\n", prefix, offset_to_name(offset),
-			str, ts.hh, ts.mm, ts.ss, ts.dec);
-}
-
-static int handle_ucsi_read_ack(struct ucsi_dev *udev, void *data, size_t len)
-{
-	if (len != sizeof(udev->rx_buf)) {
-		pr_err("Incorrect received length %zu expected %u\n", len,
-			sizeof(udev->rx_buf));
-		atomic_set(&udev->rx_valid, 0);
-		return -EINVAL;
+	left = wait_for_completion_timeout(&ucsi->read_ack, 5 * HZ);
+	if (!left) {
+		dev_err(ucsi->dev, "timeout waiting for UCSI read response\n");
+		ret = -ETIMEDOUT;
+		goto out_unlock;
 	}
 
-	memcpy(&udev->rx_buf, data, sizeof(udev->rx_buf));
-	if (udev->rx_buf.ret_code) {
-		pr_err("ret_code: %u\n", udev->rx_buf.ret_code);
-		return -EINVAL;
+	memcpy(val, &ucsi->read_buf[offset], val_len);
+	ret = 0;
+
+out_unlock:
+	mutex_unlock(&ucsi->lock);
+
+	return ret;
+}
+
+static int pmic_glink_ucsi_locked_write(struct pmic_glink_ucsi *ucsi, unsigned int offset,
+					const void *val, size_t val_len)
+{
+	struct ucsi_write_buf_req_msg req = {};
+	unsigned long left;
+	int ret;
+
+	req.hdr.owner = PMIC_GLINK_OWNER_USBC;
+	req.hdr.type = MSG_TYPE_REQ_RESP;
+	req.hdr.opcode = UC_UCSI_WRITE_BUF_REQ;
+	memcpy(&req.buf[offset], val, val_len);
+
+	reinit_completion(&ucsi->write_ack);
+
+	ret = pmic_glink_send(ucsi->client, &req, sizeof(req));
+	if (ret < 0) {
+		dev_err(ucsi->dev, "failed to send UCSI write request: %d\n", ret);
+		return ret;
 	}
 
-	pr_debug("read ack\n");
-	atomic_set(&udev->rx_valid, 1);
-	complete(&udev->read_ack);
+	left = wait_for_completion_timeout(&ucsi->write_ack, 5 * HZ);
+	if (!left) {
+		dev_err(ucsi->dev, "timeout waiting for UCSI write response\n");
+		return -ETIMEDOUT;
+	}
 
 	return 0;
 }
 
-static int handle_ucsi_write_ack(struct ucsi_dev *udev, void *data, size_t len)
+static int pmic_glink_ucsi_async_write(struct ucsi *__ucsi, unsigned int offset,
+				       const void *val, size_t val_len)
 {
-	struct ucsi_write_buf_resp_msg *msg_ptr;
+	struct pmic_glink_ucsi *ucsi = ucsi_get_drvdata(__ucsi);
+	int ret;
 
-	if (len != sizeof(*msg_ptr)) {
-		pr_err("Incorrect received length %zu expected %u\n", len,
-			sizeof(*msg_ptr));
-		return -EINVAL;
-	}
+	mutex_lock(&ucsi->lock);
+	ret = pmic_glink_ucsi_locked_write(ucsi, offset, val, val_len);
+	mutex_unlock(&ucsi->lock);
 
-	msg_ptr = data;
-	if (msg_ptr->ret_code) {
-		pr_err("ret_code: %u\n", msg_ptr->ret_code);
-		return -EINVAL;
-	}
-
-	pr_debug("write ack\n");
-	complete(&udev->write_ack);
-
-	return 0;
+	return ret;
 }
 
-static int handle_ucsi_notify(struct ucsi_dev *udev, void *data, size_t len)
+static int pmic_glink_ucsi_sync_write(struct ucsi *__ucsi, unsigned int offset,
+				      const void *val, size_t val_len)
 {
-	struct ucsi_notify_ind_msg *msg_ptr;
-	struct ucsi_connector *con;
+	struct pmic_glink_ucsi *ucsi = ucsi_get_drvdata(__ucsi);
+	unsigned long left;
+	int ret;
+
+	/* TOFIX: Downstream forces recipient to CON when UCSI_GET_ALTERNATE_MODES command */
+
+	mutex_lock(&ucsi->lock);
+	ucsi->sync_val = 0;
+	reinit_completion(&ucsi->sync_ack);
+	ucsi->sync_pending = true;
+	ret = pmic_glink_ucsi_locked_write(ucsi, offset, val, val_len);
+	mutex_unlock(&ucsi->lock);
+
+	left = wait_for_completion_timeout(&ucsi->sync_ack, 5 * HZ);
+	if (!left) {
+		dev_err(ucsi->dev, "timeout waiting for UCSI sync write response\n");
+		/* return 0 here and let core UCSI code handle the CCI_BUSY */
+		ret = 0;
+	} else if (ucsi->sync_val) {
+		dev_err(ucsi->dev, "sync write returned: %d\n", ucsi->sync_val);
+	}
+
+	ucsi->sync_pending = false;
+
+	return ret;
+}
+
+static const struct ucsi_operations pmic_glink_ucsi_ops = {
+	.read = pmic_glink_ucsi_read,
+	.sync_write = pmic_glink_ucsi_sync_write,
+	.async_write = pmic_glink_ucsi_async_write
+};
+
+static void pmic_glink_ucsi_read_ack(struct pmic_glink_ucsi *ucsi, const void *data, int len)
+{
+	const struct ucsi_read_buf_resp_msg *resp = data;
+
+	if (resp->ret_code)
+		return;
+
+	memcpy(ucsi->read_buf, resp->buf, UCSI_BUF_SIZE);
+	complete(&ucsi->read_ack);
+}
+
+static void pmic_glink_ucsi_write_ack(struct pmic_glink_ucsi *ucsi, const void *data, int len)
+{
+	const struct ucsi_write_buf_resp_msg *resp = data;
+
+	if (resp->ret_code)
+		return;
+
+	ucsi->sync_val = resp->ret_code;
+	complete(&ucsi->write_ack);
+}
+
+static void pmic_glink_ucsi_notify(struct work_struct *work)
+{
+	struct pmic_glink_ucsi *ucsi = container_of(work, struct pmic_glink_ucsi, notify_work);
+	unsigned int con_num;
 	u32 cci;
-	u8 con_num;
+	int ret;
 
-	if (len != sizeof(*msg_ptr)) {
-		pr_err("Incorrect received length %zu expected %u\n", len,
-			sizeof(*msg_ptr));
-		return -EINVAL;
-	}
-
-	mutex_lock(&udev->state_lock);
-	if (atomic_read(&udev->state) == PMIC_GLINK_STATE_DOWN) {
-		pr_err("glink state is down\n");
-		mutex_unlock(&udev->state_lock);
-		return -ENOTCONN;
-	}
-
-	if (!udev->ucsi) {
-		pr_err("ucsi is NULL\n");
-		mutex_unlock(&udev->state_lock);
-		return -ENODEV;
-	}
-
-	msg_ptr = data;
-	cci = msg_ptr->notification;
-	ucsi_log("notify:", UCSI_CCI, (u8 *)&cci, sizeof(cci));
-
-	if (test_bit(CMD_PENDING, &udev->flags) &&
-		cci & (UCSI_CCI_ACK_COMPLETE | UCSI_CCI_COMMAND_COMPLETE)) {
-		pr_debug("received ack\n");
-		complete(&udev->sync_write_ack);
+	ret = pmic_glink_ucsi_read(ucsi->ucsi, UCSI_CCI, &cci, sizeof(cci));
+	if (ret) {
+		dev_err(ucsi->dev, "failed to read CCI on notification\n");
+		return;
 	}
 
 	con_num = UCSI_CCI_CONNECTOR(cci);
-	pr_debug("con_num: %u num_connectors: %u\n", con_num,
-		udev->ucsi->cap.num_connectors);
+	if (con_num) {
+		if (con_num <= PMIC_GLINK_MAX_PORTS &&
+		    ucsi->port_orientation[con_num - 1]) {
+			int orientation = gpiod_get_value(ucsi->port_orientation[con_num - 1]);
 
-	if (con_num && con_num <= udev->ucsi->cap.num_connectors &&
-		udev->ucsi->connector) {
-		con = &udev->ucsi->connector[con_num - 1];
-		if (con && con->ucsi)
-			ucsi_connector_change(udev->ucsi, con_num);
+			if (orientation >= 0) {
+				typec_switch_set(ucsi->port_switch[con_num - 1],
+						 orientation ? TYPEC_ORIENTATION_REVERSE
+							     : TYPEC_ORIENTATION_NORMAL);
+			}
+		}
+
+		ucsi_connector_change(ucsi->ucsi, con_num);
 	}
-	mutex_unlock(&udev->state_lock);
 
-	return 0;
+	if (ucsi->sync_pending &&
+		   (cci & (UCSI_CCI_ACK_COMPLETE | UCSI_CCI_COMMAND_COMPLETE))) {
+		complete(&ucsi->sync_ack);
+	}
 }
 
-static int ucsi_callback(void *priv, void *data, size_t len)
+static void pmic_glink_ucsi_register(struct work_struct *work)
 {
-	struct pmic_glink_hdr *hdr = data;
-	struct ucsi_dev *udev = priv;
-	struct remoteproc_ts ts;
+	struct pmic_glink_ucsi *ucsi = container_of(work, struct pmic_glink_ucsi, register_work);
+	unsigned long flags;
+	bool pd_running;
+	int orientation;
+	int i;
 
-	get_remoteproc_timestamp(&ts);
+	for (i = 0; i < PMIC_GLINK_MAX_PORTS; i++) {
+		if (!ucsi->port_orientation[i])
+			continue;
+		orientation = gpiod_get_value(ucsi->port_orientation[i]);
 
-	ucsi_dbg("owner: %u type: %u opcode: %u len:%zu (%02u:%02u:%02u.%06u)\n", hdr->owner,
-		hdr->type, hdr->opcode, len, ts.hh, ts.mm, ts.ss, ts.dec);
-
-	if (hdr->opcode == UC_UCSI_READ_BUF_REQ)
-		handle_ucsi_read_ack(udev, data, len);
-	else if (hdr->opcode == UC_UCSI_WRITE_BUF_REQ)
-		handle_ucsi_write_ack(udev, data, len);
-	else if (hdr->opcode == UC_UCSI_USBC_NOTIFY_IND)
-		handle_ucsi_notify(udev, data, len);
-	else
-		pr_err("Unknown message opcode: %d\n", hdr->opcode);
-
-	return 0;
-}
-
-static bool validate_ucsi_msg(unsigned int offset, size_t len)
-{
-	pr_debug("offset %u len %u\n", offset, len);
-
-	if (offset > UCSI_BUF_SIZE - 1 || len > UCSI_BUF_SIZE ||
-		offset + len > UCSI_BUF_SIZE) {
-		pr_err("Incorrect length %zu or offset %u\n", len, offset);
-		return false;
-	}
-
-	return true;
-}
-
-#define CONN_STAT_REQD	1
-static int ucsi_qti_glink_write(struct ucsi_dev *udev, unsigned int offset,
-			       const void *val, size_t val_len, bool sync)
-{
-	struct ucsi_write_buf_req_msg ucsi_buf = { { 0 } };
-	int rc;
-
-	if (!validate_ucsi_msg(offset, val_len))
-		return -EINVAL;
-
-	if (atomic_read(&udev->state) == PMIC_GLINK_STATE_DOWN)
-		return 0;
-
-	ucsi_buf.hdr.owner = MSG_OWNER_UC;
-	ucsi_buf.hdr.type = MSG_TYPE_REQ_RESP;
-	ucsi_buf.hdr.opcode = UC_UCSI_WRITE_BUF_REQ;
-	memcpy(&ucsi_buf.buf[offset], val, val_len);
-
-	mutex_lock(&udev->write_lock);
-	pr_debug("%s write\n", sync ? "sync" : "async");
-	reinit_completion(&udev->write_ack);
-
-	if (sync) {
-		set_bit(CMD_PENDING, &udev->flags);
-		reinit_completion(&udev->sync_write_ack);
-	}
-
-	ucsi_log(sync ? "sync_write:" : "async_write:", offset,
-			(u8 *)val, val_len);
-
-	rc = pmic_glink_write(udev->client, &ucsi_buf,
-					sizeof(ucsi_buf));
-	if (rc < 0) {
-		pr_err("Error in sending message rc=%d\n", rc);
-		goto out;
-	}
-
-	rc = wait_for_completion_timeout(&udev->write_ack,
-				msecs_to_jiffies(UCSI_WAIT_TIME_MS));
-	if (!rc) {
-		pr_err("timed out\n");
-		rc = -ETIMEDOUT;
-		goto out;
-	} else {
-		rc = 0;
-	}
-
-	if (sync) {
-		rc = wait_for_completion_timeout(&udev->sync_write_ack,
-					msecs_to_jiffies(UCSI_WAIT_TIME_MS));
-		if (!rc) {
-			pr_err("timed out for sync_write_ack\n");
-			rc = -ETIMEDOUT;
-			goto out;
-		} else {
-			rc = 0;
+		if (orientation >= 0) {
+			typec_switch_set(ucsi->port_switch[i],
+					 orientation ? TYPEC_ORIENTATION_REVERSE
+					     : TYPEC_ORIENTATION_NORMAL);
 		}
 	}
 
-	if (((u8 *)val)[0] == UCSI_GET_CONNECTOR_STATUS) {
-		mutex_lock(&udev->notify_lock);
-		set_bit(CONN_STAT_REQD, &udev->cmd_requested_flags);
-		mutex_unlock(&udev->notify_lock);
-	}
+	spin_lock_irqsave(&ucsi->state_lock, flags);
+	pd_running = ucsi->pd_running;
+	spin_unlock_irqrestore(&ucsi->state_lock, flags);
 
-out:
-	if (sync)
-		clear_bit(CMD_PENDING, &udev->flags);
-
-	mutex_unlock(&udev->write_lock);
-	return rc;
-}
-
-static int ucsi_qti_async_write(struct ucsi *ucsi, unsigned int offset,
-			       const void *val, size_t val_len)
-{
-	struct ucsi_dev *udev = ucsi_get_drvdata(ucsi);
-
-	return ucsi_qti_glink_write(udev, offset, val, val_len, false);
-}
-
-
-static int ucsi_qti_sync_write(struct ucsi *ucsi, unsigned int offset,
-			       const void *val, size_t val_len)
-{
-	struct ucsi_dev *udev = ucsi_get_drvdata(ucsi);
-
-	return ucsi_qti_glink_write(udev, offset, val, val_len, true);
-}
-
-static void ucsi_qti_clean_notification(struct ucsi_dev *udev)
-{
-	struct constat_info_entry *entry, *tmp;
-
-	mutex_lock(&udev->notify_lock);
-	list_for_each_entry_safe(entry, tmp, &udev->constat_info_list, node) {
-		list_del(&entry->node);
-		kfree(entry);
-	}
-	INIT_LIST_HEAD(&udev->constat_info_list);
-	mutex_unlock(&udev->notify_lock);
-}
-
-static void ucsi_qti_notify_work(struct work_struct *work)
-{
-	struct ucsi_dev *udev = container_of(work, struct ucsi_dev,
-			notify_work);
-	struct constat_info_entry *entry;
-
-	mutex_lock(&udev->notify_lock);
-	while (!list_empty(&udev->constat_info_list)) {
-		entry = list_first_entry(&udev->constat_info_list,
-					struct constat_info_entry, node);
-		list_del(&entry->node);
-		mutex_unlock(&udev->notify_lock);
-		pr_debug("acc: %d usb: %d alt_mode: %d change: %d connect: %d\n",
-			entry->constat_info.acc,
-			entry->constat_info.partner_usb,
-			entry->constat_info.partner_alternate_mode,
-			entry->constat_info.partner_change,
-			entry->constat_info.connect);
-		raw_notifier_call_chain(&ucsi_glink_notifier,
-					0, &entry->constat_info);
-		kfree(entry);
-		mutex_lock(&udev->notify_lock);
-	}
-	mutex_unlock(&udev->notify_lock);
-}
-
-static void ucsi_qti_notify(struct ucsi_dev *udev, unsigned int offset,
-			    struct ucsi_connector_status *status, size_t len)
-{
-	u8 conn_partner_type, conn_partner_flag;
-	bool cmd_requested;
-	struct constat_info_entry *entry;
-
-	if (len != sizeof(*status))
-		return;
-
-	mutex_lock(&udev->notify_lock);
-	cmd_requested = test_bit(CONN_STAT_REQD, &udev->cmd_requested_flags);
-	mutex_unlock(&udev->notify_lock);
-
-	if (cmd_requested && offset == UCSI_MESSAGE_IN) {
-		entry = kzalloc(sizeof(*entry), GFP_KERNEL);
-		if (!entry)
-			return;
-
-		INIT_LIST_HEAD(&entry->node);
-		entry->constat_info.partner_usb = false;
-		entry->constat_info.partner_alternate_mode = false;
-
-		entry->constat_info.partner_change =
-				status->change & UCSI_CONSTAT_PARTNER_CHANGE;
-
-		entry->constat_info.connect =
-				status->flags & UCSI_CONSTAT_CONNECTED;
-
-		conn_partner_type = UCSI_CONSTAT_PARTNER_TYPE(status->flags);
-
-		switch (conn_partner_type) {
-		case UCSI_CONSTAT_PARTNER_TYPE_AUDIO:
-			entry->constat_info.acc = TYPEC_ACCESSORY_AUDIO;
-			break;
-		case UCSI_CONSTAT_PARTNER_TYPE_DEBUG:
-			entry->constat_info.acc = TYPEC_ACCESSORY_DEBUG;
-			break;
-		case UCSI_CONSTAT_PARTNER_TYPE_UFP:
-		case UCSI_CONSTAT_PARTNER_TYPE_CABLE:
-		case UCSI_CONSTAT_PARTNER_TYPE_CABLE_AND_UFP:
-		case UCSI_CONSTAT_PARTNER_TYPE_DFP:
-			entry->constat_info.partner_usb = true;
-			/* fallthrough */
-		default:
-			entry->constat_info.acc = TYPEC_ACCESSORY_NONE;
-			break;
-		}
-
-		conn_partner_flag = UCSI_CONSTAT_PARTNER_FLAGS(status->flags);
-		if (conn_partner_flag & UCSI_CONSTAT_PARTNER_FLAG_USB)
-			entry->constat_info.partner_usb = true;
-
-		if (conn_partner_flag & UCSI_CONSTAT_PARTNER_FLAG_ALT_MODE)
-			entry->constat_info.partner_alternate_mode = true;
-
-		mutex_lock(&udev->notify_lock);
-		list_add_tail(&entry->node, &udev->constat_info_list);
-		clear_bit(CONN_STAT_REQD, &udev->cmd_requested_flags);
-		mutex_unlock(&udev->notify_lock);
-
-		schedule_work(&udev->notify_work);
+	if (!ucsi->ucsi_registered && pd_running) {
+		ucsi_register(ucsi->ucsi);
+		ucsi->ucsi_registered = true;
+	} else if (ucsi->ucsi_registered && !pd_running) {
+		ucsi_unregister(ucsi->ucsi);
+		ucsi->ucsi_registered = false;
 	}
 }
 
-static int ucsi_qti_read(struct ucsi *ucsi, unsigned int offset,
-			       void *val, size_t val_len)
+static void pmic_glink_ucsi_callback(const void *data, size_t len, void *priv)
 {
-	struct ucsi_dev *udev = ucsi_get_drvdata(ucsi);
-	struct ucsi_read_buf_req_msg ucsi_buf = { { 0 } };
-	int rc;
+	struct pmic_glink_ucsi *ucsi = priv;
+	const struct pmic_glink_hdr *hdr = data;
 
-	if (!validate_ucsi_msg(offset, val_len))
-		return -EINVAL;
-
-	if (atomic_read(&udev->state) == PMIC_GLINK_STATE_DOWN)
-		return 0;
-
-	ucsi_buf.hdr.owner = MSG_OWNER_UC;
-	ucsi_buf.hdr.type = MSG_TYPE_REQ_RESP;
-	ucsi_buf.hdr.opcode = UC_UCSI_READ_BUF_REQ;
-
-	mutex_lock(&udev->read_lock);
-
-	pr_debug("read offset %s len %u\n", offset_to_name(offset), val_len);
-	reinit_completion(&udev->read_ack);
-	rc = pmic_glink_write(udev->client, &ucsi_buf,
-					sizeof(ucsi_buf));
-	if (rc < 0) {
-		pr_err("Error in sending message rc=%d\n", rc);
-		goto out;
-	}
-
-	rc = wait_for_completion_timeout(&udev->read_ack,
-				msecs_to_jiffies(UCSI_WAIT_TIME_MS));
-	if (!rc) {
-		pr_err("timed out\n");
-		rc = -ETIMEDOUT;
-		goto out;
-	} else {
-		rc = 0;
-	}
-
-	if (!atomic_read(&udev->rx_valid)) {
-		rc = -ENODATA;
-		goto out;
-	}
-
-	memcpy((u8 *)val, &udev->rx_buf.buf[offset], val_len);
-	atomic_set(&udev->rx_valid, 0);
-	ucsi_log("read:", offset, (u8 *)val, val_len);
-	ucsi_qti_notify(udev, offset, val, val_len);
-
-out:
-	mutex_unlock(&udev->read_lock);
-
-	return rc;
-}
-
-static const struct ucsi_operations ucsi_qti_ops = {
-	.read = ucsi_qti_read,
-	.sync_write = ucsi_qti_sync_write,
-	.async_write = ucsi_qti_async_write
-};
-
-static int ucsi_setup(struct ucsi_dev *udev)
-{
-	int rc;
-
-	if (udev->ucsi) {
-		dev_err(udev->dev, "ucsi is not NULL\n");
-		return -EINVAL;
-	}
-
-	mutex_lock(&udev->state_lock);
-	udev->ucsi = ucsi_create(udev->dev, &ucsi_qti_ops);
-	if (IS_ERR(udev->ucsi)) {
-		rc = PTR_ERR(udev->ucsi);
-		dev_err(udev->dev, "ucsi_create failed rc=%d\n", rc);
-		udev->ucsi = NULL;
-		mutex_unlock(&udev->state_lock);
-		return rc;
-	}
-
-	ucsi_set_drvdata(udev->ucsi, udev);
-
-	rc = ucsi_register(udev->ucsi);
-	if (rc) {
-		dev_err(udev->dev, "ucsi_register failed rc=%d\n", rc);
-		ucsi_destroy(udev->ucsi);
-		udev->ucsi = NULL;
-		mutex_unlock(&udev->state_lock);
-		return rc;
-	}
-
-	mutex_unlock(&udev->state_lock);
-	return 0;
-}
-
-static void ucsi_qti_setup_work(struct work_struct *work)
-{
-	struct ucsi_dev *udev = container_of(work, struct ucsi_dev,
-			setup_work);
-
-	ucsi_setup(udev);
-}
-
-static void ucsi_qti_state_cb(void *priv, enum pmic_glink_state state)
-{
-	struct ucsi_dev *udev = priv;
-
-	dev_dbg(udev->dev, "state: %d\n", state);
-
-	mutex_lock(&udev->state_lock);
-	atomic_set(&udev->state, state);
-
-	switch (state) {
-	case PMIC_GLINK_STATE_DOWN:
-		if (!udev->ucsi) {
-			dev_dbg(udev->dev, "ucsi is NULL\n");
-			mutex_unlock(&udev->state_lock);
-			return;
-		}
-
-		ucsi_qti_clean_notification(udev);
-		ucsi_unregister(udev->ucsi);
-		ucsi_destroy(udev->ucsi);
-		udev->ucsi = NULL;
+	switch (le32_to_cpu(hdr->opcode)) {
+	case UC_UCSI_READ_BUF_REQ:
+		pmic_glink_ucsi_read_ack(ucsi, data, len);
 		break;
-	case PMIC_GLINK_STATE_UP:
-		schedule_work(&udev->setup_work);
+	case UC_UCSI_WRITE_BUF_REQ:
+		pmic_glink_ucsi_write_ack(ucsi, data, len);
 		break;
-	default:
+	case UC_UCSI_USBC_NOTIFY_IND:
+		schedule_work(&ucsi->notify_work);
 		break;
-	}
-	mutex_unlock(&udev->state_lock);
+	};
 }
 
-static int ucsi_probe(struct platform_device *pdev)
+static void pmic_glink_ucsi_pdr_notify(void *priv, int state)
 {
-	struct device *dev = &pdev->dev;
-	struct pmic_glink_client_data client_data;
-	struct ucsi_dev *udev;
-	int rc;
+	struct pmic_glink_ucsi *ucsi = priv;
+	unsigned long flags;
 
-	udev = devm_kzalloc(dev, sizeof(*udev), GFP_KERNEL);
-	if (!udev)
+	spin_lock_irqsave(&ucsi->state_lock, flags);
+	ucsi->pd_running = (state == SERVREG_SERVICE_STATE_UP);
+	spin_unlock_irqrestore(&ucsi->state_lock, flags);
+	schedule_work(&ucsi->register_work);
+}
+
+static void pmic_glink_ucsi_destroy(void *data)
+{
+	struct pmic_glink_ucsi *ucsi = data;
+
+	/* Protect to make sure we're not in a middle of a transaction from a glink callback */
+	mutex_lock(&ucsi->lock);
+	ucsi_destroy(ucsi->ucsi);
+	mutex_unlock(&ucsi->lock);
+}
+
+static int pmic_glink_ucsi_probe(struct auxiliary_device *adev,
+				 const struct auxiliary_device_id *id)
+{
+	struct pmic_glink_ucsi *ucsi;
+	struct device *dev = &adev->dev;
+	struct fwnode_handle *fwnode;
+	int ret;
+
+	ucsi = devm_kzalloc(dev, sizeof(*ucsi), GFP_KERNEL);
+	if (!ucsi)
 		return -ENOMEM;
 
-	INIT_LIST_HEAD(&udev->constat_info_list);
-	INIT_WORK(&udev->notify_work, ucsi_qti_notify_work);
-	INIT_WORK(&udev->setup_work, ucsi_qti_setup_work);
-	mutex_init(&udev->read_lock);
-	mutex_init(&udev->write_lock);
-	mutex_init(&udev->notify_lock);
-	mutex_init(&udev->state_lock);
-	init_completion(&udev->read_ack);
-	init_completion(&udev->write_ack);
-	init_completion(&udev->sync_write_ack);
-	atomic_set(&udev->rx_valid, 0);
-	atomic_set(&udev->state, PMIC_GLINK_STATE_UP);
+	ucsi->dev = dev;
+	dev_set_drvdata(dev, ucsi);
 
-	client_data.id = MSG_OWNER_UC;
-	client_data.name = "ucsi";
-	client_data.msg_cb = ucsi_callback;
-	client_data.priv = udev;
-	client_data.state_cb = ucsi_qti_state_cb;
+	INIT_WORK(&ucsi->notify_work, pmic_glink_ucsi_notify);
+	INIT_WORK(&ucsi->register_work, pmic_glink_ucsi_register);
+	init_completion(&ucsi->read_ack);
+	init_completion(&ucsi->write_ack);
+	init_completion(&ucsi->sync_ack);
+	spin_lock_init(&ucsi->state_lock);
+	mutex_init(&ucsi->lock);
 
-	udev->client = pmic_glink_register_client(dev, &client_data);
-	if (IS_ERR(udev->client)) {
-		rc = PTR_ERR(udev->client);
-		if (rc != -EPROBE_DEFER)
-			dev_err(dev, "Error in registering with pmic_glink rc=%d\n",
-				rc);
-		return rc;
+	ucsi->ucsi = ucsi_create(dev, &pmic_glink_ucsi_ops);
+	if (IS_ERR(ucsi->ucsi))
+		return PTR_ERR(ucsi->ucsi);
+
+	/* Make sure we destroy *after* pmic_glink unregister */
+	ret = devm_add_action_or_reset(dev, pmic_glink_ucsi_destroy, ucsi);
+	if (ret)
+		return ret;
+
+	ucsi_set_drvdata(ucsi->ucsi, ucsi);
+
+	device_for_each_child_node(dev, fwnode) {
+		struct gpio_desc *desc;
+		u32 port;
+
+		ret = fwnode_property_read_u32(fwnode, "reg", &port);
+		if (ret < 0) {
+			dev_err(dev, "missing reg property of %pOFn\n", fwnode);
+			fwnode_handle_put(fwnode);
+			return ret;
+		}
+
+		if (port >= PMIC_GLINK_MAX_PORTS) {
+			dev_warn(dev, "invalid connector number, ignoring\n");
+			continue;
+		}
+
+		desc = devm_gpiod_get_index_optional(&adev->dev, "orientation", port, GPIOD_IN);
+
+		/* If GPIO isn't found, continue */
+		if (!desc)
+			continue;
+
+		if (IS_ERR(desc)) {
+			fwnode_handle_put(fwnode);
+			return dev_err_probe(dev, PTR_ERR(desc),
+					     "unable to acquire orientation gpio\n");
+		}
+		ucsi->port_orientation[port] = desc;
+
+		ucsi->port_switch[port] = fwnode_typec_switch_get(fwnode);
+		if (IS_ERR(ucsi->port_switch[port]))
+			return dev_err_probe(dev, PTR_ERR(ucsi->port_switch[port]),
+					"failed to acquire orientation-switch\n");
 	}
 
-	platform_set_drvdata(pdev, udev);
-	udev->dev = dev;
+	ucsi->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_USBC,
+						    pmic_glink_ucsi_callback,
+						    pmic_glink_ucsi_pdr_notify,
+						    ucsi);
+	if (IS_ERR(ucsi->client))
+		return PTR_ERR(ucsi->client);
 
-	ucsi_ipc_log = ipc_log_context_create(NUM_LOG_PAGES, "ucsi", 0);
-	if (!ucsi_ipc_log)
-		dev_warn(dev, "Error in creating ipc_log_context\n");
+	pmic_glink_client_register(ucsi->client);
 
-	rc = ucsi_setup(udev);
-	if (rc) {
-		ipc_log_context_destroy(ucsi_ipc_log);
-		ucsi_ipc_log = NULL;
-		pmic_glink_unregister_client(udev->client);
-	}
-
-	return rc;
+	return 0;
 }
 
-static int ucsi_remove(struct platform_device *pdev)
+static void pmic_glink_ucsi_remove(struct auxiliary_device *adev)
 {
-	struct device *dev = &pdev->dev;
-	struct ucsi_dev *udev = dev_get_drvdata(dev);
-	int rc;
+	struct pmic_glink_ucsi *ucsi = dev_get_drvdata(&adev->dev);
 
-	ucsi_qti_clean_notification(udev);
-	cancel_work_sync(&udev->notify_work);
-	ucsi_unregister(udev->ucsi);
-	ucsi_destroy(udev->ucsi);
-
-	rc = pmic_glink_unregister_client(udev->client);
-	if (rc < 0)
-		dev_err(dev, "pmic_glink_unregister_client failed rc=%d\n",
-			rc);
-
-	ipc_log_context_destroy(ucsi_ipc_log);
-	ucsi_ipc_log = NULL;
-
-	return rc;
+	/* Unregister first to stop having read & writes */
+	ucsi_unregister(ucsi->ucsi);
 }
 
-static const struct of_device_id ucsi_match_table[] = {
-	{.compatible = "qcom,ucsi-glink"},
+static const struct auxiliary_device_id pmic_glink_ucsi_id_table[] = {
+	{ .name = "pmic_glink.ucsi", },
 	{},
 };
+MODULE_DEVICE_TABLE(auxiliary, pmic_glink_ucsi_id_table);
 
-static struct platform_driver ucsi_driver = {
-	.driver	= {
-		.name = "ucsi_glink",
-		.of_match_table = ucsi_match_table,
-	},
-	.probe	= ucsi_probe,
-	.remove	= ucsi_remove,
+static struct auxiliary_driver pmic_glink_ucsi_driver = {
+	.name = "pmic_glink_ucsi",
+	.probe = pmic_glink_ucsi_probe,
+	.remove = pmic_glink_ucsi_remove,
+	.id_table = pmic_glink_ucsi_id_table,
 };
 
-module_platform_driver(ucsi_driver);
+module_auxiliary_driver(pmic_glink_ucsi_driver);
 
-MODULE_DESCRIPTION("QTI UCSI Glink driver");
-MODULE_LICENSE("GPL v2");
+MODULE_DESCRIPTION("Qualcomm PMIC GLINK UCSI driver");
+MODULE_LICENSE("GPL");

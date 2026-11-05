@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2018-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2018-2019, 2021, The Linux Foundation. All rights reserved.
  */
 
 #include <linux/clk-provider.h>
@@ -18,7 +18,7 @@
 #define RESET_MAX	100
 
 static int dummy_clk_set_rate(struct clk_hw *hw, unsigned long rate,
-					unsigned long parent_rate)
+			      unsigned long parent_rate)
 {
 	struct clk_dummy *dummy = to_clk_dummy(hw);
 
@@ -30,18 +30,18 @@ static int dummy_clk_set_rate(struct clk_hw *hw, unsigned long rate,
 }
 
 static long dummy_clk_round_rate(struct clk_hw *hw, unsigned long rate,
-					unsigned long *parent_rate)
+				  unsigned long *parent_rate)
 {
 	return rate;
 }
 
 static unsigned long dummy_clk_recalc_rate(struct clk_hw *hw,
-		unsigned long parent_rate)
+					    unsigned long parent_rate)
 {
 	struct clk_dummy *dummy = to_clk_dummy(hw);
 
 	pr_debug("%s: returning a clock rate of %lu\n",
-				__func__, dummy->rrate);
+		 __func__, dummy->rrate);
 
 	return dummy->rrate;
 }
@@ -55,18 +55,18 @@ const struct clk_ops clk_dummy_ops = {
 EXPORT_SYMBOL(clk_dummy_ops);
 
 static int dummy_reset_assert(struct reset_controller_dev *rcdev,
-				unsigned long id)
+			       unsigned long id)
 {
 	return 0;
 }
 
 static int dummy_reset_deassert(struct reset_controller_dev *rcdev,
-				unsigned long id)
+				 unsigned long id)
 {
 	return 0;
 }
 
-static struct reset_control_ops dummy_reset_ops = {
+const struct reset_control_ops dummy_reset_ops = {
 	.assert         = dummy_reset_assert,
 	.deassert       = dummy_reset_deassert,
 };
@@ -80,7 +80,7 @@ static struct reset_control_ops dummy_reset_ops = {
  * @node: device node
  */
 static struct clk *clk_register_dummy(struct device *dev, const char *name,
-		unsigned long flags, struct device_node *node)
+				       unsigned long flags, struct device_node *node)
 {
 	struct clk_dummy *dummy;
 	struct clk *clk;
@@ -109,8 +109,7 @@ static struct clk *clk_register_dummy(struct device *dev, const char *name,
 	if (devm_reset_controller_register(dev, &dummy->reset))
 		pr_err("Failed to register reset controller for %s\n", name);
 	else
-		pr_info("Successfully registered dummy reset controller for %s\n",
-								name);
+		pr_info("Successfully registered dummy reset controller for %s\n", name);
 
 	return clk;
 }
@@ -132,12 +131,12 @@ static int dummy_clk_probe(struct platform_device *pdev)
 	} else {
 		ret = PTR_ERR(clk);
 		pr_err("Failed to register dummy clock controller for %s, ret=%d\n",
-								clk_name, ret);
+		       clk_name, ret);
 		return ret;
 	}
 
 	dev_info(&pdev->dev, "Successfully registered dummy clock controller for %s\n",
-								clk_name);
+		 clk_name);
 	return 0;
 }
 
@@ -176,4 +175,4 @@ static void __exit dummy_clk_exit(void)
 module_exit(dummy_clk_exit);
 
 MODULE_DESCRIPTION("QTI Dummy Clock Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (c) 2013-2015, 2017-2020, The Linux Foundation. All rights reserved.
+/*
+ * Copyright (c) 2013-2015, 2017-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef HEAP_MEM_EXT_SERVICE_01_H

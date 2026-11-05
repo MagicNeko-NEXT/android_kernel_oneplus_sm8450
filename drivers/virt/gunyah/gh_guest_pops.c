@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -10,24 +11,31 @@
 #include <linux/delay.h>
 #include <linux/input.h>
 #include <linux/notifier.h>
+#include <linux/pm_wakeup.h>
+#include <linux/reboot.h>
 
-#include <linux/gunyah/gh_vm.h>
 #include <linux/gunyah/gh_rm_drv.h>
 
 #define GH_GUEST_POPS_POFF_BUTTON_HOLD_SHUTDOWN_DELAY_MS	1000
 #define GH_GUEST_POPS_POFF_BUTTON_HOLD_RESTART_DELAY_MS		500
 
+#define GH_GUEST_POPS_POFF_TIMEOUT_MS 5000
+
 static struct input_dev *gh_vm_poff_input;
 static struct notifier_block rm_nb;
 
-static struct kobj_type gh_guest_kobj_type = {
+static const struct kobj_type gh_guest_kobj_type = {
 	.sysfs_ops = &kobj_sysfs_ops,
 };
 static struct kobject gh_guest_kobj;
 
+static struct wakeup_source *ws;
+
 static int gh_guest_pops_handle_stop_shutdown(u32 stop_reason)
 {
 	/* Emulate a KEY_POWER event to notify user-space of a shutdown */
+	__pm_stay_awake(ws);
+
 	pr_info("Sending KEY_POWER event\n");
 
 	input_report_key(gh_vm_poff_input, KEY_POWER, 1);
@@ -44,6 +52,24 @@ static int gh_guest_pops_handle_stop_shutdown(u32 stop_reason)
 
 	input_report_key(gh_vm_poff_input, KEY_POWER, 0);
 	input_sync(gh_vm_poff_input);
+
+	/*
+	 * VM should shutdown of reboot in normal case
+	 * if not kernel shutdown or reboot will trigger after timeout
+	 */
+
+	msleep(GH_GUEST_POPS_POFF_TIMEOUT_MS);
+	pr_err("POPS VM shutdown timeout, trigger kernel shutdown!\n");
+	switch (stop_reason) {
+	case GH_VM_STOP_SHUTDOWN:
+		kernel_power_off();
+		break;
+	case GH_VM_STOP_RESTART:
+		kernel_restart(NULL);
+		break;
+	}
+
+	__pm_relax(ws);
 
 	return 0;
 }
@@ -64,7 +90,7 @@ gh_guest_pops_vm_shutdown(struct gh_rm_notif_vm_shutdown_payload *vm_shutdown)
 		return gh_guest_pops_handle_stop_crash();
 	case GH_VM_STOP_RESTART:
 		return gh_guest_pops_handle_stop_shutdown(vm_shutdown->stop_reason);
-	};
+	}
 
 	return 0;
 }
@@ -80,7 +106,7 @@ static int gh_guest_pops_rm_notifer_fn(struct notifier_block *nb,
 	return NOTIFY_DONE;
 }
 
-static int __init gh_guest_pops_init_poff(void)
+static int gh_guest_pops_init_poff(void)
 {
 	int ret;
 
@@ -91,19 +117,29 @@ static int __init gh_guest_pops_init_poff(void)
 	input_set_capability(gh_vm_poff_input, EV_KEY, KEY_POWER);
 
 	ret = input_register_device(gh_vm_poff_input);
-	if (ret) {
-		input_free_device(gh_vm_poff_input);
-		return ret;
-	}
+	if (ret)
+		goto fail_register;
 
 	rm_nb.notifier_call = gh_guest_pops_rm_notifer_fn;
 	ret = gh_rm_register_notifier(&rm_nb);
-	if (ret) {
-		input_unregister_device(gh_vm_poff_input);
-		return ret;
+	if (ret)
+		goto fail_init;
+
+	ws = wakeup_source_register(NULL, "gh_guest_pops_ws");
+	if (!ws) {
+		ret = -ENOMEM;
+		goto fail_ws;
 	}
 
 	return 0;
+
+fail_ws:
+	gh_rm_unregister_notifier(&rm_nb);
+fail_init:
+	input_unregister_device(gh_vm_poff_input);
+fail_register:
+	input_free_device(gh_vm_poff_input);
+	return ret;
 }
 
 static ssize_t gh_guest_set_app_status(struct kobject *kobj,
@@ -185,9 +221,10 @@ static void gh_guest_pops_exit_poff(void)
 	gh_rm_unregister_notifier(&rm_nb);
 
 	input_unregister_device(gh_vm_poff_input);
+	input_free_device(gh_vm_poff_input);
 }
 
-static int __init gh_guest_pops_init(void)
+int gh_guest_pops_init(void)
 {
 	int ret;
 
@@ -213,13 +250,11 @@ static int __init gh_guest_pops_init(void)
 
 	return 0;
 }
-module_init(gh_guest_pops_init);
 
-static void __exit gh_guest_pops_exit(void)
+void gh_guest_pops_remove(void)
 {
 	gh_guest_pops_exit_poff();
 	gh_guest_sysfs_cleanup();
 }
-module_exit(gh_guest_pops_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

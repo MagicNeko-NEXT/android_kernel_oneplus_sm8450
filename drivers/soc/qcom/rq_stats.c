@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2010-2015, 2017, 2019, 2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2010-2015, 2017, 2019-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/init.h>
@@ -54,7 +55,7 @@ static ssize_t show_def_timer_ms(struct kobject *kobj,
 	do_div(diff, 1000 * 1000);
 	udiff = (unsigned int) diff;
 
-	return snprintf(buf, MAX_LONG_SIZE, "%u\n", udiff);
+	return scnprintf(buf, MAX_LONG_SIZE, "%u\n", udiff);
 }
 
 static ssize_t store_def_timer_ms(struct kobject *kobj,
@@ -122,11 +123,12 @@ static int __init msm_rq_stats_init(void)
 	rq_info.def_timer_last_jiffy = 0;
 	ret = init_rq_attribs();
 
-	register_trace_android_vh_jiffies_update(wakeup_user, NULL);
+	if (ret == 0)
+		register_trace_android_vh_jiffies_update(wakeup_user, NULL);
 
 	return ret;
 }
 late_initcall(msm_rq_stats_init);
 
 MODULE_DESCRIPTION("QCOM Run Queue Stats");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

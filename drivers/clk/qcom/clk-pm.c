@@ -17,21 +17,8 @@
 /* Restores the clocks configuration while coming out of Hibernation */
 static int clock_pm_restore_early(struct device *dev)
 {
-	if (pm_runtime_enabled(dev)) {
-		int ret;
-
-		ret = pm_runtime_get_sync(dev);
-		if (ret < 0)
-			return ret;
-
-		clk_restore_context();
-	}
-
+	clk_restore_context();
 	clk_restore_critical_clocks(dev);
-
-	if (pm_runtime_enabled(dev))
-		pm_runtime_put_sync(dev);
-
 	return 0;
 }
 

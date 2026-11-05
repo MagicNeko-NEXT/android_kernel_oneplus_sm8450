@@ -5,10 +5,10 @@
 #include <linux/file.h>
 
 #ifdef CONFIG_MEMFD_CREATE
-extern long memfd_fcntl(struct file *file, unsigned int cmd, unsigned long arg);
+extern long memfd_fcntl(struct file *file, unsigned int cmd, unsigned int arg);
 unsigned int *memfd_file_seals_ptr(struct file *file);
 #else
-static inline long memfd_fcntl(struct file *f, unsigned int c, unsigned long a)
+static inline long memfd_fcntl(struct file *f, unsigned int c, unsigned int a)
 {
 	return -EINVAL;
 }

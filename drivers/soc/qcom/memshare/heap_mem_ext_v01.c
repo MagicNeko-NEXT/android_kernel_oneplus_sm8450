@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2013-2015, 2017-2020, The Linux Foundation. All rights reserved.
+/*
+ * Copyright (c) 2013-2015, 2017-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/module.h>
@@ -33,7 +35,7 @@ struct qmi_elem_info dhms_mem_alloc_addr_info_type_v01_ei[] = {
 		.tlv_type       = QMI_COMMON_TLV_TYPE,
 	},
 };
-EXPORT_SYMBOL(dhms_mem_alloc_addr_info_type_v01_ei);
+EXPORT_SYMBOL_GPL(dhms_mem_alloc_addr_info_type_v01_ei);
 
 struct qmi_elem_info mem_alloc_generic_req_msg_data_v01_ei[] = {
 	{
@@ -114,7 +116,7 @@ struct qmi_elem_info mem_alloc_generic_req_msg_data_v01_ei[] = {
 		.tlv_type       = QMI_COMMON_TLV_TYPE,
 	},
 };
-EXPORT_SYMBOL(mem_alloc_generic_req_msg_data_v01_ei);
+EXPORT_SYMBOL_GPL(mem_alloc_generic_req_msg_data_v01_ei);
 
 struct qmi_elem_info mem_alloc_generic_resp_msg_data_v01_ei[] = {
 	{
@@ -186,7 +188,7 @@ struct qmi_elem_info mem_alloc_generic_resp_msg_data_v01_ei[] = {
 		.tlv_type       = QMI_COMMON_TLV_TYPE,
 	},
 };
-EXPORT_SYMBOL(mem_alloc_generic_resp_msg_data_v01_ei);
+EXPORT_SYMBOL_GPL(mem_alloc_generic_resp_msg_data_v01_ei);
 
 struct qmi_elem_info mem_free_generic_req_msg_data_v01_ei[] = {
 	{
@@ -251,7 +253,7 @@ struct qmi_elem_info mem_free_generic_req_msg_data_v01_ei[] = {
 		.tlv_type       = QMI_COMMON_TLV_TYPE,
 	},
 };
-EXPORT_SYMBOL(mem_free_generic_req_msg_data_v01_ei);
+EXPORT_SYMBOL_GPL(mem_free_generic_req_msg_data_v01_ei);
 
 struct qmi_elem_info mem_free_generic_resp_msg_data_v01_ei[] = {
 	{
@@ -271,7 +273,7 @@ struct qmi_elem_info mem_free_generic_resp_msg_data_v01_ei[] = {
 		.tlv_type       = QMI_COMMON_TLV_TYPE,
 	},
 };
-EXPORT_SYMBOL(mem_free_generic_resp_msg_data_v01_ei);
+EXPORT_SYMBOL_GPL(mem_free_generic_resp_msg_data_v01_ei);
 
 struct qmi_elem_info mem_query_size_req_msg_data_v01_ei[] = {
 	{
@@ -307,7 +309,7 @@ struct qmi_elem_info mem_query_size_req_msg_data_v01_ei[] = {
 		.tlv_type       = QMI_COMMON_TLV_TYPE,
 	},
 };
-EXPORT_SYMBOL(mem_query_size_req_msg_data_v01_ei);
+EXPORT_SYMBOL_GPL(mem_query_size_req_msg_data_v01_ei);
 
 struct qmi_elem_info mem_query_size_resp_msg_data_v01_ei[] = {
 	{
@@ -345,6 +347,6 @@ struct qmi_elem_info mem_query_size_resp_msg_data_v01_ei[] = {
 		.tlv_type       = QMI_COMMON_TLV_TYPE,
 	},
 };
-EXPORT_SYMBOL(mem_query_size_resp_msg_data_v01_ei);
+EXPORT_SYMBOL_GPL(mem_query_size_resp_msg_data_v01_ei);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

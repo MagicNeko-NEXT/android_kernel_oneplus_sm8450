@@ -5,10 +5,10 @@
 
 #define pr_fmt(fmt)	"eusb2_phy: %s: " fmt, __func__
 
-#include <linux/err.h>
 #include <linux/clk.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/err.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
@@ -16,11 +16,11 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/power_supply.h>
-#include <linux/qcom_scm.h>
-#include <linux/regulator/consumer.h>
+#include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/reset.h>
 #include <linux/slab.h>
 #include <linux/types.h>
+#include <linux/regulator/consumer.h>
 #include <linux/usb/dwc3-msm.h>
 #include <linux/usb/phy.h>
 #include <linux/usb/repeater.h>
@@ -145,10 +145,9 @@
 /* VIOCTL_EUD_DETECT register based EUD_DETECT field */
 #define EUD_DETECT			BIT(0)
 
-#define USB_HSPHY_1P2_VOL_MIN		1200000 /* uV */
-#define USB_HSPHY_1P2_VOL_MAX		1200000 /* uV */
+#define USB_HSPHY_1P2_VOL_MIN		1200000	/* uV */
+#define USB_HSPHY_1P2_VOL_MAX		1200000	/* uV */
 #define USB_HSPHY_1P2_HPM_LOAD		5905	/* uA */
-
 #define USB_HSPHY_VDD_HPM_LOAD		7757	/* uA */
 
 struct msm_eusb2_phy {
@@ -167,6 +166,7 @@ struct msm_eusb2_phy {
 
 	struct regulator	*vdd;
 	struct regulator	*vdda12;
+	struct regulator	*vdd_refgen;
 	int			vdd_levels[3]; /* none, low, high */
 
 	bool			clocks_enabled;
@@ -196,7 +196,7 @@ struct msm_eusb2_phy {
 static inline bool is_eud_debug_mode_active(struct msm_eusb2_phy *phy)
 {
 	if (phy->eud_enable_reg &&
-		(readl_relaxed(phy->eud_enable_reg) & EUD_EN2))
+			(readl_relaxed(phy->eud_enable_reg) & EUD_EN2))
 		return true;
 
 	return false;
@@ -212,13 +212,9 @@ static void msm_eusb2_phy_clocks(struct msm_eusb2_phy *phy, bool on)
 
 	if (on) {
 		clk_prepare_enable(phy->ref_clk_src);
-
-		if (phy->ref_clk)
-			clk_prepare_enable(phy->ref_clk);
+		clk_prepare_enable(phy->ref_clk);
 	} else {
-		if (phy->ref_clk)
-			clk_disable_unprepare(phy->ref_clk);
-
+		clk_disable_unprepare(phy->ref_clk);
 		clk_disable_unprepare(phy->ref_clk_src);
 	}
 
@@ -227,19 +223,11 @@ static void msm_eusb2_phy_clocks(struct msm_eusb2_phy *phy, bool on)
 
 static void msm_eusb2_phy_update_eud_detect(struct msm_eusb2_phy *phy, bool set)
 {
-	if (!phy->eud_detect_reg)
-		return;
-
-	if (set) {
-		/* Make sure all the writes are processed before setting EUD_DETECT */
-		mb();
+	if (set)
 		writel_relaxed(EUD_DETECT, phy->eud_detect_reg);
-	} else {
+	else
 		writel_relaxed(readl_relaxed(phy->eud_detect_reg) & ~EUD_DETECT,
 					phy->eud_detect_reg);
-		/* Make sure clearing EUD_DETECT is completed before turning off the regulators */
-		mb();
-	}
 }
 
 static int msm_eusb2_phy_power(struct msm_eusb2_phy *phy, bool on)
@@ -249,10 +237,8 @@ static int msm_eusb2_phy_power(struct msm_eusb2_phy *phy, bool on)
 	dev_dbg(phy->phy.dev, "turn %s regulators. power_enabled:%d\n",
 			on ? "on" : "off", phy->power_enabled);
 
-	if (phy->power_enabled == on) {
-		dev_dbg(phy->phy.dev, "PHYs' regulators are already ON.\n");
+	if (phy->power_enabled == on)
 		return 0;
-	}
 
 	if (!on)
 		goto clear_eud_det;
@@ -296,6 +282,29 @@ static int msm_eusb2_phy_power(struct msm_eusb2_phy *phy, bool on)
 		goto unset_vdda12;
 	}
 
+	if (phy->vdd_refgen) {
+		ret = regulator_set_load(phy->vdd_refgen, USB_HSPHY_VDD_HPM_LOAD);
+		if (ret < 0) {
+			dev_err(phy->phy.dev, "Unable to set HPM of vdd_refgen:%d\n", ret);
+			goto disable_vdda12;
+		}
+
+		ret = regulator_set_voltage(phy->vdd_refgen, phy->vdd_levels[1],
+					phy->vdd_levels[2]);
+		if (ret) {
+			dev_err(phy->phy.dev,
+				"Unable to set voltage for hsusb vdd_refgen\n");
+			goto put_vdd_refgen_lpm;
+		}
+
+		ret = regulator_enable(phy->vdd_refgen);
+		if (ret) {
+			dev_err(phy->phy.dev, "Unable to enable VDD refgen\n");
+			goto unconfig_vdd_refgen;
+		}
+	}
+	/* Make sure all the writes are processed before setting EUD_DETECT */
+	mb();
 	/* Set eud_detect_reg after powering on eUSB PHY rails to bring EUD out of reset */
 	msm_eusb2_phy_update_eud_detect(phy, true);
 
@@ -307,6 +316,28 @@ clear_eud_det:
 	/* Clear eud_detect_reg to put EUD in reset */
 	msm_eusb2_phy_update_eud_detect(phy, false);
 
+	/* Make sure clearing EUD_DETECT is completed before turning off the regulators */
+	mb();
+
+	if (phy->vdd_refgen) {
+		ret = regulator_disable(phy->vdd_refgen);
+		if (ret)
+			dev_err(phy->phy.dev, "Unable to disable vdd_refgen:%d\n", ret);
+
+unconfig_vdd_refgen:
+		ret = regulator_set_voltage(phy->vdd_refgen, phy->vdd_levels[0],
+				    phy->vdd_levels[2]);
+		if (ret)
+			dev_err(phy->phy.dev,
+				"unable to set voltage for hsusb vdd_refgen\n");
+
+put_vdd_refgen_lpm:
+		ret = regulator_set_load(phy->vdd_refgen, 0);
+		if (ret < 0)
+			dev_err(phy->phy.dev, "Unable to set LPM of vdd_refgen\n");
+	}
+
+disable_vdda12:
 	ret = regulator_disable(phy->vdda12);
 	if (ret)
 		dev_err(phy->phy.dev, "Unable to disable vdda12:%d\n", ret);
@@ -353,30 +384,28 @@ static void msm_eusb2_write_readback(void __iomem *base, u32 offset,
 {
 	u32 write_val, tmp = readl_relaxed(base + offset);
 
-	tmp &= ~mask;		/* retain other bits */
+	tmp &= ~mask;
 	write_val = tmp | val;
 
 	writel_relaxed(write_val, base + offset);
 
 	/* Read back to see if val was written */
 	tmp = readl_relaxed(base + offset);
-	tmp &= mask;		/* clear other bits */
+	tmp &= mask;
 
 	if (tmp != val)
 		pr_err("write: %x to offset: %x FAILED\n", val, offset);
 }
 
+static void eusb2_phy_reset_seq(struct msm_eusb2_phy *phy)
+{
+	writel(APB_LOGIC_RESET, phy->base + USB_PHY_APB_ACCESS_CMD);
+	writel(0x00, phy->base + USB_PHY_APB_ACCESS_CMD);
+}
+
 #define APB_ACCESS_TIMEOUT	10 /* in us */
 #define APB_ACCESS_POLL_DELAY	1  /* in us */
 #define APB_READ_ACCESS_DONE	1
-
-static void eusb2_phy_reset_seq(struct msm_eusb2_phy *phy)
-{
-	msm_eusb2_write_readback(phy->base, USB_PHY_APB_ACCESS_CMD,
-			APB_LOGIC_RESET, APB_LOGIC_RESET);
-	msm_eusb2_write_readback(phy->base, USB_PHY_APB_ACCESS_CMD,
-			0x00, 0x00);
-}
 
 static int eusb2_phy_apb_cmd_wait(struct msm_eusb2_phy *phy)
 {
@@ -402,18 +431,14 @@ static void eusb2_phy_apb_reg_write(struct msm_eusb2_phy *phy,
 	int ret;
 
 	/* program register index to update requested register */
-	msm_eusb2_write_readback(phy->base, USB_PHY_APB_ADDRESS,
-			reg_index, reg_index);
+	writel(reg_index, phy->base + USB_PHY_APB_ADDRESS);
 
 	/* value to be program */
-	msm_eusb2_write_readback(phy->base, USB_PHY_APB_WRDATA_MSB,
-			((val >> 8) & 0xF), ((val >> 8) & 0xF));
-	msm_eusb2_write_readback(phy->base, USB_PHY_APB_WRDATA_LSB,
-			(val & 0xF), (val & 0xF));
+	writel(((val >> 8) & 0xF), phy->base + USB_PHY_APB_WRDATA_MSB);
+	writel((val & 0xF), phy->base + USB_PHY_APB_WRDATA_LSB);
 
 	/* send cmd to update reg_index with above programmed value */
-	msm_eusb2_write_readback(phy->base, USB_PHY_APB_ACCESS_CMD,
-			RW_ACCESS | APB_START_CMD, RW_ACCESS | APB_START_CMD);
+	writel(RW_ACCESS | APB_START_CMD, phy->base + USB_PHY_APB_ACCESS_CMD);
 
 	/* poll for cmd completion */
 	ret = eusb2_phy_apb_cmd_wait(phy);
@@ -423,8 +448,7 @@ static void eusb2_phy_apb_reg_write(struct msm_eusb2_phy *phy,
 	}
 
 	/* write access completed */
-	msm_eusb2_write_readback(phy->base, USB_PHY_APB_ACCESS_CMD,
-			0x00, 0x00);
+	writel(0x0, phy->base + USB_PHY_APB_ACCESS_CMD);
 	dev_info(phy->phy.dev, "APB reg(%x) updated with %x\n", reg_index, val);
 }
 
@@ -435,12 +459,10 @@ static void eusb2_phy_apb_reg_read(struct msm_eusb2_phy *phy, u8 reg_index)
 	u32 rddata_msb;
 
 	/* program register which is required to read */
-	msm_eusb2_write_readback(phy->base, USB_PHY_APB_ADDRESS,
-			reg_index, reg_index);
+	writel(reg_index, phy->base + USB_PHY_APB_ADDRESS);
 
 	/* send cmd to read reg_index based register value */
-	msm_eusb2_write_readback(phy->base, USB_PHY_APB_ACCESS_CMD,
-			APB_START_CMD, APB_START_CMD);
+	writel(APB_START_CMD, phy->base + USB_PHY_APB_ACCESS_CMD);
 
 	/* poll for cmd completion */
 	ret = eusb2_phy_apb_cmd_wait(phy);
@@ -450,12 +472,11 @@ static void eusb2_phy_apb_reg_read(struct msm_eusb2_phy *phy, u8 reg_index)
 	}
 
 	/* read data of reg_index register */
-	rddata_lsb = readl_relaxed(phy->base + USB_PHY_APB_RDDATA_LSB);
-	rddata_msb = readl_relaxed(phy->base + USB_PHY_APB_RDDATA_MSB);
+	rddata_lsb = readl(phy->base + USB_PHY_APB_RDDATA_LSB);
+	rddata_msb = readl(phy->base + USB_PHY_APB_RDDATA_MSB);
 
 	/* read access completed */
-	msm_eusb2_write_readback(phy->base, USB_PHY_APB_ACCESS_CMD,
-			0x00, 0x00);
+	writel(0x0, phy->base + USB_PHY_APB_ACCESS_CMD);
 	dev_info(phy->phy.dev, "APB reg(%x) read success, val:%x\n",
 			reg_index, ((rddata_msb << 8) | rddata_lsb));
 }
@@ -667,9 +688,13 @@ static void msm_eusb2_ref_clk_init(struct usb_phy *uphy)
 	msm_eusb2_write_readback(phy->base, USB_PHY_CFG_CTRL_3,
 			PHY_CFG_PLL_REF_DIV, PLL_REF_DIV_VAL);
 }
+
 static int msm_eusb2_repeater_reset_and_init(struct msm_eusb2_phy *phy)
 {
 	int ret;
+
+	if (phy->ur)
+		phy->ur->flags = phy->phy.flags;
 
 	ret = usb_repeater_powerup(phy->ur);
 	if (ret)
@@ -679,17 +704,7 @@ static int msm_eusb2_repeater_reset_and_init(struct msm_eusb2_phy *phy)
 	if (ret)
 		dev_err(phy->phy.dev, "repeater reset failed.\n");
 
-#ifndef OPLUS_FEATURE_CHG_BASIC
 	ret = usb_repeater_init(phy->ur);
-#else
-	if (phy->phy.flags & PHY_HOST_MODE) {
-		dev_info(phy->phy.dev, "Init usb-repeater in HOST mode.\n");
-		usb_repeater_init_with_mode(phy->ur, OPLUS_REPEATER_PARAM_HOST);
-	}else {
-		dev_info(phy->phy.dev, "Init usb-repeater in DEVICE mode.\n");
-		usb_repeater_init_with_mode(phy->ur, OPLUS_REPEATER_PARAM_DEVICE);
-	}
-#endif
 	if (ret)
 		dev_err(phy->phy.dev, "repeater init failed.\n");
 
@@ -718,11 +733,10 @@ static int msm_eusb2_phy_init(struct usb_phy *uphy)
 	if (ret)
 		return ret;
 
+	/* Bring eUSB2 repeater out of reset and initialized before eUSB2 PHY */
 	ret = msm_eusb2_repeater_reset_and_init(phy);
-	if (ret) {
-		dev_err(phy->phy.dev, "repeater powerup failed.\n");
+	if (ret)
 		return ret;
-	}
 
 	msm_eusb2_phy_clocks(phy, true);
 
@@ -795,6 +809,9 @@ static int msm_eusb2_phy_init(struct usb_phy *uphy)
 
 	msm_eusb2_write_readback(phy->base, USB_PHY_HS_PHY_CTRL2,
 			USB2_SUSPEND_N_SEL, 0);
+
+	msm_eusb2_write_readback(phy->base, USB_PHY_CFG0,
+			CMN_CTRL_OVERRIDE_EN, 0x00);
 	return 0;
 }
 
@@ -852,6 +869,7 @@ static int msm_eusb2_phy_set_suspend(struct usb_phy *uphy, int suspend)
 		usb_repeater_powerdown(phy->ur);
 	} else {
 		/* Bus resume and cable connect handling */
+		msm_eusb2_phy_power(phy, true);
 		msm_eusb2_phy_clocks(phy, true);
 	}
 
@@ -866,6 +884,7 @@ static int msm_eusb2_phy_notify_connect(struct usb_phy *uphy,
 	struct msm_eusb2_phy *phy = container_of(uphy, struct msm_eusb2_phy, phy);
 
 	phy->cable_connected = true;
+
 	/*
 	 * SW WA for CV9 RESET DEVICE TEST(TD 9.23) compliance test failure.
 	 * During HS to SS transitions UTMI_TX Valid signal remains high causing
@@ -876,7 +895,6 @@ static int msm_eusb2_phy_notify_connect(struct usb_phy *uphy,
 	if (!(phy->phy.flags & PHY_HOST_MODE) && (speed >= USB_SPEED_SUPER)) {
 		msm_eusb2_write_readback(phy->base, USB_PHY_APB_ACCESS_CMD, 0xff, 0x0);
 		msm_eusb2_write_readback(phy->base, USB_PHY_APB_ADDRESS, 0xff, 0x5);
-		msm_eusb2_write_readback(phy->base, USB_PHY_APB_WRDATA_LSB, 0xff, 0x80);
 		msm_eusb2_write_readback(phy->base, USB_PHY_APB_WRDATA_LSB, 0xff, 0xc0);
 		msm_eusb2_write_readback(phy->base, USB_PHY_APB_ACCESS_CMD, 0xff, 0x3);
 		udelay(2);
@@ -894,6 +912,13 @@ static int msm_eusb2_phy_notify_disconnect(struct usb_phy *uphy,
 				       enum usb_device_speed speed)
 {
 	struct msm_eusb2_phy *phy = container_of(uphy, struct msm_eusb2_phy, phy);
+
+	if (is_eud_debug_mode_active(phy) && !(phy->phy.flags & EUD_SPOOF_DISCONNECT)) {
+		msm_eusb2_phy_update_eud_detect(phy, false);
+		/* Ensure that EUD disable occurs before re-enabling */
+		mb();
+		msm_eusb2_phy_update_eud_detect(phy, true);
+	}
 
 	phy->cable_connected = false;
 	return 0;
@@ -928,6 +953,9 @@ static void msm_eusb2_phy_vbus_draw_work(struct work_struct *w)
 static int msm_eusb2_phy_set_power(struct usb_phy *uphy, unsigned int mA)
 {
 	struct msm_eusb2_phy *phy = container_of(uphy, struct msm_eusb2_phy, phy);
+
+	if (phy->cable_connected && (mA == 0))
+		return 0;
 
 	phy->vbus_draw = mA;
 	schedule_work(&phy->vbus_draw_work);
@@ -990,33 +1018,37 @@ static int msm_eusb2_phy_probe(struct platform_device *pdev)
 	if (res) {
 		phy->eud_enable_reg = devm_ioremap_resource(dev, res);
 		if (IS_ERR(phy->eud_enable_reg)) {
-			dev_err(dev, "eud_enable_reg ioremap err:%d\n", phy->eud_enable_reg);
 			ret = PTR_ERR(phy->eud_enable_reg);
+			dev_err(dev, "eud_enable_reg ioremap err:%d\n", ret);
 			goto err_ret;
 		}
 		phy->eud_reg = res->start;
 	}
 
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "eud_detect_reg");
-	if (res) {
-		phy->eud_detect_reg = devm_ioremap_resource(dev, res);
-		if (IS_ERR(phy->eud_detect_reg)) {
-			dev_err(dev, "eud_detect_reg ioremap err:%d\n", phy->eud_detect_reg);
-			ret = PTR_ERR(phy->eud_detect_reg);
-			goto err_ret;
-		}
+	if (!res) {
+		dev_err(dev, "missing eud_detect register address\n");
+		ret = -ENODEV;
+		goto err_ret;
+	}
+
+	phy->eud_detect_reg = devm_ioremap_resource(dev, res);
+	if (IS_ERR(phy->eud_detect_reg)) {
+		ret = PTR_ERR(phy->eud_detect_reg);
+		dev_err(dev, "eud_detect_reg ioremap err:%d\n", ret);
+		goto err_ret;
 	}
 
 	phy->ref_clk_src = devm_clk_get(dev, "ref_clk_src");
 	if (IS_ERR(phy->ref_clk_src)) {
-		dev_dbg(dev, "clk get failed for ref_clk_src\n");
+		dev_err(dev, "clk get failed for ref_clk_src\n");
 		ret = PTR_ERR(phy->ref_clk_src);
 		goto err_ret;
 	}
 
 	phy->ref_clk = devm_clk_get_optional(dev, "ref_clk");
 	if (IS_ERR(phy->ref_clk)) {
-		dev_dbg(dev, "clk get failed for ref_clk\n");
+		dev_err(dev, "clk get failed for ref_clk\n");
 		ret = PTR_ERR(phy->ref_clk);
 		goto err_ret;
 	}
@@ -1047,6 +1079,14 @@ static int msm_eusb2_phy_probe(struct platform_device *pdev)
 		dev_err(dev, "unable to get vdda12 supply\n");
 		ret = PTR_ERR(phy->vdda12);
 		goto err_ret;
+	}
+
+	if (of_property_read_bool(dev->of_node, "vdd_refgen-supply")) {
+		phy->vdd_refgen = devm_regulator_get_optional(dev, "vdd_refgen");
+		if (IS_ERR(phy->vdd_refgen)) {
+			phy->vdd_refgen = NULL;
+			dev_err(dev, "unable to get refgen supply\n");
+		}
 	}
 
 	phy->param_override_seq_cnt = of_property_count_elems_of_size(
@@ -1090,22 +1130,22 @@ static int msm_eusb2_phy_probe(struct platform_device *pdev)
 	phy->phy.set_power		= msm_eusb2_phy_set_power;
 	phy->phy.type			= USB_PHY_TYPE_USB2;
 
-	ret = usb_add_phy_dev(&phy->phy);
-	if (ret)
-		goto err_ret;
-
 	INIT_WORK(&phy->vbus_draw_work, msm_eusb2_phy_vbus_draw_work);
 	msm_eusb2_phy_create_debugfs(phy);
 
 	/*
 	 * EUD may be enable in boot loader and to keep EUD session alive across
 	 * kernel boot till USB phy driver is initialized based on cable status,
-	 * keep LDOs on here.
+	 * keep LDOs, clocks and repeater on here.
 	 */
-	if (is_eud_debug_mode_active(phy))
+	if (is_eud_debug_mode_active(phy)) {
 		msm_eusb2_phy_power(phy, true);
+		msm_eusb2_phy_clocks(phy, true);
+		msm_eusb2_repeater_reset_and_init(phy);
+	}
 
-	return 0;
+	/* Placed at the end to ensure the probe is complete */
+	ret = usb_add_phy_dev(&phy->phy);
 
 err_ret:
 	return ret;
@@ -1124,6 +1164,7 @@ static int msm_eusb2_phy_remove(struct platform_device *pdev)
 
 	debugfs_remove_recursive(phy->root);
 	usb_remove_phy(&phy->phy);
+	clk_disable_unprepare(phy->ref_clk);
 	clk_disable_unprepare(phy->ref_clk_src);
 	msm_eusb2_phy_clocks(phy, false);
 	msm_eusb2_phy_power(phy, false);
@@ -1149,4 +1190,4 @@ static struct platform_driver msm_eusb2_phy_driver = {
 
 module_platform_driver(msm_eusb2_phy_driver);
 MODULE_DESCRIPTION("MSM USB eUSB2 PHY driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

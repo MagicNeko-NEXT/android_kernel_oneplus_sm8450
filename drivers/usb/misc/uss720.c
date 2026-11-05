@@ -502,7 +502,7 @@ static size_t parport_uss720_epp_write_data(struct parport *pp, const void *buf,
 #else
 	struct parport_uss720_private *priv = pp->private_data;
 	struct usb_device *usbdev = priv->usbdev;
-	int rlen;
+	int rlen = 0;
 	int i;
 
 	if (!usbdev)
@@ -563,7 +563,7 @@ static size_t parport_uss720_ecp_write_data(struct parport *pp, const void *buff
 {
 	struct parport_uss720_private *priv = pp->private_data;
 	struct usb_device *usbdev = priv->usbdev;
-	int rlen;
+	int rlen = 0;
 	int i;
 
 	if (!usbdev)
@@ -581,7 +581,7 @@ static size_t parport_uss720_ecp_read_data(struct parport *pp, void *buffer, siz
 {
 	struct parport_uss720_private *priv = pp->private_data;
 	struct usb_device *usbdev = priv->usbdev;
-	int rlen;
+	int rlen = 0;
 	int i;
 
 	if (!usbdev)
@@ -614,7 +614,7 @@ static size_t parport_uss720_write_compat(struct parport *pp, const void *buffer
 {
 	struct parport_uss720_private *priv = pp->private_data;
 	struct usb_device *usbdev = priv->usbdev;
-	int rlen;
+	int rlen = 0;
 	int i;
 
 	if (!usbdev)
@@ -733,7 +733,7 @@ static int uss720_probe(struct usb_interface *intf,
 	ret = get_1284_register(pp, 0, &reg, GFP_KERNEL);
 	dev_dbg(&intf->dev, "reg: %7ph\n", priv->reg);
 	if (ret < 0)
-		return ret;
+		goto probe_abort;
 
 	ret = usb_find_last_int_in_endpoint(interface, &epd);
 	if (!ret) {

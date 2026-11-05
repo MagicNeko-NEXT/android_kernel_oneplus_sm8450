@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2015-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/module.h>
@@ -187,12 +187,12 @@ struct dcc_drvdata {
 	uint8_t			curr_list;
 	uint8_t			*cti_trig;
 	uint8_t			loopoff;
+	uint8_t			*qad_output;
 	uint32_t		ram_cpy_len;
 	uint32_t		per_ll_reg_cnt;
 	int32_t			ll_state_cnt;
 	struct reg_state	*ll_state;
 	void			*sram_state;
-	uint8_t			*qad_output;
 };
 
 static uint32_t dcc_offset_conv(struct dcc_drvdata *drvdata, uint32_t off)
@@ -521,7 +521,7 @@ static int __dcc_ll_cfg(struct dcc_drvdata *drvdata, int curr_list)
 			if ((off - prev_off) > 0xFF ||
 			    entry->len > MAX_DCC_LEN) {
 				dev_err(drvdata->dev,
-					"DCC: Progamming error Base: 0x%x, offset 0x%x\n",
+					"DCC: Programming error Base: 0x%x, offset 0x%x\n",
 					entry->base, entry->offset);
 				ret = -EINVAL;
 				goto err;
@@ -576,7 +576,7 @@ static int __dcc_ll_cfg(struct dcc_drvdata *drvdata, int curr_list)
 
 	if (loop_start) {
 		dev_err(drvdata->dev,
-			"DCC: Progamming error: Loop unterminated\n");
+			"DCC: Programming error: Loop unterminated\n");
 		ret = -EINVAL;
 		goto err;
 	}
@@ -667,7 +667,7 @@ static int dcc_valid_list(struct dcc_drvdata *drvdata, int curr_list)
 		return -EINVAL;
 	}
 
-	dev_info(drvdata->dev, "DCC list passed %d\n", curr_list);
+	dev_err(drvdata->dev, "DCC list passed %d\n", curr_list);
 	return 0;
 }
 
@@ -697,9 +697,8 @@ static int dcc_enable(struct dcc_drvdata *drvdata)
 
 	mutex_lock(&drvdata->mutex);
 
-	if (!is_dcc_enabled(drvdata)) {
+	if (!is_dcc_enabled(drvdata))
 		memset_io(drvdata->ram_base, 0xDE, drvdata->ram_size);
-	}
 
 	for (list = 0; list < drvdata->nr_link_list; list++) {
 
@@ -1229,24 +1228,24 @@ static ssize_t config_show(struct device *dev,
 			    &drvdata->cfg_head[drvdata->curr_list], list) {
 		switch (entry->desc_type) {
 		case DCC_READ_WRITE_TYPE:
-			len = snprintf(local_buf, 64,
+			len = scnprintf(local_buf, 64,
 				       "Index: 0x%x, mask: 0x%x, val: 0x%x\n",
 				       entry->index, entry->mask,
 				       entry->write_val);
 			break;
 		case DCC_LOOP_TYPE:
-			len = snprintf(local_buf, 64, "Index: 0x%x, Loop: %d\n",
+			len = scnprintf(local_buf, 64, "Index: 0x%x, Loop: %d\n",
 				       entry->index, entry->loop_cnt);
 			break;
 		case DCC_WRITE_TYPE:
-			len = snprintf(local_buf, 64,
+			len = scnprintf(local_buf, 64,
 				       "Write Index: 0x%x, Base: 0x%x, Offset: 0x%x, len: 0x%x APB: %d\n",
 				       entry->index, entry->base,
 				       entry->offset, entry->len,
 				       entry->apb_bus);
 			break;
 		default:
-			len = snprintf(local_buf, 64,
+			len = scnprintf(local_buf, 64,
 				       "Read Index: 0x%x, Base: 0x%x, Offset: 0x%x, len: 0x%x APB: %d\n",
 				       entry->index, entry->base,
 				       entry->offset, entry->len,
@@ -1336,7 +1335,7 @@ static int dcc_config_add(struct dcc_drvdata *drvdata, unsigned int addr,
 	offset = addr - base;
 
 	while (len) {
-		entry = devm_kzalloc(drvdata->dev, sizeof(*entry), GFP_KERNEL);
+		entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 		if (!entry) {
 			ret = -ENOMEM;
 			goto err;
@@ -1406,7 +1405,7 @@ static void dcc_config_reset(struct dcc_drvdata *drvdata)
 		list_for_each_entry_safe(entry, temp,
 					 &drvdata->cfg_head[curr_list], list) {
 			list_del(&entry->list);
-			devm_kfree(drvdata->dev, entry);
+			kfree(entry);
 			drvdata->nr_config[curr_list]--;
 		}
 	}
@@ -1518,7 +1517,7 @@ static int dcc_add_loop(struct dcc_drvdata *drvdata, unsigned long loop_cnt)
 {
 	struct dcc_config_entry *entry;
 
-	entry = devm_kzalloc(drvdata->dev, sizeof(*entry), GFP_KERNEL);
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry)
 		return -ENOMEM;
 
@@ -1584,7 +1583,7 @@ static int dcc_rd_mod_wr_add(struct dcc_drvdata *drvdata, unsigned int mask,
 		goto err;
 	}
 
-	entry = devm_kzalloc(drvdata->dev, sizeof(*entry), GFP_KERNEL);
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry) {
 		ret = -ENOMEM;
 		goto err;
@@ -1629,7 +1628,7 @@ static int dcc_add_write(struct dcc_drvdata *drvdata, unsigned int addr,
 {
 	struct dcc_config_entry *entry;
 
-	entry = devm_kzalloc(drvdata->dev, sizeof(*entry), GFP_KERNEL);
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry)
 		return -ENOMEM;
 
@@ -1782,7 +1781,6 @@ static ssize_t dcc_sram_read(struct file *file, char __user *data,
 {
 	unsigned char *buf;
 	struct dcc_drvdata *drvdata = file->private_data;
-	int ret;
 
 	/* EOF check */
 	if (drvdata->ram_size <= *ppos)
@@ -1796,13 +1794,7 @@ static ssize_t dcc_sram_read(struct file *file, char __user *data,
 	if (!buf)
 		return -ENOMEM;
 
-	ret = dcc_sram_memcpy(buf, (drvdata->ram_base + *ppos), len);
-	if (ret) {
-		dev_err(drvdata->dev,
-			"Target address or size not aligned with 4 bytes\n");
-		kfree(buf);
-		return ret;
-	}
+	dcc_sram_memcpy(buf, (drvdata->ram_base + *ppos), len);
 
 	if (copy_to_user(data, buf, len)) {
 		dev_err(drvdata->dev,
@@ -1842,7 +1834,7 @@ static int dcc_sram_dev_register(struct dcc_drvdata *drvdata)
 	if (ret)
 		goto err_cdev_add;
 
-	drvdata->sram_class = class_create(THIS_MODULE,
+	drvdata->sram_class = class_create(
 					   drvdata->sram_node);
 	if (IS_ERR(drvdata->sram_class)) {
 		ret = PTR_ERR(drvdata->sram_class);
@@ -1889,7 +1881,7 @@ static int dcc_sram_dev_init(struct dcc_drvdata *drvdata)
 	if (!drvdata->sram_node)
 		return -ENOMEM;
 
-	strlcpy(drvdata->sram_node, node_name, node_size);
+	strscpy(drvdata->sram_node, node_name, node_size);
 	ret = dcc_sram_dev_register(drvdata);
 	if (ret)
 		dev_err(drvdata->dev, "DCC: sram node not registered.\n");
@@ -1939,7 +1931,6 @@ static int dcc_dt_parse(struct dcc_drvdata *drvdata, struct device_node *np)
 			str_dcc_data_sink[drvdata->data_sink[curr_link_list]]);
 		}
 	}
-	drvdata->qad_output[drvdata->curr_list] = 1;
 
 	prop = of_get_property(np, "qcom,link-list", &len);
 	if (prop) {
@@ -2139,7 +2130,7 @@ static int dcc_probe(struct platform_device *pdev)
 	dcc_configure_list(drvdata, pdev->dev.of_node);
 
 	/* Add dcc info to minidump table */
-	strlcpy(md_entry.name, "KDCCDATA", sizeof(md_entry.name));
+	strscpy(md_entry.name, "KDCCDATA", sizeof(md_entry.name));
 	md_entry.virt_addr = (uintptr_t)drvdata->ram_base;
 	md_entry.phys_addr = res->start;
 	md_entry.size = drvdata->ram_size;
@@ -2162,7 +2153,7 @@ static int dcc_remove(struct platform_device *pdev)
 	return 0;
 }
 
-#ifdef CONFIG_HIBERNATION
+#if defined(CONFIG_DEEPSLEEP) || defined(CONFIG_HIBERNATION)
 static int dcc_state_store(struct device *dev)
 {
 	int ret = 0, n, i;
@@ -2306,6 +2297,33 @@ out:
 }
 #endif
 
+#ifdef CONFIG_DEEPSLEEP
+static int dcc_v2_suspend(struct device *dev)
+{
+	if (pm_suspend_target_state == PM_SUSPEND_MEM)
+		return dcc_state_store(dev);
+
+	return 0;
+}
+
+static int dcc_v2_resume(struct device *dev)
+{
+	if (pm_suspend_target_state == PM_SUSPEND_MEM)
+		return dcc_state_restore(dev);
+
+	return 0;
+}
+#else
+static int dcc_v2_suspend(struct device *dev)
+{
+	return 0;
+}
+
+static int dcc_v2_resume(struct device *dev)
+{
+	return 0;
+}
+#endif
 
 #ifdef CONFIG_HIBERNATION
 static int dcc_v2_freeze(struct device *dev)
@@ -2334,14 +2352,29 @@ static int dcc_v2_thaw(struct device *dev)
 
 	return 0;
 }
+#else
+static int dcc_v2_freeze(struct device *dev)
+{
+	return 0;
+}
+
+static int dcc_v2_restore(struct device *dev)
+{
+	return 0;
+}
+
+static int dcc_v2_thaw(struct device *dev)
+{
+	return 0;
+}
 #endif
 
 static const struct dev_pm_ops dcc_v2_pm_ops = {
-#ifdef CONFIG_HIBERNATION
+	.suspend         = dcc_v2_suspend,
+	.resume          = dcc_v2_resume,
 	.freeze          = dcc_v2_freeze,
 	.restore         = dcc_v2_restore,
 	.thaw            = dcc_v2_thaw,
-#endif
 };
 
 static const struct of_device_id msm_dcc_match[] = {
@@ -2355,11 +2388,11 @@ static struct platform_driver dcc_driver = {
 	.driver         = {
 		.name   = "msm-dcc",
 		.of_match_table	= msm_dcc_match,
-		.pm     = &dcc_v2_pm_ops,
+		.pm     = pm_ptr(&dcc_v2_pm_ops),
 	},
 };
 
 module_platform_driver(dcc_driver);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("MSM data capture and compare engine");

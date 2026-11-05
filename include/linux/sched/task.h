@@ -23,7 +23,12 @@ struct kernel_clone_args {
 	int __user *pidfd;
 	int __user *child_tid;
 	int __user *parent_tid;
+	const char *name;
 	int exit_signal;
+	u32 kthread:1;
+	u32 io_thread:1;
+	u32 user_worker:1;
+	u32 no_files:1;
 	unsigned long stack;
 	unsigned long stack_size;
 	unsigned long tls;
@@ -31,7 +36,9 @@ struct kernel_clone_args {
 	/* Number of elements in *set_tid */
 	size_t set_tid_size;
 	int cgroup;
-	int io_thread;
+	int idle;
+	int (*fn)(void *);
+	void *fn_arg;
 	struct cgroup *cgrp;
 	struct css_set *cset;
 };
@@ -47,10 +54,11 @@ extern spinlock_t mmlist_lock;
 
 extern union thread_union init_thread_union;
 extern struct task_struct init_task;
+#ifdef CONFIG_GKI_DYNAMIC_TASK_STRUCT_SIZE
+extern u64 vendor_data_pad[CONFIG_GKI_TASK_STRUCT_VENDOR_SIZE_MAX / sizeof(u64)];
+#endif
 
-#ifdef CONFIG_PROVE_RCU
 extern int lockdep_tasklist_lock_is_held(void);
-#endif /* #ifdef CONFIG_PROVE_RCU */
 
 extern asmlinkage void schedule_tail(struct task_struct *prev);
 extern void init_idle(struct task_struct *idle, int cpu);
@@ -70,8 +78,7 @@ extern void fork_init(void);
 
 extern void release_task(struct task_struct * p);
 
-extern int copy_thread(unsigned long, unsigned long, unsigned long,
-		       struct task_struct *, unsigned long);
+extern int copy_thread(struct task_struct *, const struct kernel_clone_args *);
 
 extern void flush_thread(void);
 
@@ -82,15 +89,19 @@ static inline void exit_thread(struct task_struct *tsk)
 {
 }
 #endif
-extern void do_group_exit(int);
+extern __noreturn void do_group_exit(int);
 
 extern void exit_files(struct task_struct *);
 extern void exit_itimers(struct task_struct *);
 
 extern pid_t kernel_clone(struct kernel_clone_args *kargs);
+struct task_struct *copy_process(struct pid *pid, int trace, int node,
+				 struct kernel_clone_args *args);
 struct task_struct *create_io_thread(int (*fn)(void *), void *arg, int node);
 struct task_struct *fork_idle(int);
-extern pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags);
+extern pid_t kernel_thread(int (*fn)(void *), void *arg, const char *name,
+			    unsigned long flags);
+extern pid_t user_mode_thread(int (*fn)(void *), void *arg, unsigned long flags);
 extern long kernel_wait4(pid_t, int __user *, int, struct rusage *);
 int kernel_wait(pid_t pid, int *stat);
 
@@ -118,6 +129,19 @@ static inline void put_task_struct(struct task_struct *t)
 		return;
 
 	/*
+	 * In !RT, it is always safe to call __put_task_struct().
+	 * Under RT, we can only call it in preemptible context.
+	 */
+	if (!IS_ENABLED(CONFIG_PREEMPT_RT) || preemptible()) {
+		static DEFINE_WAIT_OVERRIDE_MAP(put_task_map, LD_WAIT_SLEEP);
+
+		lock_map_acquire_try(&put_task_map);
+		__put_task_struct(t);
+		lock_map_release(&put_task_map);
+		return;
+	}
+
+	/*
 	 * under PREEMPT_RT, we can't call put_task_struct
 	 * in atomic context because it will indirectly
 	 * acquire sleeping locks.
@@ -137,10 +161,7 @@ static inline void put_task_struct(struct task_struct *t)
 	 * when it fails to fork a process. Therefore, there is no
 	 * way it can conflict with put_task_struct().
 	 */
-	if (IS_ENABLED(CONFIG_PREEMPT_RT) && !preemptible())
-		call_rcu(&t->rcu, __put_task_struct_rcu_cb);
-	else
-		__put_task_struct(t);
+	call_rcu(&t->rcu, __put_task_struct_rcu_cb);
 }
 
 DEFINE_FREE(put_task, struct task_struct *, if (_T) put_task_struct(_T))
@@ -152,6 +173,9 @@ static inline void put_task_struct_many(struct task_struct *t, int nr)
 }
 
 void put_task_struct_rcu_user(struct task_struct *task);
+
+/* Free all architecture-specific resources held by a thread. */
+void release_thread(struct task_struct *dead_task);
 
 #ifdef CONFIG_ARCH_WANTS_DYNAMIC_TASK_STRUCT
 extern int arch_task_struct_size __read_mostly;
@@ -204,5 +228,26 @@ static inline void task_unlock(struct task_struct *p)
 {
 	spin_unlock(&p->alloc_lock);
 }
+
+DEFINE_GUARD(task_lock, struct task_struct *, task_lock(_T), task_unlock(_T))
+
+#ifdef CONFIG_GKI_DYNAMIC_TASK_STRUCT_SIZE
+static inline void *android_task_vendor_data(struct task_struct *p)
+{
+	if (p == &init_task)
+		return &vendor_data_pad[0];
+
+	return p + 1;
+}
+
+static inline void android_init_dynamic_vendor_data(struct task_struct *p)
+{
+	if (arch_task_struct_size > sizeof(struct task_struct))
+		memset((void *)android_task_vendor_data(p), 0x0,
+		       arch_task_struct_size - sizeof(struct task_struct));
+}
+#else /* !CONFIG_GKI_DYNAMIC_TASK_STRUCT_SIZE */
+static inline void android_init_dynamic_vendor_data(struct task_struct *p) {}
+#endif /* CONFIG_GKI_DYNAMIC_TASK_STRUCT_SIZE */
 
 #endif /* _LINUX_SCHED_TASK_H */

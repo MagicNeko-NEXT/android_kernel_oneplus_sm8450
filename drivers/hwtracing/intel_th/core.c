@@ -95,21 +95,23 @@ out_pm:
 
 static void intel_th_device_remove(struct intel_th_device *thdev);
 
-static int intel_th_remove(struct device *dev)
+static void intel_th_remove(struct device *dev)
 {
 	struct intel_th_driver *thdrv = to_intel_th_driver(dev->driver);
 	struct intel_th_device *thdev = to_intel_th_device(dev);
 	struct intel_th_device *hub = to_intel_th_hub(thdev);
-	int err;
 
 	if (thdev->type == INTEL_TH_SWITCH) {
 		struct intel_th *th = to_intel_th(hub);
 		int i, lowest;
 
-		/* disconnect outputs */
-		err = device_for_each_child(dev, thdev, intel_th_child_remove);
-		if (err)
-			return err;
+		/*
+		 * disconnect outputs
+		 *
+		 * intel_th_child_remove returns 0 unconditionally, so there is
+		 * no need to check the return value of device_for_each_child.
+		 */
+		device_for_each_child(dev, thdev, intel_th_child_remove);
 
 		/*
 		 * Remove outputs, that is, hub's children: they are created
@@ -162,8 +164,6 @@ static int intel_th_remove(struct device *dev)
 	pm_runtime_disable(dev);
 	pm_runtime_set_active(dev);
 	pm_runtime_enable(dev);
-
-	return 0;
 }
 
 static struct bus_type intel_th_bus = {
@@ -185,11 +185,11 @@ static struct device_type intel_th_source_device_type = {
 	.release	= intel_th_device_release,
 };
 
-static char *intel_th_output_devnode(struct device *dev, umode_t *mode,
+static char *intel_th_output_devnode(const struct device *dev, umode_t *mode,
 				     kuid_t *uid, kgid_t *gid)
 {
-	struct intel_th_device *thdev = to_intel_th_device(dev);
-	struct intel_th *th = to_intel_th(thdev);
+	const struct intel_th_device *thdev = to_intel_th_device(dev);
+	const struct intel_th *th = to_intel_th(thdev);
 	char *node;
 
 	if (thdev->id >= 0)
@@ -810,13 +810,20 @@ static int intel_th_output_open(struct inode *inode, struct file *file)
 	int err;
 
 	dev = bus_find_device_by_devt(&intel_th_bus, inode->i_rdev);
-	if (!dev || !dev->driver)
+	if (!dev)
 		return -ENODEV;
+
+	if (!dev->driver) {
+		err = -ENODEV;
+		goto out_put_device;
+	}
 
 	thdrv = to_intel_th_driver(dev->driver);
 	fops = fops_get(thdrv->fops);
-	if (!fops)
-		return -ENODEV;
+	if (!fops) {
+		err = -ENODEV;
+		goto out_put_device;
+	}
 
 	replace_fops(file, fops);
 
@@ -824,14 +831,30 @@ static int intel_th_output_open(struct inode *inode, struct file *file)
 
 	if (file->f_op->open) {
 		err = file->f_op->open(inode, file);
-		return err;
+		if (err)
+			goto out_put_device;
 	}
+
+	return 0;
+
+out_put_device:
+	put_device(dev);
+
+	return err;
+}
+
+static int intel_th_output_release(struct inode *inode, struct file *file)
+{
+	struct intel_th_device *thdev = file->private_data;
+
+	put_device(&thdev->dev);
 
 	return 0;
 }
 
 static const struct file_operations intel_th_output_fops = {
 	.open	= intel_th_output_open,
+	.release = intel_th_output_release,
 	.llseek	= noop_llseek,
 };
 
@@ -861,7 +884,7 @@ static irqreturn_t intel_th_irq(int irq, void *data)
  * @irq:	irq number
  */
 struct intel_th *
-intel_th_alloc(struct device *dev, struct intel_th_drvdata *drvdata,
+intel_th_alloc(struct device *dev, const struct intel_th_drvdata *drvdata,
 	       struct resource *devres, unsigned int ndevres)
 {
 	int err, r, nr_mmios = 0;

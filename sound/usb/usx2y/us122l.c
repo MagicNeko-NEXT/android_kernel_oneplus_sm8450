@@ -224,9 +224,9 @@ static int usb_stream_hwdep_mmap(struct snd_hwdep *hw,
 	}
 
 	area->vm_ops = &usb_stream_hwdep_vm_ops;
-	area->vm_flags |= VM_DONTDUMP;
+	vm_flags_set(area, VM_DONTDUMP);
 	if (!read)
-		area->vm_flags |= VM_DONTEXPAND;
+		vm_flags_set(area, VM_DONTEXPAND);
 	area->vm_private_data = us122l;
 	atomic_inc(&us122l->mmap_count);
 out:
@@ -385,7 +385,7 @@ static int usb_stream_hwdep_ioctl(struct snd_hwdep *hw, struct file *file,
 	if (cfg.period_frames < min_period_frames)
 		return -EINVAL;
 
-	snd_power_wait(hw->card, SNDRV_CTL_POWER_D0);
+	snd_power_wait(hw->card);
 
 	mutex_lock(&us122l->mutex);
 	s = us122l->sk.s;

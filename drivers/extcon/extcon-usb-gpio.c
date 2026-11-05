@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/**
+/*
  * drivers/extcon/extcon-usb-gpio.c - USB GPIO extcon driver
  *
  * Copyright (C) 2015 Texas Instruments Incorporated - https://www.ti.com
@@ -7,18 +7,17 @@
  */
 
 #include <linux/extcon-provider.h>
-#include <linux/gpio.h>
 #include <linux/gpio/consumer.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/of_gpio.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 #include <linux/pinctrl/consumer.h>
+#include <linux/mod_devicetable.h>
 
 #define USB_GPIO_DEBOUNCE_MS	20	/* ms */
 
@@ -28,7 +27,6 @@ struct usb_extcon_info {
 
 	struct gpio_desc *id_gpiod;
 	struct gpio_desc *vbus_gpiod;
-	struct gpio_desc *vbus_out_gpiod;
 	int id_irq;
 	int vbus_irq;
 
@@ -73,17 +71,12 @@ static void usb_extcon_detect_cable(struct work_struct *work)
 		gpiod_get_value_cansleep(info->vbus_gpiod) : id;
 
 	/* at first we clean states which are no longer active */
-	if (id) {
-		if (info->vbus_out_gpiod)
-			gpiod_set_value_cansleep(info->vbus_out_gpiod, 0);
+	if (id)
 		extcon_set_state_sync(info->edev, EXTCON_USB_HOST, false);
-	}
 	if (!vbus)
 		extcon_set_state_sync(info->edev, EXTCON_USB, false);
 
 	if (!id) {
-		if (info->vbus_out_gpiod)
-			gpiod_set_value_cansleep(info->vbus_out_gpiod, 1);
 		extcon_set_state_sync(info->edev, EXTCON_USB_HOST, true);
 	} else {
 		if (vbus)
@@ -119,8 +112,6 @@ static int usb_extcon_probe(struct platform_device *pdev)
 	info->id_gpiod = devm_gpiod_get_optional(&pdev->dev, "id", GPIOD_IN);
 	info->vbus_gpiod = devm_gpiod_get_optional(&pdev->dev, "vbus",
 						   GPIOD_IN);
-	info->vbus_out_gpiod = devm_gpiod_get_optional(&pdev->dev, "vbus-out",
-						   GPIOD_OUT_HIGH);
 
 	if (!info->id_gpiod && !info->vbus_gpiod) {
 		dev_err(dev, "failed to get gpios\n");
@@ -132,9 +123,6 @@ static int usb_extcon_probe(struct platform_device *pdev)
 
 	if (IS_ERR(info->vbus_gpiod))
 		return PTR_ERR(info->vbus_gpiod);
-
-	if (IS_ERR(info->vbus_out_gpiod))
-		return PTR_ERR(info->vbus_out_gpiod);
 
 	info->edev = devm_extcon_dev_allocate(dev, usb_extcon_cable);
 	if (IS_ERR(info->edev)) {
@@ -238,16 +226,6 @@ static int usb_extcon_suspend(struct device *dev)
 		}
 	}
 
-	/*
-	 * We don't want to process any IRQs after this point
-	 * as GPIOs used behind I2C subsystem might not be
-	 * accessible until resume completes. So disable IRQ.
-	 */
-	if (info->id_gpiod)
-		disable_irq(info->id_irq);
-	if (info->vbus_gpiod)
-		disable_irq(info->vbus_irq);
-
 	if (!device_may_wakeup(dev))
 		pinctrl_pm_select_sleep_state(dev);
 
@@ -278,11 +256,6 @@ static int usb_extcon_resume(struct device *dev)
 			}
 		}
 	}
-
-	if (info->id_gpiod)
-		enable_irq(info->id_irq);
-	if (info->vbus_gpiod)
-		enable_irq(info->vbus_irq);
 
 	queue_delayed_work(system_power_efficient_wq,
 			   &info->wq_detcable, 0);

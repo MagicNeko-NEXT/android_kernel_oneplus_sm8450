@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2016-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/slimbus.h>
@@ -24,8 +25,6 @@ struct btfmslim_ch slave_txport[] = {
 	.port = SLAVE_SB_PGD_PORT_TX1_FM},
 	{.id = BTFM_FM_SLIM_TX, .name = "FM_Tx2",
 	.port = SLAVE_SB_PGD_PORT_TX2_FM},
-	{.id = BTFM_BT_SPLIT_A2DP_SLIM_TX, .name = "A2DP_Tx",
-	.port = SLAVE_SB_PGD_PORT_TX_A2DP},
 	{.id = BTFM_SLIM_NUM_CODEC_DAIS, .name = "",
 	.port = BTFM_SLIM_PGD_PORT_LAST},
 };
@@ -62,10 +61,12 @@ int btfm_slim_slave_hw_init(struct btfmslim *btfmslim)
 	return ret;
 }
 
-static inline int is_fm_port(struct btfmslim *btfmslim)
+static inline int is_fm_port(uint8_t port_num)
 {
-	BTFMSLIM_INFO("dai id is %d", btfmslim->dai_id);
-	if (btfmslim->dai_id == BTFM_FM_SLIM_TX)
+	if (port_num == SLAVE_SB_PGD_PORT_TX1_FM ||
+		port_num == CHRKVER3_SB_PGD_PORT_TX1_FM ||
+		port_num == CHRKVER3_SB_PGD_PORT_TX2_FM ||
+		port_num == SLAVE_SB_PGD_PORT_TX2_FM)
 		return 1;
 	else
 		return 0;
@@ -117,7 +118,7 @@ int btfm_slim_slave_enable_port(struct btfmslim *btfmslim, uint8_t port_num,
 
 	/* txport */
 	/* Multiple Channel Setting */
-	if (is_fm_port(btfmslim)) {
+	if (is_fm_port(port_num)) {
 		if (port_num == CHRKVER3_SB_PGD_PORT_TX1_FM)
 			reg_val = (0x1 << CHRKVER3_SB_PGD_PORT_TX1_FM);
 		else if (port_num == CHRKVER3_SB_PGD_PORT_TX2_FM)
@@ -135,18 +136,6 @@ int btfm_slim_slave_enable_port(struct btfmslim *btfmslim, uint8_t port_num,
 	} else if (port_num == SLAVE_SB_PGD_PORT_TX_SCO) {
 		/* SCO Tx */
 		reg_val = 0x1 << SLAVE_SB_PGD_PORT_TX_SCO;
-		reg = SLAVE_SB_PGD_TX_PORTn_MULTI_CHNL_0(port_num);
-		BTFMSLIM_DBG("writing reg_val (%d) to reg(%x)",
-				reg_val, reg);
-		ret = btfm_slim_write(btfmslim, reg, reg_val, IFD);
-		if (ret < 0) {
-			BTFMSLIM_ERR("failed to write (%d) reg 0x%x",
-					ret, reg);
-			goto error;
-		}
-	} else if (port_num == SLAVE_SB_PGD_PORT_TX_A2DP) {
-		/* A2DP Tx */
-		reg_val = 0x1 << SLAVE_SB_PGD_PORT_TX_A2DP;
 		reg = SLAVE_SB_PGD_TX_PORTn_MULTI_CHNL_0(port_num);
 		BTFMSLIM_DBG("writing reg_val (%d) to reg(%x)",
 				reg_val, reg);
@@ -178,7 +167,7 @@ enable_disable_rxport:
 	else
 		en = SLAVE_SB_PGD_PORT_DISABLE;
 
-	if (is_fm_port(btfmslim))
+	if (is_fm_port(port_num))
 		reg_val = en | SLAVE_SB_PGD_PORT_WM_L8;
 	else if (port_num == SLAVE_SB_PGD_PORT_TX_SCO)
 		reg_val = enable ? en | SLAVE_SB_PGD_PORT_WM_L1 : en;
@@ -187,9 +176,6 @@ enable_disable_rxport:
 
 	if (enable && port_num == SLAVE_SB_PGD_PORT_TX_SCO)
 		BTFMSLIM_INFO("programming SCO Tx with reg_val %d to reg 0x%x",
-				reg_val, reg);
-	else if (enable && port_num == SLAVE_SB_PGD_PORT_TX_A2DP)
-		BTFMSLIM_INFO("programming A2DP Tx with reg_val %d to reg 0x%x",
 				reg_val, reg);
 
 	ret = btfm_slim_write(btfmslim, reg, reg_val, IFD);

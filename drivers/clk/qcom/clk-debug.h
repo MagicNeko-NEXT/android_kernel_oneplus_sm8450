@@ -1,5 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (c) 2016, 2019-2021, The Linux Foundation. All rights reserved. */
+/*
+ * Copyright (c) 2016, 2019-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ */
 
 #ifndef __QCOM_CLK_DEBUG_H__
 #define __QCOM_CLK_DEBUG_H__
@@ -104,7 +107,7 @@ extern void clk_debug_print_hw(struct clk_hw *hw, struct seq_file *f);
 #define WARN_CLK(hw, cond, fmt, ...)						\
 	do {									\
 		clk_debug_print_hw(hw, NULL);					\
-		WARN(cond, "%s: " fmt, clk_hw_get_name(hw), ##__VA_ARGS__);	\
+		WARN(cond, "%s: " fmt, qcom_clk_hw_get_name(hw), ##__VA_ARGS__);	\
 	} while (0)
 
 #define clock_debug_output(m, fmt, ...)			\

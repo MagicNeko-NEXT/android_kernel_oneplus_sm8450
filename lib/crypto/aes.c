@@ -13,7 +13,7 @@
  * Emit the sbox as volatile const to prevent the compiler from doing
  * constant folding on sbox references involving fixed indexes.
  */
-static volatile const u8 __cacheline_aligned aes_sbox[] = {
+static volatile const u8 ____cacheline_aligned aes_sbox[] = {
 	0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5,
 	0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
 	0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0,
@@ -48,7 +48,7 @@ static volatile const u8 __cacheline_aligned aes_sbox[] = {
 	0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
 };
 
-static volatile const u8 __cacheline_aligned aes_inv_sbox[] = {
+static volatile const u8 ____cacheline_aligned aes_inv_sbox[] = {
 	0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38,
 	0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
 	0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87,
@@ -190,7 +190,7 @@ int aes_expandkey(struct crypto_aes_ctx *ctx, const u8 *in_key,
 	u32 rc, i, j;
 	int err;
 
-#if defined(CONFIG_CRYPTO_FIPS140) && !defined(BUILD_FIPS140_KO)
+#ifndef __DISABLE_EXPORTS
 	err = -(MAX_ERRNO + 1);
 	trace_android_vh_aes_expandkey(ctx, in_key, key_len, &err);
 	if (err != -(MAX_ERRNO + 1))
@@ -269,7 +269,7 @@ void aes_encrypt(const struct crypto_aes_ctx *ctx, u8 *out, const u8 *in)
 	int rounds = 6 + ctx->key_length / 4;
 	u32 st0[4], st1[4];
 	int round;
-#if defined(CONFIG_CRYPTO_FIPS140) && !defined(BUILD_FIPS140_KO)
+#ifndef __DISABLE_EXPORTS
 	int hook_inuse = 0;
 
 	trace_android_vh_aes_encrypt(ctx, out, in, &hook_inuse);
@@ -327,7 +327,7 @@ void aes_decrypt(const struct crypto_aes_ctx *ctx, u8 *out, const u8 *in)
 	int rounds = 6 + ctx->key_length / 4;
 	u32 st0[4], st1[4];
 	int round;
-#if defined(CONFIG_CRYPTO_FIPS140) && !defined(BUILD_FIPS140_KO)
+#ifndef __DISABLE_EXPORTS
 	int hook_inuse = 0;
 
 	trace_android_vh_aes_decrypt(ctx, out, in, &hook_inuse);

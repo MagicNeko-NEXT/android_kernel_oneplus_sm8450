@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2020 The Linux Foundation. All rights reserved.
+/* Copyright (c) 2020, 2021 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/delay.h>
@@ -13,7 +14,8 @@
 #include <linux/module.h>
 #include <linux/reboot.h>
 #include <linux/pm.h>
-#include <linux/qcom_scm.h>
+#include <linux/panic_notifier.h>
+#include <linux/firmware/qcom/qcom_scm.h>
 #include <soc/qcom/minidump.h>
 
 enum qcom_download_dest {
@@ -25,9 +27,11 @@ enum qcom_download_dest {
 struct qcom_dload {
 	struct notifier_block panic_nb;
 	struct notifier_block reboot_nb;
+	struct notifier_block restart_nb;
 	struct kobject kobj;
 
 	bool in_panic;
+	bool in_reboot;
 	void __iomem *dload_dest_addr;
 };
 
@@ -35,7 +39,7 @@ struct qcom_dload {
 
 #define QCOM_DOWNLOAD_BOTHDUMP (QCOM_DOWNLOAD_FULLDUMP | QCOM_DOWNLOAD_MINIDUMP)
 
-static bool enable_dump =
+static int enable_dump =
 	IS_ENABLED(CONFIG_POWER_RESET_QCOM_DOWNLOAD_MODE_DEFAULT);
 static enum qcom_download_mode current_download_mode = QCOM_DOWNLOAD_NODUMP;
 static enum qcom_download_mode dump_mode = QCOM_DOWNLOAD_FULLDUMP;
@@ -49,20 +53,24 @@ static int set_download_mode(enum qcom_download_mode mode)
 			return -ENODEV;
 	}
 	current_download_mode = mode;
-	qcom_scm_set_download_mode(mode, 0);
+	qcom_scm_set_download_mode(mode);
 	return 0;
 }
 
 static int set_dump_mode(enum qcom_download_mode mode)
 {
-	int ret = 0;
+	int ret = 0, temp;
 
 	if (enable_dump) {
 		ret = set_download_mode(mode);
 		if (likely(!ret))
-			dump_mode = mode;
+			dump_mode = qcom_scm_get_download_mode(&temp) ? dump_mode : temp;
 	} else
 		dump_mode = mode;
+
+	if (dump_mode != mode)
+		pr_err("Requested dload mode is not set\n");
+
 	return ret;
 }
 
@@ -94,7 +102,7 @@ static int param_set_download_mode(const char *val,
 	int ret;
 
 	/* update enable_dump according to user input */
-	ret = param_set_bool(val, kp);
+	ret = param_set_int(val, kp);
 	if (ret)
 		return ret;
 
@@ -147,7 +155,7 @@ static const struct sysfs_ops reset_sysfs_ops = {
 	.store	= attr_store,
 };
 
-static struct kobj_type qcom_dload_kobj_type = {
+static const struct kobj_type qcom_dload_kobj_type = {
 	.sysfs_ops	= &reset_sysfs_ops,
 };
 
@@ -252,17 +260,29 @@ static int qcom_dload_panic(struct notifier_block *this, unsigned long event,
 	return NOTIFY_OK;
 }
 
+static int qcom_dload_restart(struct notifier_block *this, unsigned long event,
+			      void *ptr)
+{
+	struct qcom_dload *poweroff = container_of(this, struct qcom_dload,
+						   restart_nb);
+
+	if (!poweroff->in_panic && !poweroff->in_reboot) {
+		qcom_scm_disable_sdi();
+		set_download_mode(QCOM_DOWNLOAD_NODUMP);
+	}
+
+	return NOTIFY_OK;
+}
+
 static int qcom_dload_reboot(struct notifier_block *this, unsigned long event,
 			      void *ptr)
 {
 	char *cmd = ptr;
 	struct qcom_dload *poweroff = container_of(this, struct qcom_dload,
-						     reboot_nb);
+						   reboot_nb);
 
-	/* Clean shutdown, disable dump mode to allow normal restart */
-	if (!poweroff->in_panic)
-		set_download_mode(QCOM_DOWNLOAD_NODUMP);
-
+	poweroff->in_reboot = true;
+	set_download_mode(QCOM_DOWNLOAD_NODUMP);
 	if (cmd) {
 		if (!strcmp(cmd, "edl"))
 			set_download_mode(QCOM_DOWNLOAD_EDL);
@@ -295,7 +315,10 @@ static void __iomem *map_prop_mem(const char *propname)
 static int qcom_dload_probe(struct platform_device *pdev)
 {
 	struct qcom_dload *poweroff;
-	int ret;
+	int ret, temp;
+
+	if (IS_ENABLED(CONFIG_QCOM_MINIDUMP) && !msm_minidump_enabled())
+		return -EPROBE_DEFER;
 
 	poweroff = devm_kzalloc(&pdev->dev, sizeof(*poweroff), GFP_KERNEL);
 	if (!poweroff)
@@ -317,8 +340,10 @@ static int qcom_dload_probe(struct platform_device *pdev)
 	}
 
 	poweroff->dload_dest_addr = map_prop_mem("qcom,msm-imem-dload-type");
-
 	msm_enable_dump_mode(enable_dump);
+	dump_mode = qcom_scm_get_download_mode(&temp) ? dump_mode : temp;
+	pr_info("%s: Current dump mode: 0x%x\n", __func__, dump_mode);
+
 	if (!enable_dump)
 		qcom_scm_disable_sdi();
 
@@ -331,6 +356,10 @@ static int qcom_dload_probe(struct platform_device *pdev)
 	poweroff->reboot_nb.priority = 255;
 	register_reboot_notifier(&poweroff->reboot_nb);
 
+	poweroff->restart_nb.notifier_call = qcom_dload_restart;
+	poweroff->restart_nb.priority = 201;
+	register_restart_handler(&poweroff->restart_nb);
+
 	platform_set_drvdata(pdev, poweroff);
 
 	return 0;
@@ -342,6 +371,8 @@ static int qcom_dload_remove(struct platform_device *pdev)
 
 	atomic_notifier_chain_unregister(&panic_notifier_list,
 					 &poweroff->panic_nb);
+
+	unregister_restart_handler(&poweroff->restart_nb);
 	unregister_reboot_notifier(&poweroff->reboot_nb);
 
 	if (poweroff->dload_dest_addr)
@@ -350,19 +381,19 @@ static int qcom_dload_remove(struct platform_device *pdev)
 	return 0;
 }
 
-static const struct of_device_id of_qcom_dload_match[] = {
-	{ .compatible = "qcom,dload-mode", },
+static const struct platform_device_id qcom_dload_id_match[] = {
+	{ .name = "qcom-dload-mode", },
 	{},
 };
-MODULE_DEVICE_TABLE(of, of_qcom_dload_match);
+MODULE_DEVICE_TABLE(platform, qcom_dload_id_match);
 
 static struct platform_driver qcom_dload_driver = {
 	.probe = qcom_dload_probe,
 	.remove = qcom_dload_remove,
 	.driver = {
 		.name = "qcom-dload-mode",
-		.of_match_table = of_match_ptr(of_qcom_dload_match),
 	},
+	.id_table = qcom_dload_id_match,
 };
 
 static int __init qcom_dload_driver_init(void)
@@ -372,7 +403,7 @@ static int __init qcom_dload_driver_init(void)
 #if IS_MODULE(CONFIG_POWER_RESET_QCOM_DOWNLOAD_MODE)
 module_init(qcom_dload_driver_init);
 #else
-pure_initcall(qcom_dload_driver_init);
+fs_initcall(qcom_dload_driver_init);
 #endif
 
 static void __exit qcom_dload_driver_exit(void)
@@ -382,4 +413,4 @@ static void __exit qcom_dload_driver_exit(void)
 module_exit(qcom_dload_driver_exit);
 
 MODULE_DESCRIPTION("MSM Download Mode Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

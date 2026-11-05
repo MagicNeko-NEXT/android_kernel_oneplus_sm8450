@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  *
  */
 
@@ -11,6 +12,7 @@
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <linux/gunyah/gh_irq_lend.h>
 #include <linux/gunyah/gh_rm_drv.h>
+#include <linux/gunyah/gh_vm.h>
 
 #include "gh_rm_drv_private.h"
 
@@ -37,6 +39,7 @@ struct gh_irq_entry {
 
 static struct gh_irq_entry gh_irq_entries[GH_IRQ_LABEL_MAX];
 static DEFINE_SPINLOCK(gh_irq_lend_lock);
+struct notifier_block vm_nb;
 
 static int gh_irq_released_accepted_nb_handler(struct notifier_block *this,
 				      unsigned long cmd, void *data)
@@ -144,6 +147,58 @@ static struct notifier_block gh_irq_lent_nb = {
 	.notifier_call = gh_irq_lent_nb_handler,
 };
 
+static int gh_irq_vm_nb_handler(struct notifier_block *this, unsigned long cmd,
+				void *data)
+{
+	gh_vmid_t vmid;
+	enum gh_irq_label label;
+	struct gh_irq_entry *entry;
+	unsigned long flags;
+	int ret;
+
+	if (!data)
+		return NOTIFY_DONE;
+	vmid = *((gh_vmid_t *)data);
+
+	switch (cmd) {
+	case GH_VM_EARLY_POWEROFF:
+		for (label = 0; label < GH_IRQ_LABEL_MAX; label++) {
+			spin_lock_irqsave(&gh_irq_lend_lock, flags);
+			entry = &gh_irq_entries[label];
+			if (vmid != entry->vmid ||
+			    (entry->state !=
+				     GH_IRQ_STATE_WAIT_RELEASE_OR_ACCEPT &&
+			     entry->state != GH_IRQ_STATE_RELEASED &&
+			     entry->state != GH_IRQ_STATE_ACCEPTED &&
+			     entry->state != GH_IRQ_STATE_LENT)) {
+				spin_unlock_irqrestore(&gh_irq_lend_lock,
+						       flags);
+				continue;
+			}
+			spin_unlock_irqrestore(&gh_irq_lend_lock, flags);
+
+			ret = gh_rm_vm_irq_reclaim(entry->virq_handle);
+			if (ret) {
+				pr_err("Failed to reclaim IRQ label:%d of VMID:%d\n",
+				       label, entry->vmid);
+				continue;
+			}
+
+			spin_lock_irqsave(&gh_irq_lend_lock, flags);
+			entry->state = GH_IRQ_STATE_NONE;
+			spin_unlock_irqrestore(&gh_irq_lend_lock, flags);
+		}
+		pr_info("IRQ reclaim for VMID:%d finished\n", vmid);
+		break;
+	}
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block gh_irq_vm_nb = {
+	.notifier_call = gh_irq_vm_nb_handler,
+};
+
 /**
  * gh_irq_lend_v2: Lend a hardware interrupt to another VM
  * @label: vIRQ high-level label
@@ -176,7 +231,7 @@ int gh_irq_lend_v2(enum gh_irq_label label, enum gh_vm_names name,
 		return -EINVAL;
 	}
 
-	ret = gh_rm_get_vmid(name, &entry->vmid);
+	ret = ghd_rm_get_vmid(name, &entry->vmid);
 	if (ret) {
 		entry->state = GH_IRQ_STATE_NONE;
 		spin_unlock_irqrestore(&gh_irq_lend_lock, flags);
@@ -190,7 +245,7 @@ int gh_irq_lend_v2(enum gh_irq_label label, enum gh_vm_names name,
 
 	return gh_rm_vm_irq_lend(entry->vmid, virq, label, &entry->virq_handle);
 }
-EXPORT_SYMBOL(gh_irq_lend_v2);
+EXPORT_SYMBOL_GPL(gh_irq_lend_v2);
 
 /**
  * gh_irq_lend: Lend a hardware interrupt to another VM
@@ -216,7 +271,7 @@ int gh_irq_lend(enum gh_irq_label label, enum gh_vm_names name,
 
 	return 0;
 }
-EXPORT_SYMBOL(gh_irq_lend);
+EXPORT_SYMBOL_GPL(gh_irq_lend);
 
 /**
  * gh_irq_lend_notify: Pass the irq handle to other VM for accept
@@ -237,7 +292,7 @@ int gh_irq_lend_notify(enum gh_irq_label label)
 
 	return gh_rm_vm_irq_lend_notify(entry->vmid, entry->virq_handle);
 }
-EXPORT_SYMBOL(gh_irq_lend_notify);
+EXPORT_SYMBOL_GPL(gh_irq_lend_notify);
 
 /**
  * gh_irq_reclaim: Reclaim a hardware interrupt after other VM
@@ -268,7 +323,7 @@ int gh_irq_reclaim(enum gh_irq_label label)
 		entry->state = GH_IRQ_STATE_NONE;
 	return ret;
 }
-EXPORT_SYMBOL(gh_irq_reclaim);
+EXPORT_SYMBOL_GPL(gh_irq_reclaim);
 
 /**
  * gh_irq_wait_for_lend_v2: Register to claim a lent interrupt from another VM
@@ -302,7 +357,7 @@ int gh_irq_wait_for_lend_v2(enum gh_irq_label label, enum gh_vm_names name,
 
 	return 0;
 }
-EXPORT_SYMBOL(gh_irq_wait_for_lend_v2);
+EXPORT_SYMBOL_GPL(gh_irq_wait_for_lend_v2);
 
 /**
  * gh_irq_wait_lend: Register to claim a lent interrupt from another VM
@@ -316,7 +371,7 @@ int gh_irq_wait_for_lend(enum gh_irq_label label, enum gh_vm_names name,
 {
 	return 0;
 }
-EXPORT_SYMBOL(gh_irq_wait_for_lend);
+EXPORT_SYMBOL_GPL(gh_irq_wait_for_lend);
 
 /**
  * gh_irq_accept: Register to receive interrupts with a lent vIRQ
@@ -333,7 +388,7 @@ EXPORT_SYMBOL(gh_irq_wait_for_lend);
 int gh_irq_accept(enum gh_irq_label label, int irq, int type)
 {
 	struct gh_irq_entry *entry;
-	u32 virq;
+	int virq;
 
 	if (label >= GH_IRQ_LABEL_MAX)
 		return -EINVAL;
@@ -359,7 +414,7 @@ int gh_irq_accept(enum gh_irq_label label, int irq, int type)
 	entry->state = GH_IRQ_STATE_ACCEPTED;
 	return irq;
 }
-EXPORT_SYMBOL(gh_irq_accept);
+EXPORT_SYMBOL_GPL(gh_irq_accept);
 
 /**
  * gh_irq_accept_notify: Notify the lend vm (pvm) that IRQ is accepted
@@ -386,7 +441,7 @@ int gh_irq_accept_notify(enum gh_irq_label label)
 	return gh_rm_vm_irq_accept_notify(entry->vmid,
 					  entry->virq_handle);
 }
-EXPORT_SYMBOL(gh_irq_accept_notify);
+EXPORT_SYMBOL_GPL(gh_irq_accept_notify);
 
 /**
  * gh_irq_release: Release a lent interrupt
@@ -412,7 +467,7 @@ int gh_irq_release(enum gh_irq_label label)
 		entry->state = GH_IRQ_STATE_WAIT_LEND;
 	return ret;
 }
-EXPORT_SYMBOL(gh_irq_release);
+EXPORT_SYMBOL_GPL(gh_irq_release);
 
 int gh_irq_release_notify(enum gh_irq_label label)
 {
@@ -430,13 +485,17 @@ int gh_irq_release_notify(enum gh_irq_label label)
 	return gh_rm_vm_irq_release_notify(entry->vmid,
 					  entry->virq_handle);
 }
-EXPORT_SYMBOL(gh_irq_release_notify);
+EXPORT_SYMBOL_GPL(gh_irq_release_notify);
 
 static int __init gh_irq_lend_init(void)
 {
 	int ret;
 
 	ret = gh_rm_register_notifier(&gh_irq_lent_nb);
+	if (ret)
+		return ret;
+
+	ret = gh_register_vm_notifier(&gh_irq_vm_nb);
 	if (ret)
 		return ret;
 
@@ -448,8 +507,9 @@ static void gh_irq_lend_exit(void)
 {
 	gh_rm_unregister_notifier(&gh_irq_lent_nb);
 	gh_rm_unregister_notifier(&gh_irq_released_accepted_nb);
+	gh_unregister_vm_notifier(&gh_irq_vm_nb);
 }
 module_exit(gh_irq_lend_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. Gunyah IRQ Lending Library");

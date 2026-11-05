@@ -62,6 +62,7 @@ void *snd_usb_find_csint_desc(void *buffer, int buflen, void *after, u8 dsubtype
 	}
 	return NULL;
 }
+EXPORT_SYMBOL_GPL(snd_usb_find_csint_desc);
 
 /*
  * Wrapper for usb_control_msg().
@@ -108,7 +109,6 @@ unsigned char snd_usb_parse_datainterval(struct snd_usb_audio *chip,
 {
 	switch (snd_usb_get_speed(chip->dev)) {
 	case USB_SPEED_HIGH:
-	case USB_SPEED_WIRELESS:
 	case USB_SPEED_SUPER:
 	case USB_SPEED_SUPER_PLUS:
 		if (get_endpoint(alts, 0)->bInterval >= 1 &&
@@ -121,3 +121,13 @@ unsigned char snd_usb_parse_datainterval(struct snd_usb_audio *chip,
 	return 0;
 }
 
+struct usb_host_interface *
+snd_usb_get_host_interface(struct snd_usb_audio *chip, int ifnum, int altsetting)
+{
+	struct usb_interface *iface;
+
+	iface = usb_ifnum_to_if(chip->dev, ifnum);
+	if (!iface)
+		return NULL;
+	return usb_altnum_to_altsetting(iface, altsetting);
+}

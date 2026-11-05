@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
+
 
 /*
  * This driver uses rpmsg to communicate with CDSP and receive requests
@@ -17,6 +18,7 @@
 #include <linux/completion.h>
 #include <linux/string.h>
 #include <linux/err.h>
+#include <linux/cpu.h>
 #include <linux/platform_device.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
@@ -33,36 +35,44 @@
 #include <asm/arch_timer.h>
 #include <linux/soc/qcom/cdsprm.h>
 #include <linux/soc/qcom/cdsprm_cxlimit.h>
+#include <linux/soc/qcom/cdsprm_dcvs_clients_votes.h>
 
-#define SYSMON_CDSP_FEATURE_L3_RX		1
-#define SYSMON_CDSP_FEATURE_RM_RX		2
-#define SYSMON_CDSP_FEATURE_COMPUTE_PRIO_TX	3
-#define SYSMON_CDSP_FEATURE_NPU_LIMIT_TX	4
-#define SYSMON_CDSP_FEATURE_NPU_LIMIT_RX	5
-#define SYSMON_CDSP_FEATURE_NPU_ACTIVITY_TX	6
-#define SYSMON_CDSP_FEATURE_NPU_ACTIVITY_RX	7
-#define SYSMON_CDSP_FEATURE_NPU_CORNER_TX	8
-#define SYSMON_CDSP_FEATURE_NPU_CORNER_RX	9
+#define SYSMON_CDSP_FEATURE_L3_RX				1
+#define SYSMON_CDSP_FEATURE_RM_RX				2
+#define SYSMON_CDSP_FEATURE_COMPUTE_PRIO_TX		3
+#define SYSMON_CDSP_FEATURE_NPU_LIMIT_TX		4
+#define SYSMON_CDSP_FEATURE_NPU_LIMIT_RX		5
+#define SYSMON_CDSP_FEATURE_NPU_ACTIVITY_TX		6
+#define SYSMON_CDSP_FEATURE_NPU_ACTIVITY_RX		7
+#define SYSMON_CDSP_FEATURE_NPU_CORNER_TX		8
+#define SYSMON_CDSP_FEATURE_NPU_CORNER_RX		9
 #define SYSMON_CDSP_FEATURE_THERMAL_LIMIT_TX	10
 #define SYSMON_CDSP_FEATURE_CAMERA_ACTIVITY_TX	11
-#define SYSMON_CDSP_FEATURE_VERSION_RX		12
-#define SYSMON_CDSP_FEATURE_VTCM_CONFIG		13
-#define SYSMON_CDSP_VTCM_SEND_TX_STATUS     14
+#define SYSMON_CDSP_FEATURE_VERSION_RX			12
+#define SYSMON_CDSP_FEATURE_VTCM_CONFIG			13
+#define SYSMON_CDSP_VTCM_SEND_TX_STATUS			14
 #if IS_ENABLED(CONFIG_CDSPRM_VTCM_DYNAMIC_DEBUG)
-#define SYSMON_CDSP_VTCM_SEND_TEST_TX_STATUS  15
+#define SYSMON_CDSP_VTCM_SEND_TEST_TX_STATUS	15
 #endif
+#define SYSMON_CDSP_FEATURE_CRM_PDKILL			16
+#define SYSMON_CDSP_CRM_PDKILL_RX_STATUS		17
+#define SYSMON_CDSP_FEATURE_GET_DCVS_CLIENTS	20
+#define SYSMON_CDSP_DCVS_CLIENTS_RX_STATUS		21
 
-#define SYSMON_CDSP_QOS_FLAG_IGNORE	0
-#define SYSMON_CDSP_QOS_FLAG_ENABLE	1
-#define SYSMON_CDSP_QOS_FLAG_DISABLE	2
-#define QOS_LATENCY_DISABLE_VALUE	-1
-#define SYS_CLK_TICKS_PER_MS		19200
-#define CDSPRM_MSG_QUEUE_DEPTH		50
-#define CDSP_THERMAL_MAX_STATE		10
-#define HVX_THERMAL_MAX_STATE		10
-#define NUM_VTCM_PARTITIONS_MAX		16
-#define NUM_VTCM_APPID_MAPS_MAX		32
-#define SYSMON_CDSP_GLINK_VERSION	0x2
+
+#define SYSMON_CDSP_QOS_FLAG_IGNORE				0
+#define SYSMON_CDSP_QOS_FLAG_ENABLE				1
+#define SYSMON_CDSP_QOS_FLAG_DISABLE			2
+#define QOS_LATENCY_DISABLE_VALUE				-1
+#define SYS_CLK_TICKS_PER_MS					19200
+#define CDSPRM_MSG_QUEUE_DEPTH					50
+#define CDSP_THERMAL_MAX_STATE					10
+#define HVX_THERMAL_MAX_STATE					10
+#define NUM_VTCM_PARTITIONS_MAX					16
+#define NUM_VTCM_APPID_MAPS_MAX					32
+#define SYSMON_CDSP_GLINK_VERSION				0x2
+#define WAIT_FOR_DCVS_CLIENTDATA_TIMEOUT		msecs_to_jiffies(100)
+#define DCVS_CLIENTS_VOTES_SLEEP_LATENCY_THRESHOLD_US	5000
 
 enum {
 	VTCM_PARTITION_REMOVE = 0,
@@ -145,8 +155,24 @@ struct sysmon_msg {
 #if IS_ENABLED(CONFIG_CDSPRM_VTCM_DYNAMIC_DEBUG)
 		unsigned int vtcm_test_rx_status;
 #endif
+		unsigned int crm_pdkill_status;
 	} fs;
 	unsigned int size;
+};
+
+struct sysmon_msg_v2 {
+	unsigned int feature_id;
+	unsigned int size;
+	unsigned int version;
+	unsigned int reserved1;
+	unsigned int reserved2;
+	union {
+		struct sysmon_dcvs_clients dcvs_clients_votes;
+	} fs;
+};
+
+struct crm_pdkill {
+	unsigned int b_enable;
 };
 
 struct sysmon_msg_tx {
@@ -168,6 +194,7 @@ struct sysmon_msg_tx_v2 {
 	unsigned int feature_id;
 	union {
 		struct vtcm_partition_interface vtcm_partition;
+		struct crm_pdkill pdkill;
 	} fs;
 };
 
@@ -193,6 +220,9 @@ struct cdsprm {
 	unsigned int			b_vtcm_test_partitioning;
 #endif
 	unsigned int			b_vtcm_partition_en;
+	unsigned int			b_resmgr_pdkill;
+	unsigned int			b_resmgr_pdkill_override;
+	unsigned int            b_resmgr_pdkill_status;
 	struct completion		msg_avail;
 	struct cdsprm_request		msg_queue[CDSPRM_MSG_QUEUE_DEPTH];
 	struct vtcm_partition_interface		vtcm_partition;
@@ -243,6 +273,9 @@ struct cdsprm {
 #endif
 	struct dentry			*debugfs_file_priority;
 	struct dentry			*debugfs_file_vtcm;
+	struct dentry			*debugfs_resmgr_pdkill_override;
+	struct dentry			*debugfs_resmgr_pdkill_state;
+	struct dentry			*debugfs_dcvs_clients_info;
 	int (*set_l3_freq)(unsigned int freq_khz);
 	int (*set_l3_freq_cached)(unsigned int freq_khz);
 	int (*set_corner_limit)(enum cdsprm_npu_corner);
@@ -250,6 +283,8 @@ struct cdsprm {
 	u32 *coreno;
 	u32 corecount;
 	struct dev_pm_qos_request *dev_pm_qos_req;
+	struct sysmon_dcvs_clients dcvs_clients_votes;
+	struct completion dcvs_clients_votes_complete;
 };
 
 static struct cdsprm gcdsprm;
@@ -275,7 +310,7 @@ void cdsprm_register_cdspl3gov(struct cdsprm_l3 *arg)
 	gcdsprm.set_l3_freq = arg->set_l3_freq;
 	spin_unlock_irqrestore(&gcdsprm.l3_lock, flags);
 }
-EXPORT_SYMBOL(cdsprm_register_cdspl3gov);
+EXPORT_SYMBOL_GPL(cdsprm_register_cdspl3gov);
 
 int cdsprm_cxlimit_npu_limit_register(
 	const struct cdsprm_npu_limit_cbs *npu_limit_cb)
@@ -287,7 +322,7 @@ int cdsprm_cxlimit_npu_limit_register(
 
 	return 0;
 }
-EXPORT_SYMBOL(cdsprm_cxlimit_npu_limit_register);
+EXPORT_SYMBOL_GPL(cdsprm_cxlimit_npu_limit_register);
 
 int cdsprm_cxlimit_npu_limit_deregister(void)
 {
@@ -298,7 +333,7 @@ int cdsprm_cxlimit_npu_limit_deregister(void)
 
 	return 0;
 }
-EXPORT_SYMBOL(cdsprm_cxlimit_npu_limit_deregister);
+EXPORT_SYMBOL_GPL(cdsprm_cxlimit_npu_limit_deregister);
 
 int cdsprm_compute_core_set_priority(unsigned int priority_idx)
 {
@@ -321,7 +356,7 @@ int cdsprm_compute_core_set_priority(unsigned int priority_idx)
 
 	return 0;
 }
-EXPORT_SYMBOL(cdsprm_compute_core_set_priority);
+EXPORT_SYMBOL_GPL(cdsprm_compute_core_set_priority);
 
 #if IS_ENABLED(CONFIG_CDSPRM_VTCM_DYNAMIC_DEBUG)
 int cdsprm_compute_vtcm_test(unsigned int vtcm_test_data)
@@ -400,7 +435,32 @@ int cdsprm_compute_vtcm_set_partition_map(unsigned int b_vtcm_partitioning)
 
 	return result;
 }
-EXPORT_SYMBOL(cdsprm_compute_vtcm_set_partition_map);
+EXPORT_SYMBOL_GPL(cdsprm_compute_vtcm_set_partition_map);
+
+int cdsprm_resmgr_pdkill_config(unsigned int b_enable)
+{
+	int result = -EINVAL;
+	struct sysmon_msg_tx_v2 rpmsg_v2;
+
+	if (gcdsprm.rpmsgdev && gcdsprm.cdsp_version > 2) {
+		rpmsg_v2.cdsp_ver_info = SYSMON_CDSP_GLINK_VERSION;
+		rpmsg_v2.feature_id = SYSMON_CDSP_FEATURE_CRM_PDKILL;
+		rpmsg_v2.fs.pdkill.b_enable = b_enable;
+		rpmsg_v2.size = sizeof(rpmsg_v2);
+		result = rpmsg_send(gcdsprm.rpmsgdev->ept,
+				&rpmsg_v2,
+				sizeof(rpmsg_v2));
+
+		if (result)
+			pr_info("Sending resmgr pdkill config failed: %d\n", result);
+		else {
+			gcdsprm.b_resmgr_pdkill_override = b_enable;
+			pr_info("resmgr pdkill config set to %d\n", b_enable);
+		}
+	}
+
+	return result;
+}
 
 int cdsprm_cxlimit_npu_activity_notify(unsigned int b_enabled)
 {
@@ -452,7 +512,7 @@ int cdsprm_cxlimit_npu_activity_notify(unsigned int b_enabled)
 
 	return result;
 }
-EXPORT_SYMBOL(cdsprm_cxlimit_npu_activity_notify);
+EXPORT_SYMBOL_GPL(cdsprm_cxlimit_npu_activity_notify);
 
 enum cdsprm_npu_corner cdsprm_cxlimit_npu_corner_notify(
 				enum cdsprm_npu_corner corner)
@@ -502,7 +562,7 @@ enum cdsprm_npu_corner cdsprm_cxlimit_npu_corner_notify(
 
 	return return_npu_corner;
 }
-EXPORT_SYMBOL(cdsprm_cxlimit_npu_corner_notify);
+EXPORT_SYMBOL_GPL(cdsprm_cxlimit_npu_corner_notify);
 
 int cdsprm_cxlimit_camera_activity_notify(unsigned int b_enabled)
 {
@@ -526,7 +586,7 @@ int cdsprm_cxlimit_camera_activity_notify(unsigned int b_enabled)
 
 	return 0;
 }
-EXPORT_SYMBOL(cdsprm_cxlimit_camera_activity_notify);
+EXPORT_SYMBOL_GPL(cdsprm_cxlimit_camera_activity_notify);
 
 static int cdsprm_thermal_cdsp_clk_limit(unsigned int level)
 {
@@ -597,7 +657,7 @@ void cdsprm_unregister_cdspl3gov(void)
 	gcdsprm.set_l3_freq = NULL;
 	spin_unlock_irqrestore(&gcdsprm.l3_lock, flags);
 }
-EXPORT_SYMBOL(cdsprm_unregister_cdspl3gov);
+EXPORT_SYMBOL_GPL(cdsprm_unregister_cdspl3gov);
 
 static void qos_cores_init(struct device *dev)
 {
@@ -647,7 +707,7 @@ static void set_qos_latency(int latency)
 {
 	int err = 0;
 	u32 ii = 0;
-	int cpu;
+	unsigned int cpu;
 
 	if (gcdsprm.b_silver_en) {
 
@@ -667,7 +727,7 @@ static void set_qos_latency(int latency)
 			}
 
 			if (err < 0) {
-				pr_err("%s: %s: PM voting cpu:%d fail,err %d,QoS update %d\n",
+				pr_err("%s: %s: PM voting cpu:%u fail,err %d,QoS update %d\n",
 					current->comm, __func__, cpu,
 					err, gcdsprm.qos_request);
 				break;
@@ -785,9 +845,8 @@ static void cdsprm_rpmsg_send_details(void)
 	if (!gcdsprm.cdsp_version)
 		return;
 
-	if (gcdsprm.cdsp_version > 1 && gcdsprm.b_vtcm_partition_en) {
+	if (gcdsprm.cdsp_version > 1 && gcdsprm.b_vtcm_partition_en)
 		cdsprm_compute_vtcm_set_partition_map(VTCM_PARTITION_SET);
-	}
 
 	if (gcdsprm.b_cx_limit_en) {
 		reinit_completion(&gcdsprm.npu_activity_complete);
@@ -836,6 +895,8 @@ static void cdsprm_rpmsg_send_details(void)
 		cdsprm_thermal_hvx_instruction_limit(
 			gcdsprm.thermal_hvx_level);
 	}
+
+	cdsprm_resmgr_pdkill_config(gcdsprm.b_resmgr_pdkill_override);
 }
 
 static struct cdsprm_request *get_next_request(void)
@@ -950,7 +1011,7 @@ static int process_cdsp_request_thread(void *data)
 		spin_unlock_irqrestore(&gcdsprm.list_lock, flags);
 	}
 
-	do_exit(0);
+	return 0;
 }
 
 static int cdsprm_rpmsg_probe(struct rpmsg_device *dev)
@@ -986,14 +1047,21 @@ static int cdsprm_rpmsg_callback(struct rpmsg_device *dev, void *data,
 		int len, void *priv, u32 addr)
 {
 	struct sysmon_msg *msg = (struct sysmon_msg *)data;
+	struct sysmon_msg_v2 *msg_v2 = (struct sysmon_msg_v2 *)data;
 	bool b_valid = false;
 	struct cdsprm_request *req;
 	unsigned long flags;
 
 	if (!data || (len < sizeof(*msg))) {
 		dev_err(&dev->dev,
-		"Invalid message in rpmsg callback, length: %d, expected: %lu\n",
-				len, sizeof(*msg));
+			"Invalid message in rpmsg callback, length: %d, expected: >= %lu\n",
+			len, sizeof(*msg));
+		return -EINVAL;
+	} else if ((msg->feature_id >= SYSMON_CDSP_DCVS_CLIENTS_RX_STATUS) &&
+			(msg_v2->size != len)) {
+		dev_err(&dev->dev,
+			"Invalid message in rpmsg callback, length: %d, expected: >= %lu\n",
+			len, sizeof(*msg_v2));
 		return -EINVAL;
 	}
 
@@ -1054,7 +1122,21 @@ static int cdsprm_rpmsg_callback(struct rpmsg_device *dev, void *data,
 	}
 #endif
 
-	else {
+	else if (msg->feature_id == SYSMON_CDSP_CRM_PDKILL_RX_STATUS) {
+		if (!msg->fs.crm_pdkill_status)
+			gcdsprm.b_resmgr_pdkill_status = gcdsprm.b_resmgr_pdkill_override;
+		dev_dbg(&dev->dev,
+				"Received ack for resmgr pdkill config (%d) with status (%d)\n",
+				gcdsprm.b_resmgr_pdkill_override, msg->fs.crm_pdkill_status);
+	} else if (msg->feature_id == SYSMON_CDSP_DCVS_CLIENTS_RX_STATUS) {
+		gcdsprm.dcvs_clients_votes.status = 0;
+		memset(&gcdsprm.dcvs_clients_votes, 0, sizeof(gcdsprm.dcvs_clients_votes));
+		memcpy(&gcdsprm.dcvs_clients_votes, &msg_v2->fs.dcvs_clients_votes,
+			min((msg_v2->size - offsetof(struct sysmon_msg_v2, fs)),
+				sizeof(gcdsprm.dcvs_clients_votes)));
+		complete(&gcdsprm.dcvs_clients_votes_complete);
+		dev_dbg(&dev->dev, "Received DCVS clients information");
+	} else {
 		dev_err(&dev->dev, "Received incorrect msg feature %d\n",
 		msg->feature_id);
 	}
@@ -1216,11 +1298,554 @@ DEFINE_DEBUGFS_ATTRIBUTE(cdsprmvtcm_test_debugfs_fops,
 			"%llu\n");
 #endif
 
+static int cdsprm_resmgr_pdkill_override_read(void *data, u64 *val)
+{
+	*val = gcdsprm.b_resmgr_pdkill_status;
+
+	return 0;
+}
+
+static int cdsprm_resmgr_pdkill_override_write(void *data, u64 val)
+{
+	int result = cdsprm_resmgr_pdkill_config((unsigned int)val);
+
+	pr_info("resmgr pdkill override %llu sent to NSP, returned %d\n", val, result);
+
+	return result;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(cdsprm_resmgr_pdkill_debugfs_fops,
+			cdsprm_resmgr_pdkill_override_read,
+			cdsprm_resmgr_pdkill_override_write,
+			"%llu\n");
+
+static char *dcvs_vcorner(unsigned int i)
+{
+	switch (i) {
+	case 0:
+		return "DISABLE";
+	case 1:
+		return "SVS2";
+	case 2:
+		return "SVS";
+	case 3:
+		return "SVS_PLUS";
+	case 4:
+		return "NOM";
+	case 5:
+		return "NOM_PLUS";
+	case 6:
+		return "TURBO";
+	case 7:
+		return "TURBO_PLUS";
+	case 8:
+		return "TURBO_L2";
+	case 9:
+		return "TURBO_L3";
+	case 10 ... 255:
+		return "MAX";
+	default:
+		return "INVALID";
+	}
+}
+
+char *dcvs_vcorner_ext(unsigned int i)
+{
+	switch (i) {
+	case 0:
+		return "DISABLE";
+	case 1 ... 0x100:
+		return "MIN";
+	case 0x101 ... 0x134:
+		return "LOW_SVS_D2";
+	case 0x135 ... 0x138:
+		return "LOW_SVS_D1";
+	case 0x139 ... 0x140:
+		return "LOW_SVS";
+	case 0x141 ... 0x180:
+		return "SVS";
+	case 0x181 ... 0x1c0:
+		return "SVS_L1";
+	case 0x1C1 ... 0x200:
+		return "NOM";
+	case 0x201 ... 0x240:
+		return "NOM_L1";
+	case 0x241 ... 0x280:
+		return "TUR";
+	case 0x281 ... 0x2A0:
+		return "TUR_L1";
+	case 0x2A1 ... 0x2B0:
+		return "TUR_L2";
+	case 0x2B1 ... 0x2C0:
+		return "TUR_L3";
+	case 0x2C1 ... 0xFFFF:
+		return "MAX";
+	default:
+		return "INVALID";
+	}
+}
+
+static char *dcvs_policy(unsigned int i)
+{
+	switch (i) {
+	case 1:
+		return "ADSP_DCVS_POLICY_BALANCED";
+	case 2:
+		return "ADSP_DCVS_POLICY_POWER_SAVER";
+	case 3:
+		return "ADSP_DCVS_POLICY_POWER_SAVER_AGGRESSIVE";
+	case 4:
+		return "ADSP_DCVS_POLICY_PERFORMANCE";
+	case 5:
+		return "ADSP_DCVS_POLICY_DUTY_CYCLE";
+	default:
+		return "INVALID_DCVS_POLICY";
+	}
+}
+
+static char *dcvs_client_policy(unsigned int i)
+{
+	switch (i) {
+	case 1:
+		return "ADSP_DCVS_ADJUST_UP_DOWN";
+	case 2:
+		return "DSP_DCVS_ADJUST_ONLY_UP";
+	case 4:
+		return "ADSP_DCVS_POWER_SAVER_MODE";
+	case 8:
+		return "ADSP_DCVS_POWER_SAVER_AGGRESSIVE_MODE";
+	case 16:
+		return "ADSP_DCVS_PERFORMANCE_MODE";
+	case 32:
+		return "ADSP_DCVS_DUTY_CYCLE_MODE";
+	default:
+		return "INVALID_DCVS_POLICY";
+	}
+}
+
+enum {
+	LPM_ENABLED = 0,
+	LPM_DISABLED,
+	STANDALONE_APCR_ENABLED,
+	RPM_ASSISTED_APCR_ENABLED,
+};
+
+static char *lpm_state(unsigned int lpmState)
+{
+	switch (lpmState) {
+	case LPM_DISABLED:
+		return "ALL_LPM_DISABLED";
+	case STANDALONE_APCR_ENABLED:
+		return "STANDALONE_APCR_ENABLED";
+	case RPM_ASSISTED_APCR_ENABLED:
+		return "RPM_ASSISTED_APCR_ENABLED";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+/** Input: bitwise-OR of values from #MmpmClientClassType */
+static void print_client_classes(unsigned int adsppmClientClass)
+{
+	char buf[120];
+	int bitMask = 1;
+
+	strscpy(buf, "Client Class: ", sizeof(buf));
+	for (int i = 0; i < 5; i++) {
+		if ((bitMask & adsppmClientClass) != 0) {
+			switch (i) {
+			case 0:
+				strlcat(buf, "AUDIO ", sizeof(buf));
+				break;
+			case 1:
+				strlcat(buf, "VOICE ", sizeof(buf));
+				break;
+			case 2:
+				strlcat(buf, "COMPUTE ", sizeof(buf));
+				break;
+			case 3:
+				strlcat(buf, "STREAMING_1_HVX ", sizeof(buf));
+				break;
+			case 4:
+				strlcat(buf, "STREAMING_2_HVX ", sizeof(buf));
+				break;
+			default:
+				strlcat(buf, "UNKNOWN ", sizeof(buf));
+				break;
+			}
+		}
+
+		bitMask = bitMask << 1;
+	}
+
+	if (!adsppmClientClass)
+		strlcat(buf, "None", sizeof(buf));
+
+	pr_info("%s\n", buf);
+}
+
+static void print_dcvs_clients_votes(void)
+{
+	struct sysmon_dcvs_client_info *dcvs_client_p = &gcdsprm.dcvs_clients_votes.table[0];
+	struct sysmon_dcvs_client_agg_info *agg_info_p = &gcdsprm.dcvs_clients_votes.aggInfo;
+
+	pr_info("Number of active clients %u\n", gcdsprm.dcvs_clients_votes.num_clients);
+
+	if (gcdsprm.dcvs_clients_votes.num_clients) {
+		pr_info("Aggregated States:\n");
+		pr_info("    Core (Min, Max, Target) corner: (%s, %s, %s)\n",
+				dcvs_vcorner(agg_info_p->core_min_corner),
+				dcvs_vcorner(agg_info_p->core_max_corner),
+				dcvs_vcorner(agg_info_p->core_target_corner));
+		pr_info("    Core Perf Mode : %s\n",
+				agg_info_p->core_perf_mode ? "LOW" : "HIGH");
+
+		pr_info("    Bus (Min, Max, Target) corner: (%s, %s, %s)\n",
+				dcvs_vcorner(agg_info_p->bus_min_corner),
+				dcvs_vcorner(agg_info_p->bus_max_corner),
+				dcvs_vcorner(agg_info_p->bus_target_corner));
+		pr_info("    Bus Perf Mode : %s\n",
+				agg_info_p->bus_perf_mode ? "LOW" : "HIGH");
+
+		if (agg_info_p->dcvs_state)
+			pr_info("    DCVS Participation: %s DCVS Policy : %s\n",
+				agg_info_p->dcvs_state ? "ENABLED" : "DISABLED",
+				dcvs_policy(agg_info_p->dcvs_policy));
+
+		if (agg_info_p->core_clk_vote_mhz)
+			pr_info("    Core Clk Vote : %u MHz\n",
+				agg_info_p->core_clk_vote_mhz);
+
+		if (agg_info_p->bus_clk_vote_mhz)
+			pr_info("    Bus Clk Vote : %u MHz\n",
+				agg_info_p->bus_clk_vote_mhz);
+
+		pr_info("    HMX Power : %s\n",
+				(agg_info_p->hmx_power) ? "ON" : "OFF");
+		pr_info("    HMX (Min, Max, Target) Corner: (%s, %s, %s)\n",
+				dcvs_vcorner_ext(agg_info_p->hmx_min_corner),
+				dcvs_vcorner_ext(agg_info_p->hmx_max_corner),
+				dcvs_vcorner_ext(agg_info_p->hmx_target_corner));
+
+		pr_info("    HMX Perf Mode : %s\n",
+				agg_info_p->hmx_perf_mode ? "LOW" : "HIGH");
+
+		if (agg_info_p->hmx_freq_mhz)
+			pr_info("    HMX Frequency : %u MHz\n",
+					agg_info_p->hmx_freq_mhz);
+
+		if (agg_info_p->hmx_floor_freq_mhz)
+			pr_info("    HMX Floor Frequency : %u MHz\n",
+					agg_info_p->hmx_floor_freq_mhz);
+
+		if (agg_info_p->hmx_freq_from_q6_corner_mhz)
+			pr_info("    HMX Frequency From Q6 : %u MHz\n",
+					agg_info_p->hmx_freq_from_q6_corner_mhz);
+
+		if (agg_info_p->hmx_clock_mhz)
+			pr_info("    HMX Final Clock : %u MHz\n",
+				agg_info_p->hmx_clock_mhz);
+
+		pr_info("    CENG (Min, Max, Target) Corner: (%s, %s, %s)\n",
+				dcvs_vcorner(agg_info_p->ceng_min_corner),
+				dcvs_vcorner(agg_info_p->ceng_max_corner),
+				dcvs_vcorner(agg_info_p->ceng_target_corner));
+
+		pr_info("    CENG Perf Mode : %s\n",
+				agg_info_p->ceng_perf_mode ? "LOW" : "HIGH");
+
+		if (agg_info_p->ceng_ib)
+			pr_info("    CENG Instantaneous  BW : %llu bytes per second\n",
+					agg_info_p->ceng_ib);
+
+		if (agg_info_p->ceng_ab)
+			pr_info("    CENG Average BW : %u bytes per second\n",
+					agg_info_p->ceng_ab);
+
+
+		if (agg_info_p->ceng_clock_mhz)
+			pr_info("    Q6->CENG Bus Final Clock : %u MHz\n",
+				agg_info_p->ceng_clock_mhz);
+
+		if (agg_info_p->sleep_latency)
+			pr_info("    DCVS Aggregated Sleep Latency : %u us\n",
+				agg_info_p->sleep_latency);
+
+		if ((agg_info_p->sleep_latency_override))
+			pr_info("    Minimum Sleep Latency (override from user config) : %u us\n",
+				agg_info_p->sleep_latency_override);
+
+		if (agg_info_p->final_sleep_latency_vote)
+			pr_info("    Final Aggregated Sleep Latency : %u us\n",
+				agg_info_p->final_sleep_latency_vote);
+
+		if (agg_info_p->lpm_state)
+			pr_info("    LPM state :%s\n",
+				lpm_state(agg_info_p->lpm_state));
+
+	}
+
+	for (int i = 0; (i < gcdsprm.dcvs_clients_votes.num_clients) &&
+					(i < DCVS_CLIENTS_TABLE_SIZE);
+		 i++) {
+		pr_info("Client ID : %u\n", dcvs_client_p[i].client_id);
+		pr_info("    TID : %u\n", dcvs_client_p[i].tid);
+		pr_info("    PID : %u\n", dcvs_client_p[i].pid);
+
+		if (dcvs_client_p[i].libname[0])
+			pr_info("    Lib Name : %s\n", dcvs_client_p[i].libname);
+
+		if (dcvs_client_p[i].dcvs_enable)
+			pr_info("    DCVS Participation: %s DCVS Policy: %s\n",
+				dcvs_client_p[i].dcvs_enable ? "ENABLED" : "DISABLED",
+				dcvs_client_policy(
+					dcvs_client_p[i].dcvs_policy));
+
+		if (dcvs_client_p[i].set_latency &&
+		    dcvs_client_p[i].latency != 65535)
+			pr_info("    Sleep Latency Vote : %u us\n", dcvs_client_p[i].latency);
+
+		if (dcvs_client_p[i].client_class)
+			print_client_classes(dcvs_client_p[i].client_class);
+
+		if (dcvs_client_p[i].set_core_params) {
+			pr_info("    Core (Min, Max, Target) Corner: (%s, %s, %s)\n",
+				dcvs_vcorner(dcvs_client_p[i].core_min_corner),
+				dcvs_vcorner(dcvs_client_p[i].core_max_corner),
+				dcvs_vcorner(dcvs_client_p[i].core_target_corner));
+			pr_info("    Core Perf Mode : %s\n",
+					dcvs_client_p[i].core_perf_mode ? "LOW" : "HIGH");
+		}
+
+		if (dcvs_client_p[i].set_bus_params) {
+			pr_info("    Bus (Min, Max, Target) Corner: (%s, %s, %s)\n",
+				dcvs_vcorner(dcvs_client_p[i].bus_min_corner),
+				dcvs_vcorner(dcvs_client_p[i].bus_max_corner),
+				dcvs_vcorner(dcvs_client_p[i].bus_target_corner));
+			pr_info("    Bus Perf Mode : %s\n",
+					dcvs_client_p[i].bus_perf_mode ? "LOW" : "HIGH");
+		}
+
+		if (dcvs_client_p[i].mips_set_mips &&
+		    (dcvs_client_p[i].mips_mipsPerThread ||
+		     dcvs_client_p[i].mips_mipsTotal))
+			pr_info("    MIPS Vote Per Thread: %u MIPS Vote Total: %u\n",
+					dcvs_client_p[i].mips_mipsPerThread,
+					dcvs_client_p[i].mips_mipsTotal);
+
+		if (dcvs_client_p[i].mips_set_bus_bw &&
+			dcvs_client_p[i].mips_bwBytePerSec)
+			pr_info("    BW Vote : %llu bytes per second, BW Usage Percentage: %u\n",
+					dcvs_client_p[i].mips_bwBytePerSec,
+					dcvs_client_p[i].mips_busbwUsagePercentage);
+
+		if (dcvs_client_p[i].mips_latency != 65535 &&
+			dcvs_client_p[i].mips_set_latency)
+			pr_info("    Legacy Sleep Latency Vote : %u us\n",
+					dcvs_client_p[i].mips_latency);
+
+		if (dcvs_client_p[i].sleep_disable &&
+			dcvs_client_p[i].set_sleep_disable)
+			pr_info("    LPM State: %s\n",
+					lpm_state(dcvs_client_p[i].sleep_disable));
+
+		pr_info("    HMX Power : %s\n",
+				dcvs_client_p[i].hmx_params.power_up ? "ON" : "OFF");
+
+		if (dcvs_client_p[i].hmx_params.set_clock) {
+			pr_info("    HMX (Min, Max, Target) Corner: (%s, %s, %s)\n",
+					dcvs_vcorner_ext(
+						dcvs_client_p[i].hmx_params.min_corner),
+					dcvs_vcorner_ext(
+						dcvs_client_p[i].hmx_params.max_corner),
+					dcvs_vcorner_ext(
+						dcvs_client_p[i].hmx_params.target_corner));
+
+			pr_info("    HMX Perf Mode : %s\n",
+					dcvs_client_p[i].hmx_params.perf_mode ? "LOW" : "HIGH");
+
+			pr_info("    HMX Default Frequency : %s\n",
+					dcvs_client_p[i].hmx_params.pick_default
+					? "TRUE"
+					: "FALSE");
+
+			if (dcvs_client_p[i].hmx_params.freq_mhz)
+				pr_info("    HMX Frequency Requested : %u MHz\n",
+						dcvs_client_p[i].hmx_params.freq_mhz);
+
+			if (dcvs_client_p[i].hmx_params.floor_freq_mhz)
+				pr_info("    HMX Floor Frequency Requested : %u MHz\n",
+						dcvs_client_p[i].hmx_params.floor_freq_mhz);
+
+			if (dcvs_client_p[i].hmx_params.freq_mhz_from_q6_corner)
+				pr_info("    HMX Frequency From Q6 : %u MHz\n",
+				dcvs_client_p[i].hmx_params.freq_mhz_from_q6_corner);
+		}
+
+		pr_info("    Q6->CENG (Min, Max, Target) Corner: (%s, %s, %s)\n",
+				dcvs_vcorner(dcvs_client_p[i].ceng_params.min_corner),
+				dcvs_vcorner(dcvs_client_p[i].ceng_params.max_corner),
+				dcvs_vcorner(dcvs_client_p[i].ceng_params.target_corner));
+
+		pr_info("    Q6->CENG Perf Mode : %s\n",
+				dcvs_client_p[i].ceng_params.perf_mode ? "LOW" : "HIGH");
+
+		if (dcvs_client_p[i].ceng_params.bwBytePerSec)
+			pr_info("    Q6->CENG BW : %llu bytes per second, Q6->CENG BW Usage Percentage : %u\n",
+					dcvs_client_p[i].ceng_params.bwBytePerSec,
+					dcvs_client_p[i].ceng_params.busbwUsagePercentage);
+
+		pr_info("    Client Suspected to Prevent CDSP Sleep Issue: %s\n",
+				(dcvs_client_p[i].set_latency &&
+				 (dcvs_client_p[i].latency > 0) &&
+				 (dcvs_client_p[i].latency <
+				  DCVS_CLIENTS_VOTES_SLEEP_LATENCY_THRESHOLD_US) &&
+				 dcvs_client_p[i].sleep_disable &&
+				 ((dcvs_client_p[i].set_sleep_disable == STANDALONE_APCR_ENABLED) ||
+				  (dcvs_client_p[i].set_sleep_disable == LPM_DISABLED)))
+					? "YES"
+					: "NO");
+
+	}
+}
+
+static int cdsprm_get_dcvs_clients_votes(void)
+{
+	int result = -EINVAL;
+	struct sysmon_msg_tx_v2 rpmsg;
+
+	if (gcdsprm.rpmsgdev && gcdsprm.cdsp_version >= 5) {
+		rpmsg.cdsp_ver_info = SYSMON_CDSP_GLINK_VERSION;
+		rpmsg.feature_id = SYSMON_CDSP_FEATURE_GET_DCVS_CLIENTS;
+		rpmsg.size = sizeof(rpmsg);
+		result = rpmsg_send(gcdsprm.rpmsgdev->ept, &rpmsg,
+				    sizeof(rpmsg));
+		if (result) {
+			pr_err("cdsprm_sysmon_dcvs_clients_votes failed. Error : %u\n", result);
+			result = DCVS_CLIENTS_VOTES_RPMSG_SEND_FAILED;
+		}
+	} else {
+		result = DCVS_CLIENTS_VOTES_UNSUPPORTED_API;
+		pr_err("cdsprm_sysmon_dcvs_clients_votes not supported. Error: %d\n", result);
+	}
+
+	return result;
+}
+
+int cdsprm_sysmon_dcvs_clients_votes(struct sysmon_dcvs_clients *dcvs_clients_info, bool enable_log)
+{
+	int result = -EINVAL;
+
+	if (!dcvs_clients_info && !enable_log) {
+		result = DCVS_CLIETNS_VOTES_INVALID_PARAMS;
+		pr_err("Parameters validation failed.\n");
+		return result;
+	}
+
+	result = cdsprm_get_dcvs_clients_votes();
+
+	if (!result) {
+
+		if (!wait_for_completion_timeout(
+				&gcdsprm.dcvs_clients_votes_complete,
+				WAIT_FOR_DCVS_CLIENTDATA_TIMEOUT)) {
+			pr_err("timeout waiting for completion\n");
+			result = DCVS_CLIENTS_VOTES_TIMEOUT;
+
+			return result;
+		}
+
+		if (gcdsprm.dcvs_clients_votes.status == DCVS_CLIENTS_VOTES_FETCH_SUCCESS) {
+			if (enable_log)
+				print_dcvs_clients_votes();
+		} else {
+			pr_err("Failed to get DCVS clients information\n");
+			result = DCVS_CLIENTS_VOTES_FAILED;
+		}
+
+		if (dcvs_clients_info)
+			memcpy(dcvs_clients_info, &gcdsprm.dcvs_clients_votes,
+				   sizeof(struct sysmon_dcvs_clients));
+
+	}
+
+	return result;
+}
+EXPORT_SYMBOL_GPL(cdsprm_sysmon_dcvs_clients_votes);
+
+static int dcvs_clients_show(struct seq_file *s, void *d)
+{
+	int result = cdsprm_sysmon_dcvs_clients_votes(NULL, true);
+
+	if (!result)
+		seq_puts(s, "Check kernel log for cdsprm_sysmon_dcvs_clients_votes() output\n");
+	else
+		seq_printf(s, "cdsprm_sysmon_dcvs_clients_votes() failed. Error : %d\n", result);
+
+	return 0;
+}
+
+DEFINE_SHOW_ATTRIBUTE(dcvs_clients);
+
+static int cdsprm_resmgr_pdkill_state_show(struct seq_file *s, void *d)
+{
+	if (gcdsprm.b_resmgr_pdkill_status == 0) {
+		if (gcdsprm.b_resmgr_pdkill == 0)
+			seq_puts(s, "\nresmgr pdkill feature is disabled\n");
+		else
+			seq_puts(s,
+				"\nresmgr pdkill feature is disabled by debugfs override\n");
+	} else {
+		if (gcdsprm.b_resmgr_pdkill)
+			seq_puts(s, "\nresmgr pdkill feature is enabled\n");
+		else
+			seq_puts(s,
+				"\nresmgr pdkill feature is enabled by debugfs override\n");
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(cdsprm_resmgr_pdkill_state);
+
 static const struct thermal_cooling_device_ops hvx_cooling_ops = {
 	.get_max_state = hvx_get_max_state,
 	.get_cur_state = hvx_get_cur_state,
 	.set_cur_state = hvx_set_cur_state,
 };
+
+static void pd_kill_rpmsg(struct device *dev)
+{
+	gcdsprm.b_resmgr_pdkill = of_property_read_bool(dev->of_node,
+				"qcom,resmgr-pdkill-enable");
+	gcdsprm.b_resmgr_pdkill_override = gcdsprm.b_resmgr_pdkill;
+
+	if (gcdsprm.debugfs_dir) {
+		gcdsprm.debugfs_resmgr_pdkill_override =
+				debugfs_create_file("resmgr_pdkill_override_state",
+				0644, gcdsprm.debugfs_dir, NULL,
+				&cdsprm_resmgr_pdkill_debugfs_fops);
+
+		if (!gcdsprm.debugfs_resmgr_pdkill_override)
+			dev_err(dev, "Failed to create resmgr debugfs file\n");
+
+		gcdsprm.debugfs_resmgr_pdkill_state =
+				debugfs_create_file("resmgr_pdkill_state",
+				0444, gcdsprm.debugfs_dir, NULL,
+				&cdsprm_resmgr_pdkill_state_fops);
+
+		if (!gcdsprm.debugfs_resmgr_pdkill_state)
+			dev_err(dev, "Failed to create resmgr debugfs file\n");
+
+		gcdsprm.debugfs_dcvs_clients_info =
+				debugfs_create_file("dcvs_clients",
+				0444, gcdsprm.debugfs_dir, NULL,
+				&dcvs_clients_fops);
+
+		if (!gcdsprm.debugfs_dcvs_clients_info)
+			dev_err(dev, "Failed to create dcvs_clients_show file\n");
+
+	}
+}
 
 static int cdsp_rm_driver_probe(struct platform_device *pdev)
 {
@@ -1246,6 +1871,13 @@ static int cdsp_rm_driver_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
+	gcdsprm.debugfs_dir = debugfs_create_dir("compute", NULL);
+
+	if (!gcdsprm.debugfs_dir) {
+		dev_err(dev,
+		"Failed to create debugfs directory for cdsprm\n");
+	}
+
 	gcdsprm.compute_prio_idx = CDSPRM_COMPUTE_AIX_OVER_HVX;
 	of_property_read_u32(dev->of_node,
 				"qcom,compute-priority-mode",
@@ -1255,12 +1887,7 @@ static int cdsp_rm_driver_probe(struct platform_device *pdev)
 				"qcom,compute-cx-limit-en");
 
 	if (gcdsprm.b_cx_limit_en) {
-		gcdsprm.debugfs_dir = debugfs_create_dir("compute", NULL);
-
-		if (!gcdsprm.debugfs_dir) {
-			dev_err(dev,
-			"Failed to create debugfs directory for cdsprm\n");
-		} else {
+		if (gcdsprm.debugfs_dir) {
 			gcdsprm.debugfs_file_priority =
 						debugfs_create_file("priority",
 						0644, gcdsprm.debugfs_dir,
@@ -1413,7 +2040,7 @@ static int cdsp_rm_driver_probe(struct platform_device *pdev)
 			 = (unsigned char)p;
 		}
 
-		if (!gcdsprm.b_cx_limit_en || !gcdsprm.debugfs_dir)
+		if (!gcdsprm.debugfs_dir)
 			gcdsprm.debugfs_dir
 			 = debugfs_create_dir("compute", NULL);
 
@@ -1434,6 +2061,8 @@ static int cdsp_rm_driver_probe(struct platform_device *pdev)
 					"Failed to create debugfs file\n");
 		}
 	}
+
+	pd_kill_rpmsg(dev);
 
 	dev_dbg(dev, "CDSP request manager driver probe called\n");
 
@@ -1531,7 +2160,7 @@ static int __init cdsprm_init(void)
 	gcdsprm.cdsprm_wq_task = kthread_run(process_cdsp_request_thread,
 					NULL, "cdsprm-wq");
 
-	if (!gcdsprm.cdsprm_wq_task) {
+	if (IS_ERR(gcdsprm.cdsprm_wq_task)) {
 		pr_err("Failed to create kernel thread\n");
 		return -ENOMEM;
 	}
@@ -1555,6 +2184,8 @@ static int __init cdsprm_init(void)
 	}
 
 	gcdsprm.b_cdsprm_devinit = true;
+
+	init_completion(&gcdsprm.dcvs_clients_votes_complete);
 
 	err = platform_driver_register(&hvx_rm);
 
@@ -1652,6 +2283,8 @@ static void __exit cdsprm_exit(void)
 		}
 	}
 
+	complete_all(&gcdsprm.dcvs_clients_votes_complete);
+
 	if (gcdsprm.thermal_cdsp_level) {
 		cdsprm_thermal_cdsp_clk_limit(0);
 		gcdsprm.thermal_cdsp_level = 0;
@@ -1689,6 +2322,8 @@ static void __exit cdsprm_exit(void)
 #if IS_ENABLED(CONFIG_CDSPRM_VTCM_DYNAMIC_DEBUG)
 	gcdsprm.debugfs_file_vtcm_test = NULL;
 #endif
+	gcdsprm.debugfs_resmgr_pdkill_override = NULL;
+	gcdsprm.debugfs_resmgr_pdkill_state = NULL;
 	gcdsprm.hvx_tcdev = NULL;
 	gcdsprm.cdsp_tcdev = NULL;
 
@@ -1698,4 +2333,4 @@ static void __exit cdsprm_exit(void)
 module_init(cdsprm_init);
 module_exit(cdsprm_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

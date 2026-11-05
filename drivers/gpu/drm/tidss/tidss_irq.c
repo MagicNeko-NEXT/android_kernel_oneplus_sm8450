@@ -4,6 +4,9 @@
  * Author: Tomi Valkeinen <tomi.valkeinen@ti.com>
  */
 
+#include <linux/platform_device.h>
+
+#include <drm/drm_drv.h>
 #include <drm/drm_print.h>
 
 #include "tidss_crtc.h"
@@ -50,17 +53,16 @@ void tidss_irq_disable_vblank(struct drm_crtc *crtc)
 	spin_unlock_irqrestore(&tidss->wait_lock, flags);
 }
 
-irqreturn_t tidss_irq_handler(int irq, void *arg)
+static irqreturn_t tidss_irq_handler(int irq, void *arg)
 {
 	struct drm_device *ddev = (struct drm_device *)arg;
 	struct tidss_device *tidss = to_tidss(ddev);
 	unsigned int id;
 	dispc_irq_t irqstatus;
 
-	if (WARN_ON(!ddev->irq_enabled))
-		return IRQ_NONE;
-
+	spin_lock(&tidss->wait_lock);
 	irqstatus = dispc_read_and_clear_irqstatus(tidss->dispc);
+	spin_unlock(&tidss->wait_lock);
 
 	for (id = 0; id < tidss->num_crtcs; id++) {
 		struct drm_crtc *crtc = tidss->crtcs[id];
@@ -93,7 +95,7 @@ void tidss_irq_resume(struct tidss_device *tidss)
 	spin_unlock_irqrestore(&tidss->wait_lock, flags);
 }
 
-void tidss_irq_preinstall(struct drm_device *ddev)
+static void tidss_irq_preinstall(struct drm_device *ddev)
 {
 	struct tidss_device *tidss = to_tidss(ddev);
 
@@ -107,7 +109,7 @@ void tidss_irq_preinstall(struct drm_device *ddev)
 	tidss_runtime_put(tidss);
 }
 
-int tidss_irq_postinstall(struct drm_device *ddev)
+static void tidss_irq_postinstall(struct drm_device *ddev)
 {
 	struct tidss_device *tidss = to_tidss(ddev);
 	unsigned long flags;
@@ -132,6 +134,22 @@ int tidss_irq_postinstall(struct drm_device *ddev)
 	spin_unlock_irqrestore(&tidss->wait_lock, flags);
 
 	tidss_runtime_put(tidss);
+}
+
+int tidss_irq_install(struct drm_device *ddev, unsigned int irq)
+{
+	int ret;
+
+	if (irq == IRQ_NOTCONNECTED)
+		return -ENOTCONN;
+
+	tidss_irq_preinstall(ddev);
+
+	ret = request_irq(irq, tidss_irq_handler, 0, ddev->driver->name, ddev);
+	if (ret)
+		return ret;
+
+	tidss_irq_postinstall(ddev);
 
 	return 0;
 }
@@ -143,4 +161,6 @@ void tidss_irq_uninstall(struct drm_device *ddev)
 	tidss_runtime_get(tidss);
 	dispc_set_irqenable(tidss->dispc, 0);
 	tidss_runtime_put(tidss);
+
+	free_irq(tidss->irq, ddev);
 }

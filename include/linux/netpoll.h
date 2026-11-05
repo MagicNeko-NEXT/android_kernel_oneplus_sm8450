@@ -24,6 +24,7 @@ union inet_addr {
 
 struct netpoll {
 	struct net_device *dev;
+	netdevice_tracker dev_tracker;
 	char dev_name[IFNAMSIZ];
 	const char *name;
 
@@ -31,6 +32,7 @@ struct netpoll {
 	bool ipv6;
 	u16 local_port, remote_port;
 	u8 remote_mac[ETH_ALEN];
+	struct sk_buff_head skb_pool;
 };
 
 struct netpoll_info {

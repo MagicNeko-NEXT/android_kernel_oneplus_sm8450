@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2021-2023, 2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef __QMI_SENSORS_H__
@@ -73,14 +74,29 @@ enum qmi_ts_sensor {
 	QMI_TS_SUB2_SCG_FR1_CC,
 	QMI_TS_SUB2_SCG_FR2_CC,
 	QMI_TS_NSP_ISENSE_TRIM,
+	QMI_TS_EPM0,
+	QMI_TS_EPM1,
+	QMI_TS_EPM2,
+	QMI_TS_EPM3,
+	QMI_TS_EPM4,
+	QMI_TS_EPM5,
+	QMI_TS_EPM6,
+	QMI_TS_EPM7,
 	QMI_TS_SDR0_PA,
 	QMI_TS_SDR1_PA,
+	QMI_TS_SUB0_SDR0_PA,
+	QMI_TS_SUB1_SDR0_PA,
+	QMI_SYS_THERM3,
+	QMI_SYS_THERM4,
+	QMI_SYS_THERM5,
+	QMI_SYS_THERM6,
+	QMI_BEAMER_N_THERM,
+	QMI_BEAMER_E_THERM,
+	QMI_BEAMER_W_THERM,
 	QMI_TS_MODEM_CFG,
 	QMI_TS_LTE_CC,
 	QMI_TS_MCG_FR1_CC,
-	QMI_TS_MCG_FR2_CC,
 	QMI_TS_SCG_FR1_CC,
-	QMI_TS_SCG_FR2_CC,
 	QMI_TS_MAX_NR
 };
 
@@ -149,14 +165,29 @@ static char sensor_clients[QMI_TS_MAX_NR][QMI_CLIENT_NAME_LENGTH] = {
 	{"sub2_scg_fr1_cc"},
 	{"sub2_scg_fr2_cc"},
 	{"isense_trim"},
+	{"epm0"},
+	{"epm1"},
+	{"epm2"},
+	{"epm3"},
+	{"epm4"},
+	{"epm5"},
+	{"epm6"},
+	{"epm7"},
 	{"sdr0_pa"},
 	{"sdr1_pa"},
+	{"sub0_sdr0_pa"},
+	{"sub1_sdr0_pa"},
+	{"sys_therm3"},
+	{"sys_therm4"},
+	{"sys_therm5"},
+	{"sys_therm6"},
+	{"beamer_n_therm"},
+	{"beamer_e_therm"},
+	{"beamer_w_therm"},
 	{"modem_cfg"},
 	{"lte_cc"},
 	{"mcg_fr1_cc"},
-	{"mcg_fr2_cc"},
 	{"scg_fr1_cc"},
-	{"scg_fr2_cc"},
 };
 
 #endif /* __QMI_SENSORS_H__ */

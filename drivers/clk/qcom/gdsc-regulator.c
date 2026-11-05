@@ -21,12 +21,18 @@
 #include <linux/regmap.h>
 #include <linux/reset.h>
 #include <linux/mfd/syscon.h>
+#include <linux/mailbox_client.h>
+#include <linux/mailbox_controller.h>
+#include <linux/mailbox/qmp.h>
 #include <linux/interconnect.h>
 #include <linux/pm.h>
 #include <linux/suspend.h>
 
 #include "../../regulator/internal.h"
 #include "gdsc-debug.h"
+
+#define CREATE_TRACE_POINTS
+#include "trace-gdsc.h"
 
 /* GDSCR */
 #define PWR_ON_MASK		BIT(31)
@@ -50,13 +56,15 @@
 
 /* Register Offset */
 #define REG_OFFSET		0x0
-#define CFG_GDSCR_OFFSET	0x4
+#define CFG_GDSCR_OFFSET	(REG_OFFSET + 0x4)
 
 /* Timeout Delay */
 #define TIMEOUT_US		1500
 
+#define MBOX_TOUT_MS		500
+
 struct collapse_vote {
-	struct regmap	**regmap;
+	struct regmap	*regmap;
 	u32		vote_bit;
 };
 
@@ -78,6 +86,8 @@ struct gdsc {
 	struct clk_ctrl		*clk_ctrl;
 	struct collapse_vote	collapse_vote;
 	struct clk		**clocks;
+	struct mbox_client	mbox_client;
+	struct mbox_chan	*mbox;
 	struct reset_control	**reset_clocks;
 	struct icc_path		**paths;
 	bool			toggle_logic;
@@ -95,18 +105,19 @@ struct gdsc {
 	int			reset_count;
 	int			root_clk_idx;
 	int			sw_reset_count;
-	int			collapse_count;
-	int			clk_ctrl_count;
 	int			path_count;
 	u32			clk_dis_wait_val;
+	int			clk_ctrl_count;
 	u32			gds_timeout;
 	bool			skip_disable_before_enable;
+	bool			skip_disable;
+	bool			bypass_skip_disable;
 	bool			cfg_gdscr;
 };
 
 enum gdscr_status {
-	ENABLED,
 	DISABLED,
+	ENABLED,
 };
 
 static inline u32 gdsc_mb(struct gdsc *gds)
@@ -123,7 +134,7 @@ static int poll_gdsc_status(struct gdsc *sc, enum gdscr_status status)
 	int count = sc->gds_timeout;
 	u32 val, reg_offset;
 
-	if (sc->hw_ctrl)
+	if (sc->hw_ctrl && !sc->cfg_gdscr)
 		regmap = sc->hw_ctrl;
 	else
 		regmap = sc->regmap;
@@ -153,8 +164,11 @@ static int poll_gdsc_status(struct gdsc *sc, enum gdscr_status status)
 			break;
 		}
 
-		if (val)
+		if (val) {
+			trace_gdsc_time(sc->rdesc.name, status,
+					sc->gds_timeout - count, 0);
 			return 0;
+		}
 		/*
 		 * There is no guarantee about the delay needed for the enable
 		 * bit in the GDSCR to be set or reset after the GDSC state
@@ -165,27 +179,76 @@ static int poll_gdsc_status(struct gdsc *sc, enum gdscr_status status)
 		udelay(1);
 	}
 
+	trace_gdsc_time(sc->rdesc.name, status,
+			sc->gds_timeout - count, 1);
 	return -ETIMEDOUT;
+}
+
+static int check_gdsc_status(struct gdsc *sc, struct device *pdev,
+			     enum gdscr_status state)
+{
+	u32 regval, hw_ctrl_regval;
+	int ret;
+	static const char * const gdsc_states[] = {
+			"disable",
+			"enable",
+	};
+
+	if (!sc || !sc->regmap || !pdev)
+		return -EINVAL;
+
+	ret = poll_gdsc_status(sc, state);
+	if (ret) {
+		regmap_read(sc->regmap, REG_OFFSET, &regval);
+		if (sc->hw_ctrl) {
+			regmap_read(sc->hw_ctrl, REG_OFFSET,
+				    &hw_ctrl_regval);
+			dev_warn(pdev, "%s %s state (after %d us timeout): 0x%x, GDS_HW_CTRL: 0x%x. Re-polling.\n",
+				 sc->rdesc.name, gdsc_states[state], sc->gds_timeout,
+				 regval, hw_ctrl_regval);
+
+			ret = poll_gdsc_status(sc, state);
+			if (ret) {
+				regmap_read(sc->regmap, REG_OFFSET,
+					    &regval);
+				regmap_read(sc->hw_ctrl, REG_OFFSET,
+					    &hw_ctrl_regval);
+				dev_err(pdev, "%s %s final state (after additional %d us timeout): 0x%x, GDS_HW_CTRL: 0x%x\n",
+					sc->rdesc.name, gdsc_states[state], sc->gds_timeout,
+					regval, hw_ctrl_regval);
+				return ret;
+			}
+		} else {
+			dev_err(pdev, "%s %s timed out: 0x%x\n",
+				sc->rdesc.name, gdsc_states[state], regval);
+
+			udelay(sc->gds_timeout);
+			regmap_read(sc->regmap, REG_OFFSET, &regval);
+			dev_err(pdev, "%s %s final state: 0x%x (%d us timeout)\n",
+				sc->rdesc.name, gdsc_states[state], regval, sc->gds_timeout);
+			return ret;
+		}
+	}
+	return ret;
 }
 
 static int gdsc_init_is_enabled(struct gdsc *sc)
 {
 	struct regmap *regmap;
 	uint32_t regval, mask;
-	int ret, i;
+	int ret;
 
 	if (!sc->toggle_logic) {
 		sc->is_gdsc_enabled = !sc->resets_asserted;
 		return 0;
 	}
 
-	regmap = sc->regmap;
-	mask = SW_COLLAPSE_MASK;
-
-	if (sc->collapse_count) {
-		for (i = 0; i < sc->collapse_count; i++)
-			regmap = sc->collapse_vote.regmap[i];
+	if (sc->collapse_vote.regmap) {
+		regmap = sc->collapse_vote.regmap;
 		mask = BIT(sc->collapse_vote.vote_bit);
+	} else {
+		regmap = sc->regmap;
+		mask = SW_COLLAPSE_MASK;
 	}
 
 	ret = regmap_read(regmap, REG_OFFSET, &regval);
@@ -194,12 +257,23 @@ static int gdsc_init_is_enabled(struct gdsc *sc)
 
 	sc->is_gdsc_enabled = !(regval & mask);
 
+	if (sc->is_gdsc_enabled && sc->retain_ff_enable)
+		regmap_update_bits(sc->regmap, REG_OFFSET,
+			RETAIN_FF_ENABLE_MASK, RETAIN_FF_ENABLE_MASK);
+
 	return 0;
 }
 
 static int gdsc_is_enabled(struct regulator_dev *rdev)
 {
 	struct gdsc *sc = rdev_get_drvdata(rdev);
+
+	/*
+	 * Return the logical GDSC enable state given that it will only be
+	 * physically disabled by AOP during system sleep.
+	 */
+	if (sc->skip_disable)
+		return sc->is_gdsc_enabled;
 
 	if (!sc->toggle_logic)
 		return !sc->resets_asserted;
@@ -208,6 +282,35 @@ static int gdsc_is_enabled(struct regulator_dev *rdev)
 		return false;
 
 	return sc->is_gdsc_enabled;
+}
+
+#define MAX_LEN 96
+
+static int gdsc_qmp_enable(struct gdsc *sc)
+{
+	char buf[MAX_LEN] = "{class: clock, res: gpu_noc_wa}";
+	struct qmp_pkt pkt;
+	uint32_t regval;
+	int ret;
+
+	regmap_read(sc->regmap, REG_OFFSET, &regval);
+	if (!(regval & SW_COLLAPSE_MASK)) {
+		/*
+		 * Do not enable via a QMP request if the GDSC is already
+		 * enabled by software.
+		 */
+		return 0;
+	}
+
+	pkt.size = MAX_LEN;
+	pkt.data = buf;
+
+	ret = mbox_send_message(sc->mbox, &pkt);
+	if (ret < 0)
+		dev_err(&sc->rdev->dev, "qmp message send failed, ret=%d\n",
+			ret);
+
+	return ret;
 }
 
 static void gdsc_clk_ctrl(struct gdsc *sc, bool en)
@@ -231,7 +334,7 @@ static void gdsc_clk_ctrl(struct gdsc *sc, bool en)
 static int gdsc_enable(struct regulator_dev *rdev)
 {
 	struct gdsc *sc = rdev_get_drvdata(rdev);
-	uint32_t regval, hw_ctrl_regval = 0x0;
+	u32 regval;
 	int i, ret = 0;
 
 	if (sc->skip_disable_before_enable)
@@ -244,8 +347,8 @@ static int gdsc_enable(struct regulator_dev *rdev)
 
 	regmap_read(sc->regmap, REG_OFFSET, &regval);
 	if (regval & HW_CONTROL_MASK) {
-		dev_warn(&rdev->dev, "Invalid enable while %s is under HW control, reg:0x%x\n",
-				sc->rdesc.name, regval);
+		dev_warn(&rdev->dev, "Invalid enable while %s is under HW control\n",
+				sc->rdesc.name);
 		return -EBUSY;
 	}
 
@@ -316,11 +419,14 @@ static int gdsc_enable(struct regulator_dev *rdev)
 		}
 
 		/* Enable gdsc */
-		if (sc->collapse_count) {
-			for (i = 0; i < sc->collapse_count; i++)
-				regmap_update_bits(sc->collapse_vote.regmap[i], REG_OFFSET,
-						BIT(sc->collapse_vote.vote_bit),
-						~BIT(sc->collapse_vote.vote_bit));
+		if (sc->mbox) {
+			ret = gdsc_qmp_enable(sc);
+			if (ret < 0)
+				return ret;
+		} else if (sc->collapse_vote.regmap) {
+			regmap_update_bits(sc->collapse_vote.regmap, REG_OFFSET,
+					BIT(sc->collapse_vote.vote_bit),
+					~BIT(sc->collapse_vote.vote_bit));
 		} else {
 			regmap_read(sc->regmap, REG_OFFSET, &regval);
 			regval &= ~SW_COLLAPSE_MASK;
@@ -331,41 +437,9 @@ static int gdsc_enable(struct regulator_dev *rdev)
 		gdsc_mb(sc);
 		udelay(1);
 
-		ret = poll_gdsc_status(sc, ENABLED);
-		if (ret) {
-			regmap_read(sc->regmap, REG_OFFSET, &regval);
-
-			if (sc->hw_ctrl) {
-				regmap_read(sc->hw_ctrl, REG_OFFSET,
-						&hw_ctrl_regval);
-				dev_warn(&rdev->dev, "%s state (after %d us timeout): 0x%x, GDS_HW_CTRL: 0x%x. Re-polling.\n",
-					sc->rdesc.name, sc->gds_timeout,
-					regval, hw_ctrl_regval);
-
-				ret = poll_gdsc_status(sc, ENABLED);
-				if (ret) {
-					regmap_read(sc->regmap, REG_OFFSET,
-								&regval);
-					regmap_read(sc->hw_ctrl, REG_OFFSET,
-							&hw_ctrl_regval);
-					dev_err(&rdev->dev, "%s final state (after additional %d us timeout): 0x%x, GDS_HW_CTRL: 0x%x\n",
-						sc->rdesc.name, sc->gds_timeout,
-						regval, hw_ctrl_regval);
-					return ret;
-				}
-			} else {
-				dev_err(&rdev->dev, "%s enable timed out: 0x%x\n",
-					sc->rdesc.name,
-					regval);
-				udelay(sc->gds_timeout);
-
-				regmap_read(sc->regmap, REG_OFFSET, &regval);
-				dev_err(&rdev->dev, "%s final state: 0x%x (%d us after timeout)\n",
-					sc->rdesc.name, regval,
-					sc->gds_timeout);
-				return ret;
-			}
-		}
+		ret = check_gdsc_status(sc, &rdev->dev, ENABLED);
+		if (ret)
+			return ret;
 
 		if (sc->retain_ff_enable && !(regval & RETAIN_FF_ENABLE_MASK)) {
 			regval |= RETAIN_FF_ENABLE_MASK;
@@ -404,7 +478,7 @@ static int gdsc_disable(struct regulator_dev *rdev)
 	struct regulator_dev *parent_rdev;
 	uint32_t regval;
 	int i, ret = 0;
-	bool lock = false;
+	bool lock = false, hw_ctrl_mode;
 
 	if (rdev->supply) {
 		parent_rdev = rdev->supply->rdev;
@@ -418,7 +492,7 @@ static int gdsc_disable(struct regulator_dev *rdev)
 		 * checking it's enable count, so it won't get disabled while in the
 		 * middle of GDSC operations
 		 */
-		if (ww_mutex_trylock(&parent_rdev->mutex))
+		if (ww_mutex_trylock(&parent_rdev->mutex, NULL))
 			lock = true;
 
 		if (!parent_rdev->use_count) {
@@ -428,6 +502,9 @@ static int gdsc_disable(struct regulator_dev *rdev)
 			goto done;
 		}
 	}
+
+	regmap_read(sc->regmap, REG_OFFSET, &regval);
+	hw_ctrl_mode = regval & HW_CONTROL_MASK;
 
 	if (sc->clk_ctrl_count)
 		gdsc_clk_ctrl(sc, false);
@@ -440,13 +517,17 @@ static int gdsc_disable(struct regulator_dev *rdev)
 	/* Delay to account for staggered memory powerdown. */
 	udelay(1);
 
-	if (sc->toggle_logic) {
+	if (hw_ctrl_mode || (sc->skip_disable && !sc->bypass_skip_disable)) {
+		/*
+		 * Don't change the GDSCR register state on disable.  AOP will
+		 * handle this during system sleep.
+		 */
+	} else if (sc->toggle_logic) {
 		/* Disable gdsc */
-		if (sc->collapse_count) {
-			for (i = 0; i < sc->collapse_count; i++)
-				regmap_update_bits(sc->collapse_vote.regmap[i], REG_OFFSET,
-						BIT(sc->collapse_vote.vote_bit),
-						BIT(sc->collapse_vote.vote_bit));
+		if (sc->collapse_vote.regmap) {
+			regmap_update_bits(sc->collapse_vote.regmap, REG_OFFSET,
+					BIT(sc->collapse_vote.vote_bit),
+					BIT(sc->collapse_vote.vote_bit));
 		} else {
 			regmap_read(sc->regmap, REG_OFFSET, &regval);
 			regval |= SW_COLLAPSE_MASK;
@@ -465,12 +546,9 @@ static int gdsc_disable(struct regulator_dev *rdev)
 			 */
 			udelay(100);
 		} else {
-			ret = poll_gdsc_status(sc, DISABLED);
-			if (ret) {
-				regmap_read(sc->regmap, REG_OFFSET, &regval);
-				dev_err(&rdev->dev, "%s disable timed out: 0x%x\n",
-					sc->rdesc.name, regval);
-			}
+			ret = check_gdsc_status(sc, &rdev->dev, DISABLED);
+			if (ret)
+				goto done;
 		}
 
 		if (sc->domain_addr) {
@@ -483,7 +561,7 @@ static int gdsc_disable(struct regulator_dev *rdev)
 			ret = icc_set_bw(sc->paths[i], 0, 0);
 			if (ret) {
 				dev_err(&rdev->dev, "Failed to unvote BW for %d: %d\n", i, ret);
-				return ret;
+				goto done;
 			}
 		}
 	} else {
@@ -528,6 +606,12 @@ static unsigned int gdsc_get_mode(struct regulator_dev *rdev)
 {
 	struct gdsc *sc = rdev_get_drvdata(rdev);
 
+	if (sc->skip_disable) {
+		if (sc->bypass_skip_disable)
+			return REGULATOR_MODE_IDLE;
+		return REGULATOR_MODE_NORMAL;
+	}
+
 	return sc->is_gdsc_hw_ctrl_mode ? REGULATOR_MODE_FAST
 					: REGULATOR_MODE_NORMAL;
 }
@@ -538,6 +622,22 @@ static int gdsc_set_mode(struct regulator_dev *rdev, unsigned int mode)
 	struct regulator_dev *parent_rdev;
 	uint32_t regval;
 	int ret = 0;
+
+	if (sc->skip_disable) {
+		switch (mode) {
+		case REGULATOR_MODE_IDLE:
+			sc->bypass_skip_disable = true;
+			break;
+		case REGULATOR_MODE_NORMAL:
+			sc->bypass_skip_disable = false;
+			break;
+		default:
+			ret = -EINVAL;
+			break;
+		}
+
+		return ret;
+	}
 
 	if (rdev->supply) {
 		parent_rdev = rdev->supply->rdev;
@@ -603,12 +703,9 @@ static int gdsc_set_mode(struct regulator_dev *rdev, unsigned int mode)
 		 * starts to use SW mode.
 		 */
 		if (sc->is_gdsc_enabled) {
-			ret = poll_gdsc_status(sc, ENABLED);
-			if (ret) {
-				dev_err(&rdev->dev, "%s enable timed out\n",
-					sc->rdesc.name);
+			ret = check_gdsc_status(sc, &rdev->dev, ENABLED);
+			if (ret)
 				goto done;
-			}
 		}
 		sc->is_gdsc_hw_ctrl_mode = false;
 		break;
@@ -617,9 +714,6 @@ static int gdsc_set_mode(struct regulator_dev *rdev, unsigned int mode)
 		break;
 	}
 
-	regmap_read(sc->regmap, REG_OFFSET, &regval);
-	dev_dbg(&rdev->dev, "%s: %s mode:%u, hw_ctl:%u, reg:0x%x\n",
-			__func__, sc->rdesc.name, mode, sc->is_gdsc_hw_ctrl_mode, regval);
 done:
 	if (rdev->supply)
 		ww_mutex_unlock(&parent_rdev->mutex);
@@ -627,7 +721,7 @@ done:
 	return ret;
 }
 
-static struct regulator_ops gdsc_ops = {
+static const struct regulator_ops gdsc_ops = {
 	.is_enabled = gdsc_is_enabled,
 	.enable = gdsc_enable,
 	.disable = gdsc_disable,
@@ -685,14 +779,58 @@ void gdsc_debug_print_regs(struct regulator *regulator)
 	pr_info("GDSCR: 0x%.8x CFG: 0x%.8x CFG2: 0x%.8x\n",
 		regvals[0], regvals[1], regvals[2]);
 }
-EXPORT_SYMBOL(gdsc_debug_print_regs);
+EXPORT_SYMBOL_GPL(gdsc_debug_print_regs);
+
+static int gdsc_parse_dt_clk_ctrl_data(struct gdsc *sc, struct device *dev)
+{
+	struct of_phandle_args args;
+	int ret, i, clk_ctrl_len;
+
+	if (of_find_property(dev->of_node, "qcom,clk-ctrl", NULL)) {
+
+		clk_ctrl_len = of_count_phandle_with_args(dev->of_node, "qcom,clk-ctrl", NULL);
+
+		if (clk_ctrl_len % 4) {
+			dev_err(dev, "Invalid length of clk-ctrl arguments\n");
+			return -EINVAL;
+		}
+
+		sc->clk_ctrl_count = clk_ctrl_len / 4;
+
+		sc->clk_ctrl = devm_kmalloc_array(dev, sc->clk_ctrl_count,
+						   sizeof(*sc->clk_ctrl), GFP_KERNEL);
+		if (!sc->clk_ctrl)
+			return -ENOMEM;
+
+		for (i = 0; i < sc->clk_ctrl_count; i++) {
+			ret = of_parse_phandle_with_fixed_args(dev->of_node,
+						"qcom,clk-ctrl", 3, i, &args);
+			if (ret) {
+				dev_err(dev, "Failed to get clk-ctrl arguments for index:%d\n", i);
+				return ret;
+			}
+
+			sc->clk_ctrl[i].regmap = syscon_node_to_regmap(args.np);
+			of_node_put(args.np);
+			if (IS_ERR(sc->clk_ctrl[i].regmap)) {
+				dev_err(dev, "Failed to get clk-ctrl regmap for index:%d\n", i);
+				return PTR_ERR(sc->clk_ctrl[i].regmap);
+			}
+
+			sc->clk_ctrl[i].offset = args.args[0];
+			sc->clk_ctrl[i].bit = args.args[1];
+			sc->clk_ctrl[i].en_inverted = !!args.args[2];
+		}
+	}
+
+	return 0;
+}
 
 static int gdsc_parse_dt_data(struct gdsc *sc, struct device *dev,
 				struct regulator_init_data **init_data)
 {
 	struct device_node *np;
-	struct of_phandle_args args;
-	int ret, i, clk_ctrl_len;
+	int ret, i;
 
 	*init_data = of_get_regulator_init_data(dev, dev->of_node, &sc->rdesc);
 	if (*init_data == NULL)
@@ -740,42 +878,10 @@ static int gdsc_parse_dt_data(struct gdsc *sc, struct device *dev,
 			return PTR_ERR(sc->hw_ctrl);
 	}
 
-	if (of_find_property(dev->of_node, "qcom,clk-ctrl", NULL)) {
 
-		clk_ctrl_len = of_count_phandle_with_args(dev->of_node, "qcom,clk-ctrl", NULL);
-
-		if (clk_ctrl_len % 4) {
-			dev_err(dev, "Invalid length of clk-ctrl arguments\n");
-			return -EINVAL;
-		}
-
-		sc->clk_ctrl_count = clk_ctrl_len / 4;
-
-		sc->clk_ctrl = devm_kmalloc_array(dev, sc->clk_ctrl_count,
-						   sizeof(*sc->clk_ctrl), GFP_KERNEL);
-		if (!sc->clk_ctrl)
-			return -ENOMEM;
-
-		for (i = 0; i < sc->clk_ctrl_count; i++) {
-			ret = of_parse_phandle_with_fixed_args(dev->of_node,
-						"qcom,clk-ctrl", 3, i, &args);
-			if (ret) {
-				dev_err(dev, "Failed to get clk-ctrl arguments for index:%d\n", i);
-				return ret;
-			}
-
-			sc->clk_ctrl[i].regmap = syscon_node_to_regmap(args.np);
-			of_node_put(args.np);
-			if (IS_ERR(sc->clk_ctrl[i].regmap)) {
-				dev_err(dev, "Failed to get clk-ctrl regmap for index:%d\n", i);
-				return PTR_ERR(sc->clk_ctrl[i].regmap);
-			}
-
-			sc->clk_ctrl[i].offset = args.args[0];
-			sc->clk_ctrl[i].bit = args.args[1];
-			sc->clk_ctrl[i].en_inverted = !!args.args[2];
-		}
-	}
+	ret = gdsc_parse_dt_clk_ctrl_data(sc, dev);
+	if (ret)
+		return ret;
 
 	sc->gds_timeout = TIMEOUT_US;
 	of_property_read_u32(dev->of_node, "qcom,gds-timeout",
@@ -818,32 +924,39 @@ static int gdsc_parse_dt_data(struct gdsc *sc, struct device *dev,
 					      "qcom,support-cfg-gdscr");
 
 	if (of_find_property(dev->of_node, "qcom,collapse-vote", NULL)) {
-		/* Decrement the collapse count by 1 */
-		sc->collapse_count = of_property_count_u32_elems(dev->of_node,
-					"qcom,collapse-vote") - 1;
-
-		sc->collapse_vote.regmap = devm_kmalloc_array(dev, sc->collapse_count,
-					sizeof(*(sc->collapse_vote).regmap), GFP_KERNEL);
-		if (!sc->collapse_vote.regmap)
-			return -ENOMEM;
-
-		for (i = 0; i < sc->collapse_count; i++) {
-			np = of_parse_phandle(dev->of_node, "qcom,collapse-vote", i);
-			if (!np)
-				return -ENODEV;
-
-			sc->collapse_vote.regmap[i] = syscon_node_to_regmap(np);
-			of_node_put(np);
-			if (IS_ERR(sc->collapse_vote.regmap[i]))
-				return PTR_ERR(sc->collapse_vote.regmap[i]);
+		ret = of_property_count_u32_elems(dev->of_node,
+						  "qcom,collapse-vote");
+		if (ret != 2) {
+			dev_err(dev, "qcom,collapse-vote needs two values\n");
+			return -EINVAL;
 		}
 
-		ret = of_property_read_u32_index(dev->of_node, "qcom,collapse-vote",
-						sc->collapse_count, &sc->collapse_vote.vote_bit);
+		sc->collapse_vote.regmap =
+			syscon_regmap_lookup_by_phandle(dev->of_node,
+							"qcom,collapse-vote");
+		if (IS_ERR(sc->collapse_vote.regmap))
+			return PTR_ERR(sc->collapse_vote.regmap);
+		ret = of_property_read_u32_index(dev->of_node,
+						 "qcom,collapse-vote", 1,
+						 &sc->collapse_vote.vote_bit);
 		if (ret || sc->collapse_vote.vote_bit > 31) {
 			dev_err(dev, "qcom,collapse-vote vote_bit error\n");
 			return ret;
 		}
+	}
+
+	sc->skip_disable = of_property_read_bool(dev->of_node,
+							"qcom,skip-disable");
+	if (sc->skip_disable) {
+		/*
+		 * If the disable skipping feature is allowed, then use mode
+		 * control to enable and disable the feature at runtime instead
+		 * of using it to enable and disable hardware triggering.
+		 */
+		(*init_data)->constraints.valid_ops_mask |=
+							REGULATOR_CHANGE_MODE;
+		(*init_data)->constraints.valid_modes_mask =
+				REGULATOR_MODE_NORMAL | REGULATOR_MODE_IDLE;
 	}
 
 	sc->toggle_logic = !of_property_read_bool(dev->of_node,
@@ -1051,6 +1164,24 @@ static int gdsc_probe(struct platform_device *pdev)
 	regmap_read(sc->regmap, REG_OFFSET, &regval);
 	regval &= ~(HW_CONTROL_MASK | SW_OVERRIDE_MASK);
 
+	if (of_find_property(pdev->dev.of_node, "mboxes", NULL)) {
+		sc->mbox_client.dev = &pdev->dev;
+		sc->mbox_client.tx_block = true;
+		sc->mbox_client.tx_tout = MBOX_TOUT_MS;
+		sc->mbox_client.knows_txdone = false;
+
+		sc->mbox = mbox_request_channel(&sc->mbox_client, 0);
+		if (IS_ERR(sc->mbox)) {
+			ret = PTR_ERR(sc->mbox);
+			dev_err(&pdev->dev, "mailbox channel request failed, ret=%d\n",
+					ret);
+			if (ret == -EAGAIN)
+				ret = -EPROBE_DEFER;
+			sc->mbox = NULL;
+			goto err;
+		}
+	}
+
 	if (!of_property_read_u32(pdev->dev.of_node, "qcom,clk-dis-wait-val",
 				  &clk_dis_wait_val)) {
 		clk_dis_wait_val = clk_dis_wait_val << CLK_DIS_WAIT_SHIFT;
@@ -1068,26 +1199,23 @@ static int gdsc_probe(struct platform_device *pdev)
 		regval &= ~SW_COLLAPSE_MASK;
 		regmap_write(sc->regmap, REG_OFFSET, regval);
 
-		ret = poll_gdsc_status(sc, ENABLED);
-		if (ret) {
-			dev_err(dev, "%s enable timed out: 0x%x\n",
-				sc->rdesc.name, regval);
-			return ret;
-		}
+		ret = check_gdsc_status(sc, dev, ENABLED);
+		if (ret)
+			goto err;
 	}
 
 	ret = gdsc_init_is_enabled(sc);
 	if (ret) {
 		dev_err(dev, "%s failed to get initial enable state, ret=%d\n",
 			sc->rdesc.name, ret);
-		return ret;
+		goto err;
 	}
 
 	ret = gdsc_init_hw_ctrl_mode(sc);
 	if (ret) {
 		dev_err(dev, "%s failed to get initial hw_ctrl state, ret=%d\n",
 			sc->rdesc.name, ret);
-		return ret;
+		goto err;
 	}
 
 	if (sc->pm_ops)
@@ -1109,13 +1237,15 @@ static int gdsc_probe(struct platform_device *pdev)
 		ret = PTR_ERR(sc->rdev);
 		dev_err(dev, "regulator_register(\"%s\") failed, ret=%d\n",
 			sc->rdesc.name, ret);
-		return ret;
+		goto err;
 	}
 
 	ret = devm_regulator_proxy_consumer_register(dev, dev->of_node);
-	if (ret)
+	if (ret) {
 		dev_err(dev, "failed to register proxy consumer, ret=%d\n",
 			ret);
+		goto err;
+	}
 
 	ret = devm_regulator_debug_register(dev, sc->rdev);
 	if (ret)
@@ -1123,6 +1253,11 @@ static int gdsc_probe(struct platform_device *pdev)
 			ret);
 
 	platform_set_drvdata(pdev, sc);
+
+	return 0;
+err:
+	if (sc->mbox)
+		mbox_free_channel(sc->mbox);
 
 	return ret;
 }
@@ -1154,4 +1289,4 @@ static void __exit gdsc_exit(void)
 module_exit(gdsc_exit);
 
 MODULE_DESCRIPTION("GDSC regulator control library");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

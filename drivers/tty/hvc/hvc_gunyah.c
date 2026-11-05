@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "hvc_gunyah: " fmt
@@ -17,6 +18,7 @@
 #include <linux/gunyah/gh_msgq.h>
 #include <linux/gunyah/gh_common.h>
 #include <linux/gunyah/gh_rm_drv.h>
+#include <linux/gunyah/gh_vm.h>
 
 #include "hvc_console.h"
 
@@ -98,7 +100,7 @@ static void gh_hvc_put_work_fn(struct work_struct *ws)
 	int count, ret;
 	struct gh_hvc_prv *prv = container_of(ws, struct gh_hvc_prv, put_work);
 
-	ret = gh_rm_get_vmid(prv->vm_name, &vmid);
+	ret = ghd_rm_get_vmid(prv->vm_name, &vmid);
 	if (ret) {
 		pr_warn_once("%s: gh_rm_get_vmid failed for %d: %d\n",
 			     __func__, prv->vm_name, ret);
@@ -158,7 +160,7 @@ static int gh_hvc_flush(uint32_t vtermno, bool wait)
 	if (vm_name < 0 || vm_name >= GH_VM_MAX)
 		return -EINVAL;
 
-	ret = gh_rm_get_vmid(vm_name, &vmid);
+	ret = ghd_rm_get_vmid(vm_name, &vmid);
 	if (ret)
 		return ret;
 
@@ -181,7 +183,7 @@ static int gh_hvc_notify_add(struct hvc_struct *hp, int vm_name)
 		return 0;
 #endif /* CONFIG_HVC_GUNYAH_CONSOLE */
 
-	ret = gh_rm_get_vmid(vm_name, &vmid);
+	ret = ghd_rm_get_vmid(vm_name, &vmid);
 	if (ret) {
 		pr_err("%s: gh_rm_get_vmid failed for %d: %d\n", __func__,
 			vm_name, ret);
@@ -210,7 +212,7 @@ static void gh_hvc_notify_del(struct hvc_struct *hp, int vm_name)
 		gh_hvc_put_work_fn(&gh_hvc_data[vm_name].put_work);
 	}
 
-	ret = gh_rm_get_vmid(vm_name, &vmid);
+	ret = ghd_rm_get_vmid(vm_name, &vmid);
 	if (ret)
 		return;
 
@@ -233,7 +235,52 @@ static const struct hv_ops gh_hv_ops = {
 	.flush = gh_hvc_flush,
 	.notifier_add = gh_hvc_notify_add,
 	.notifier_del = gh_hvc_notify_del,
+	.notifier_hangup = gh_hvc_notify_del,
 };
+
+#ifndef CONFIG_HVC_GUNYAH_CONSOLE
+static int gh_hvc_vm_state(struct notifier_block *this,
+				       unsigned long cmd, void *data)
+{
+	struct gh_hvc_prv *prv;
+	enum gh_vm_names vm_name;
+	gh_vmid_t vmid = *((gh_vmid_t *)data);
+	int ret;
+
+	ret = gh_rm_get_vm_name(vmid, &vm_name);
+	if (ret)
+		return NOTIFY_DONE;
+
+	if (cmd == GH_VM_EXITED) {
+		if (gh_hvc_data[vm_name].hvc) {
+			hvc_remove(gh_hvc_data[vm_name].hvc);
+			gh_hvc_data[vm_name].hvc = NULL;
+		}
+	} else if (cmd == GH_VM_BEFORE_POWERUP) {
+		/*
+		 * We have already setup the hvc at init for the first
+		 * boot of the VM. Setup only for the consecutive boots.
+		 */
+		if (gh_hvc_data[vm_name].hvc)
+			return NOTIFY_DONE;
+
+		prv = &gh_hvc_data[vm_name];
+		prv->hvc = hvc_alloc(gh_vm_name_to_vtermno(vm_name), vm_name, &gh_hv_ops,
+				     256);
+		ret = PTR_ERR_OR_ZERO(prv->hvc);
+		if (ret) {
+			prv->hvc = NULL;
+			pr_err("Failed to alloc hvc %d\n", ret);
+		}
+	}
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block gh_hvc_vm_nb = {
+	.notifier_call = gh_hvc_vm_state,
+};
+#endif
 
 #ifdef CONFIG_HVC_GUNYAH_CONSOLE
 static int __init hvc_gh_console_init(void)
@@ -253,7 +300,35 @@ static int __init hvc_gh_console_init(void)
 #else
 static int __init hvc_gh_console_init(void)
 {
+	int i = 1, j, ret = 0;
+
+	/*
+	 * Initiate the self console to 0.
+	 * If it fails, DCC must be connected, try 1.
+	 */
+	ret = hvc_instantiate(gh_vm_name_to_vtermno(GH_SELF_VM), 0,
+			      &gh_hv_ops);
+
+	if (ret) {
+		ret = hvc_instantiate(gh_vm_name_to_vtermno(GH_SELF_VM), 1,
+			      &gh_hv_ops);
+		if (ret)
+			goto fail;
+
+		i++;
+	}
+
+	for (j = 1; j < GH_VM_MAX; j++, i++) {
+		ret = hvc_instantiate(gh_vm_name_to_vtermno(j), i,
+			      &gh_hv_ops);
+		if (ret)
+			goto fail;
+	}
+
 	return 0;
+
+fail:
+	return -ENODEV;
 }
 #endif /* CONFIG_HVC_GUNYAH_CONSOLE */
 
@@ -287,13 +362,21 @@ static int __init hvc_gh_init(void)
 	if (ret)
 		goto bail;
 
+#ifndef CONFIG_HVC_GUNYAH_CONSOLE
+	ret = gh_register_vm_notifier(&gh_hvc_vm_nb);
+	if (ret) {
+		gh_rm_unregister_notifier(&gh_hvc_nb);
+		goto bail;
+	}
+#endif /* !CONFIG_HVC_GUNYAH_CONSOLE */
+
 	return 0;
 bail:
 	for (--i; i >= 0; i--) {
 		hvc_remove(gh_hvc_data[i].hvc);
 		gh_hvc_data[i].hvc = NULL;
 	}
-	return ret;
+	return 0;
 }
 late_initcall(hvc_gh_init);
 
@@ -301,6 +384,9 @@ static __exit void hvc_gh_exit(void)
 {
 	int i;
 
+#ifndef CONFIG_HVC_GUNYAH_CONSOLE
+	gh_unregister_vm_notifier(&gh_hvc_vm_nb);
+#endif /* !CONFIG_HVC_GUNYAH_CONSOLE */
 	gh_rm_unregister_notifier(&gh_hvc_nb);
 
 	for (i = 0; i < GH_VM_MAX; i++)
@@ -311,5 +397,5 @@ static __exit void hvc_gh_exit(void)
 }
 module_exit(hvc_gh_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. Gunyah Hypervisor Console Driver");

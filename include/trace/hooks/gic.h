@@ -7,15 +7,11 @@
 #if !defined(_TRACE_HOOK_GIC_H) || defined(TRACE_HEADER_MULTI_READ)
 #define _TRACE_HOOK_GIC_H
 
-
-#include <linux/tracepoint.h>
 #include <trace/hooks/vendor_hooks.h>
-struct gic_chip_data;
 
-DECLARE_HOOK(android_vh_gic_resume,
-       TP_PROTO(struct gic_chip_data *gd),
-       TP_ARGS(gd));
-/* macro versions of hooks are no longer required */
+DECLARE_RESTRICTED_HOOK(android_rvh_fiq_dump,
+	TP_PROTO(struct pt_regs *regs),
+	TP_ARGS(regs), 1);
 
 #endif /* _TRACE_HOOK_GIC_H */
 /* This part must be outside protection */

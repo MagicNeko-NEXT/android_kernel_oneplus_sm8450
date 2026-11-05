@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * USB Super Speed (Plus) redriver core module
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "redriver-core: " fmt
@@ -24,8 +24,7 @@ int usb_add_redriver(struct usb_redriver *redriver)
 {
 	struct usb_redriver *iter;
 
-	if (!redriver->of_node ||  redriver->bounded ||
-	    (redriver->has_orientation && !redriver->get_orientation))
+	if (!redriver->of_node ||  redriver->bounded)
 		return -EINVAL;
 
 	spin_lock(&usb_rediver_lock);
@@ -43,7 +42,7 @@ int usb_add_redriver(struct usb_redriver *redriver)
 
 	return 0;
 }
-EXPORT_SYMBOL(usb_add_redriver);
+EXPORT_SYMBOL_GPL(usb_add_redriver);
 
 /**
  * usb_remove_redriver() - remove a redriver from a specific chip driver.
@@ -73,7 +72,7 @@ int usb_remove_redriver(struct usb_redriver *redriver)
 
 	return 0;
 }
-EXPORT_SYMBOL(usb_remove_redriver);
+EXPORT_SYMBOL_GPL(usb_remove_redriver);
 
 /**
  * usb_get_redriver_by_phandle() - find redriver to be used.
@@ -120,7 +119,7 @@ struct usb_redriver *usb_get_redriver_by_phandle(const struct device_node *np,
 
 	return redriver;
 }
-EXPORT_SYMBOL(usb_get_redriver_by_phandle);
+EXPORT_SYMBOL_GPL(usb_get_redriver_by_phandle);
 
 /**
  * usb_put_redriver() - redriver will not be used.
@@ -142,7 +141,7 @@ void usb_put_redriver(struct usb_redriver *redriver)
 	if (redriver->unbind)
 		redriver->unbind(redriver);
 }
-EXPORT_SYMBOL(usb_put_redriver);
+EXPORT_SYMBOL_GPL(usb_put_redriver);
 
 /* note: following exported symbol can be inlined in header file,
  * export here to avoid unexpected CFI(Clang Control Flow Integrity) issue.
@@ -152,30 +151,21 @@ void usb_redriver_release_lanes(struct usb_redriver *ur, int ort, int num)
 	if (ur && ur->release_usb_lanes)
 		ur->release_usb_lanes(ur, ort, num);
 }
-EXPORT_SYMBOL(usb_redriver_release_lanes);
+EXPORT_SYMBOL_GPL(usb_redriver_release_lanes);
 
 void usb_redriver_notify_connect(struct usb_redriver *ur, int ort)
 {
 	if (ur && ur->notify_connect)
 		ur->notify_connect(ur, ort);
 }
-EXPORT_SYMBOL(usb_redriver_notify_connect);
+EXPORT_SYMBOL_GPL(usb_redriver_notify_connect);
 
 void usb_redriver_notify_disconnect(struct usb_redriver *ur)
 {
 	if (ur && ur->notify_disconnect)
 		ur->notify_disconnect(ur);
 }
-EXPORT_SYMBOL(usb_redriver_notify_disconnect);
-
-int usb_redriver_get_orientation(struct usb_redriver *ur)
-{
-	if (ur && ur->has_orientation)
-		return ur->get_orientation(ur);
-
-	return -EOPNOTSUPP;
-}
-EXPORT_SYMBOL(usb_redriver_get_orientation);
+EXPORT_SYMBOL_GPL(usb_redriver_notify_disconnect);
 
 void usb_redriver_gadget_pullup_enter(struct usb_redriver *ur,
 					int is_on)
@@ -183,7 +173,7 @@ void usb_redriver_gadget_pullup_enter(struct usb_redriver *ur,
 	if (ur && ur->gadget_pullup_enter)
 		ur->gadget_pullup_enter(ur, is_on);
 }
-EXPORT_SYMBOL(usb_redriver_gadget_pullup_enter);
+EXPORT_SYMBOL_GPL(usb_redriver_gadget_pullup_enter);
 
 void usb_redriver_gadget_pullup_exit(struct usb_redriver *ur,
 		int is_on)
@@ -191,14 +181,14 @@ void usb_redriver_gadget_pullup_exit(struct usb_redriver *ur,
 	if (ur && ur->gadget_pullup_exit)
 		ur->gadget_pullup_exit(ur, is_on);
 }
-EXPORT_SYMBOL(usb_redriver_gadget_pullup_exit);
+EXPORT_SYMBOL_GPL(usb_redriver_gadget_pullup_exit);
 
 void usb_redriver_host_powercycle(struct usb_redriver *ur)
 {
 	if (ur && ur->host_powercycle)
 		ur->host_powercycle(ur);
 }
-EXPORT_SYMBOL(usb_redriver_host_powercycle);
+EXPORT_SYMBOL_GPL(usb_redriver_host_powercycle);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("USB Super Speed (Plus) redriver core module");

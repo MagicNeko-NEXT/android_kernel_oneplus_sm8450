@@ -177,7 +177,7 @@ static int vboxsf_fill_super(struct super_block *sb, struct fs_context *fc)
 	}
 	folder_name->size = size;
 	folder_name->length = size - 1;
-	strlcpy(folder_name->string.utf8, fc->source, size);
+	strscpy(folder_name->string.utf8, fc->source, size);
 	err = vboxsf_map_folder(folder_name, &sbi->root);
 	kfree(folder_name);
 	if (err) {
@@ -205,7 +205,7 @@ static int vboxsf_fill_super(struct super_block *sb, struct fs_context *fc)
 		err = -ENOMEM;
 		goto fail_unmap;
 	}
-	vboxsf_init_inode(sbi, iroot, &sbi->root_info);
+	vboxsf_init_inode(sbi, iroot, &sbi->root_info, false);
 	unlock_new_inode(iroot);
 
 	droot = d_make_root(iroot);
@@ -243,7 +243,7 @@ static struct inode *vboxsf_alloc_inode(struct super_block *sb)
 {
 	struct vboxsf_inode *sf_i;
 
-	sf_i = kmem_cache_alloc(vboxsf_inode_cachep, GFP_NOFS);
+	sf_i = alloc_inode_sb(sb, vboxsf_inode_cachep, GFP_NOFS);
 	if (!sf_i)
 		return NULL;
 
@@ -412,7 +412,7 @@ static int vboxsf_reconfigure(struct fs_context *fc)
 
 	/* Apply changed options to the root inode */
 	sbi->o = ctx->o;
-	vboxsf_init_inode(sbi, iroot, &sbi->root_info);
+	vboxsf_init_inode(sbi, iroot, &sbi->root_info, true);
 
 	return 0;
 }

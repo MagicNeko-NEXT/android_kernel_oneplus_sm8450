@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/scmi_protocol.h>
@@ -18,7 +19,7 @@
 
 static struct kobject c1dcvs_kobj;
 static struct scmi_protocol_handle *ph;
-const static struct scmi_c1dcvs_vendor_ops *ops;
+static const struct scmi_c1dcvs_vendor_ops *ops;
 static unsigned int user_c1dcvs_en;
 static unsigned int kernel_c1dcvs_en;
 static DEFINE_MUTEX(c1dcvs_lock);
@@ -70,7 +71,7 @@ static ssize_t show_##name(struct kobject *kobj,			\
 	if (ret < 0)							\
 		return ret;						\
 									\
-	return scnprintf(buf, PAGE_SIZE, "%lu\n", le32_to_cpu(var));	\
+	return scnprintf(buf, PAGE_SIZE, "%u\n", le32_to_cpu(var));	\
 }									\
 
 /*
@@ -123,7 +124,7 @@ int c1dcvs_enable(bool enable)
 
 	return ret;
 }
-EXPORT_SYMBOL(c1dcvs_enable);
+EXPORT_SYMBOL_GPL(c1dcvs_enable);
 
 store_c1dcvs_attr(enable_trace);
 show_c1dcvs_attr(enable_trace);
@@ -144,8 +145,6 @@ static ssize_t store_##name(struct kobject *kobj,			\
 	unsigned int msg[2] = {0};					\
 	char *str, *s_orig = s;						\
 									\
-	if (!s)								\
-		return -ENOMEM;						\
 	while (((str = strsep(&s, " ")) != NULL) && i < 2) {		\
 		ret = kstrtouint(str, 10, &msg[i]);			\
 		if (ret < 0) {						\
@@ -186,7 +185,7 @@ static ssize_t show_##name(struct kobject *kobj,			\
 		vars[i] = le32_to_cpu(vars[i]);				\
 		if (!vars[i])						\
 			break;						\
-		tot += scnprintf(buf + tot, PAGE_SIZE - tot, "%lu\t", vars[i]);\
+		tot += scnprintf(buf + tot, PAGE_SIZE - tot, "%u\t", vars[i]);\
 	}								\
 	tot += scnprintf(buf + tot, PAGE_SIZE - tot, "\n");		\
 									\
@@ -201,7 +200,7 @@ store_c1dcvs_thresh(efreq_thresh);
 show_c1dcvs_thresh(efreq_thresh);
 C1DCVS_ATTR_RW(efreq_thresh);
 
-static struct attribute *c1dcvs_settings_attr[] = {
+static struct attribute *c1dcvs_settings_attrs[] = {
 	&enable_c1dcvs.attr,
 	&enable_trace.attr,
 	&ipc_thresh.attr,
@@ -209,6 +208,7 @@ static struct attribute *c1dcvs_settings_attr[] = {
 	&hysteresis.attr,
 	NULL,
 };
+ATTRIBUTE_GROUPS(c1dcvs_settings);
 
 static ssize_t attr_show(struct kobject *kobj, struct attribute *attr,
 			 char *buf)
@@ -238,23 +238,35 @@ static const struct sysfs_ops c1dcvs_sysfs_ops = {
 	.show	= attr_show,
 	.store	= attr_store,
 };
-static struct kobj_type c1dcvs_settings_ktype = {
+static const struct kobj_type c1dcvs_settings_ktype = {
 	.sysfs_ops		= &c1dcvs_sysfs_ops,
-	.default_attrs		= c1dcvs_settings_attr,
+	.default_groups		= c1dcvs_settings_groups,
 };
 
 static int scmi_c1dcvs_probe(struct scmi_device *sdev)
 {
 	int ret;
+	struct device *dev_root;
 
 	if (!sdev)
 		return -ENODEV;
 
-	ops = sdev->handle->devm_get_protocol(sdev, SCMI_C1DCVS_PROTOCOL, &ph);
-	if (IS_ERR(ops))
-		return PTR_ERR(ops);
-	ret = kobject_init_and_add(&c1dcvs_kobj, &c1dcvs_settings_ktype,
-				   &cpu_subsys.dev_root->kobj, "c1dcvs");
+	ops = sdev->handle->devm_protocol_get(sdev, SCMI_C1DCVS_PROTOCOL, &ph);
+	if (IS_ERR(ops)) {
+		ret = PTR_ERR(ops);
+		ops = NULL;
+		return ret;
+	}
+
+	dev_root = bus_get_dev_root(&cpu_subsys);
+	if (dev_root) {
+		ret = kobject_init_and_add(&c1dcvs_kobj, &c1dcvs_settings_ktype,
+					   &dev_root->kobj, "c1dcvs");
+		put_device(dev_root);
+	} else {
+		dev_err(&sdev->dev, "failed to get cpu_subsys dev_root\n");
+		return -ENODEV;
+	}
 	if (ret < 0) {
 		pr_err("failed to init c1 dcvs kobj: %d\n", ret);
 		kobject_put(&c1dcvs_kobj);
@@ -267,7 +279,7 @@ static int scmi_c1dcvs_probe(struct scmi_device *sdev)
 
 static const struct scmi_device_id scmi_id_table[] = {
 	{ .protocol_id = SCMI_C1DCVS_PROTOCOL, .name = "scmi_c1dcvs_protocol" },
-	{ },
+	{}
 };
 MODULE_DEVICE_TABLE(scmi, scmi_id_table);
 
@@ -280,4 +292,4 @@ module_scmi_driver(scmi_c1dcvs_drv);
 
 MODULE_SOFTDEP("pre: c1dcvs_vendor");
 MODULE_DESCRIPTION("ARM SCMI C1DCVS driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

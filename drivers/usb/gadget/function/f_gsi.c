@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2015-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/module.h>
@@ -24,6 +25,8 @@ static struct gsi_inst_status {
 static int major;
 static struct class *gsi_class;
 static DEFINE_IDA(gsi_ida);
+static DECLARE_COMPLETION(wait_for_ipa_ready);
+struct ipa_usb_ops ipa_ops;
 
 /* Deregister misc device and free instance structures */
 static void gsi_inst_clean(struct gsi_opts *opts);
@@ -155,8 +158,11 @@ static int gsi_wakeup_host(struct f_gsi *gsi)
 	 * fully USB 3.0 compatible hosts.
 	 */
 	if ((gadget->speed >= USB_SPEED_SUPER) && (gsi->func_is_suspended)) {
+		ret = -EOPNOTSUPP;
+#if IS_ENABLED(CONFIG_USB_FUNC_WAKEUP_SUPPORTED)
 		log_event_dbg("%s: Calling usb_func_wakeup", __func__);
 		ret = usb_func_wakeup(func);
+#endif
 	} else {
 		log_event_dbg("%s: Calling usb_gadget_wakeup", __func__);
 		ret = usb_gadget_wakeup(gadget);
@@ -380,8 +386,8 @@ static void usb_gsi_debugfs_exit(void)
 }
 
 /*
- * Callback for when when network interface is up
- * and userspace is ready to answer DHCP requests,  or remote wakeup
+ * Callback for when network interface is up and userspace is ready
+ * to answer DHCP requests or remote wakeup.
  */
 static int ipa_usb_notify_cb(enum ipa_usb_notify_event event,
 	void *driver_data)
@@ -483,6 +489,12 @@ static int ipa_connect_channels(struct gsi_data_port *d_port)
 	log_event_dbg("IN: num_bufs:=%zu, buf_len=%zu\n",
 		d_port->in_request.num_bufs, d_port->in_request.buf_len);
 
+	/*
+	 * Set DWC3 endpoint mode to GSI for cases where disconnect/connect
+	 * channels occurs w/o bind(). (i.e. RNDIS adapter enable/disable)
+	 */
+	msm_ep_set_mode(d_port->in_ep, USB_EP_GSI);
+
 	ret = usb_gsi_ep_op(d_port->in_ep, &d_port->in_request,
 			GSI_EP_OP_PREPARE_TRBS);
 	if (ret) {
@@ -508,16 +520,12 @@ static int ipa_connect_channels(struct gsi_data_port *d_port)
 			GSI_EP_OP_GET_CH_INFO);
 
 	log_event_dbg("%s: USB GSI IN OPS Completed", __func__);
-	in_params->client =
-		(gsi->prot_id != IPA_USB_DIAG) ? IPA_CLIENT_USB_CONS :
-						IPA_CLIENT_USB_DPL_CONS;
-	in_params->ipa_ep_cfg.mode.mode = IPA_BASIC;
 	in_params->teth_prot = gsi->prot_id;
 	in_params->gevntcount_low_addr =
 		gsi_channel_info.gevntcount_low_addr;
 	in_params->gevntcount_hi_addr =
 		gsi_channel_info.gevntcount_hi_addr;
-	in_params->dir = GSI_CHAN_DIR_FROM_GSI;
+	in_params->dir = CHAN_DIR_FROM_GSI;
 	in_params->xfer_ring_len = gsi_channel_info.xfer_ring_len;
 	in_params->xfer_scratch.last_trb_addr_iova =
 					gsi_channel_info.last_trb_addr;
@@ -541,6 +549,13 @@ static int ipa_connect_channels(struct gsi_data_port *d_port)
 		log_event_dbg("OUT: num_bufs:=%zu, buf_len=%zu\n",
 			d_port->out_request.num_bufs,
 			d_port->out_request.buf_len);
+
+		/*
+		 * Set DWC3 endpoint mode to GSI for cases where disconnect/connect
+		 * channels occurs w/o bind(). (i.e. RNDIS adapter enable/disable)
+		 */
+		msm_ep_set_mode(d_port->out_ep, USB_EP_GSI);
+
 		ret = usb_gsi_ep_op(d_port->out_ep, &d_port->out_request,
 			GSI_EP_OP_PREPARE_TRBS);
 		if (ret) {
@@ -565,14 +580,12 @@ static int ipa_connect_channels(struct gsi_data_port *d_port)
 		usb_gsi_ep_op(d_port->out_ep, (void *)&gsi_channel_info,
 				GSI_EP_OP_GET_CH_INFO);
 		log_event_dbg("%s: USB GSI OUT OPS Completed", __func__);
-		out_params->client = IPA_CLIENT_USB_PROD;
-		out_params->ipa_ep_cfg.mode.mode = IPA_BASIC;
 		out_params->teth_prot = gsi->prot_id;
 		out_params->gevntcount_low_addr =
 			gsi_channel_info.gevntcount_low_addr;
 		out_params->gevntcount_hi_addr =
 			gsi_channel_info.gevntcount_hi_addr;
-		out_params->dir = GSI_CHAN_DIR_TO_GSI;
+		out_params->dir = CHAN_DIR_TO_GSI;
 		out_params->xfer_ring_len =
 			gsi_channel_info.xfer_ring_len;
 		out_params->xfer_ring_base_addr_iova =
@@ -626,7 +639,7 @@ static int ipa_connect_channels(struct gsi_data_port *d_port)
 				sizeof(ipa_out_channel_out_params));
 
 	log_event_dbg("%s: Calling xdci_connect", __func__);
-	ret = ipa_usb_xdci_connect(out_params, in_params,
+	ret = d_port->ipa_ops->xdci_connect(out_params, in_params,
 					&ipa_out_channel_out_params,
 					&ipa_in_channel_out_params,
 					conn_params);
@@ -741,7 +754,7 @@ static void ipa_disconnect_channel(struct gsi_data_port *d_port)
 
 	log_event_dbg("%s: Calling xdci_disconnect", __func__);
 
-	ret = ipa_usb_xdci_disconnect(gsi->d_port.out_channel_handle,
+	ret = d_port->ipa_ops->xdci_disconnect(gsi->d_port.out_channel_handle,
 			gsi->d_port.in_channel_handle, gsi->prot_id);
 	if (ret)
 		log_event_err("%s: IPA disconnect failed %d",
@@ -786,7 +799,7 @@ static int ipa_suspend_work_handler(struct gsi_data_port *d_port)
 	}
 
 	log_event_dbg("%s: Calling xdci_suspend", __func__);
-	ret = ipa_usb_xdci_suspend(gsi->d_port.out_channel_handle,
+	ret = d_port->ipa_ops->xdci_suspend(gsi->d_port.out_channel_handle,
 				gsi->d_port.in_channel_handle, gsi->prot_id,
 				usb_gsi_remote_wakeup_allowed(f));
 	if (!ret) {
@@ -819,7 +832,7 @@ static void ipa_resume_work_handler(struct gsi_data_port *d_port)
 
 	log_event_dbg("%s: Calling xdci_resume", __func__);
 
-	ret = ipa_usb_xdci_resume(gsi->d_port.out_channel_handle,
+	ret = d_port->ipa_ops->xdci_resume(gsi->d_port.out_channel_handle,
 					gsi->d_port.in_channel_handle,
 					gsi->prot_id);
 	if (ret)
@@ -906,7 +919,7 @@ static void ipa_work_handler(struct work_struct *w)
 	case STATE_INITIALIZED:
 		if (event == EVT_SET_ALT) {
 			if (!atomic_read(&gsi->connected)) {
-				log_event_err("%s: gsi not connected\n", __func__);
+				log_event_err("USB cable not connected\n");
 				break;
 			}
 
@@ -1085,6 +1098,8 @@ static void ipa_work_handler(struct work_struct *w)
 			log_event_dbg("%s: get = %d", __func__,
 				atomic_read(&gad_dev->power.usage_count));
 
+			msm_ep_set_mode(d_port->in_ep, USB_EP_GSI);
+			msm_ep_set_mode(d_port->out_ep, USB_EP_GSI);
 			ret = ipa_connect_channels(d_port);
 			if (ret) {
 				log_event_err("%s: ipa_connect_channels failed\n",
@@ -1438,14 +1453,14 @@ static ssize_t gsi_ctrl_dev_write(struct file *fp, const char __user *buf,
 	}
 
 	if (!atomic_read(&gsi->connected)) {
-		log_event_err("%s: gsi not connected\n", __func__);
+		log_event_err("USB cable not connected\n");
 		return -ECONNRESET;
 	}
 
 	if (gsi->func_is_suspended && !gsi->func_wakeup_allowed) {
 		c_port->cpkt_drop_cnt++;
 		log_event_err("drop ctrl pkt of len %zu", count);
-		return -ENOTSUPP;
+		return -EOPNOTSUPP;
 	}
 
 	cpkt = gsi_ctrl_pkt_alloc(count, GFP_KERNEL);
@@ -1505,7 +1520,7 @@ static long gsi_ctrl_dev_ioctl(struct file *fp, unsigned int cmd,
 	c_port = &gsi->c_port;
 
 	if (!atomic_read(&gsi->connected)) {
-		log_event_err("%s: gsi not connected\n", __func__);
+		log_event_err("USB cable not connected\n");
 		return -ECONNRESET;
 	}
 
@@ -1805,8 +1820,6 @@ static void gsi_rndis_open(struct f_gsi *gsi)
 {
 	struct usb_composite_dev *cdev = gsi->function.config->cdev;
 
-	log_event_dbg("%s", __func__);
-
 	rndis_set_param_medium(gsi->params, RNDIS_MEDIUM_802_3,
 				gsi_xfer_bitrate(cdev->gadget) / 100);
 	rndis_signal_connect(gsi->params);
@@ -1860,10 +1873,11 @@ static int queue_notification_request(struct f_gsi *gsi)
 		ret = usb_ep_queue(gsi->c_port.notify,
 				   gsi->c_port.notify_req, GFP_ATOMIC);
 	} else {
+		ret = -EOPNOTSUPP;
+#if IS_ENABLED(CONFIG_USB_FUNC_WAKEUP_SUPPORTED)
 		if (gsi->func_wakeup_allowed)
 			ret = usb_func_wakeup(&gsi->function);
-		else
-			ret = -EOPNOTSUPP;
+#endif
 	}
 
 	if (ret < 0 || gsi->func_is_suspended) {
@@ -1889,7 +1903,7 @@ static int gsi_ctrl_send_notification(struct f_gsi *gsi)
 	bool del_free_cpkt = false;
 
 	if (!atomic_read(&gsi->connected)) {
-		log_event_dbg("%s: gsi not connected\n", __func__);
+		log_event_dbg("%s: cable disconnect", __func__);
 		return -ENODEV;
 	}
 
@@ -2013,7 +2027,7 @@ static void gsi_ctrl_notify_resp_complete(struct usb_ep *ep,
 	default:
 		log_event_err("Unknown event %02x --> %d",
 			event->bNotificationType, req->status);
-		/* FALLTHROUGH */
+		fallthrough;
 	case 0:
 		break;
 	}
@@ -2173,7 +2187,7 @@ gsi_setup(struct usb_function *f, const struct usb_ctrlrequest *ctrl)
 	bool line_state;
 
 	if (!atomic_read(&gsi->connected)) {
-		log_event_dbg("%s: gsi not connected\n", __func__);
+		log_event_dbg("usb cable is not connected");
 		return -ENOTCONN;
 	}
 
@@ -2582,7 +2596,7 @@ static void gsi_resume(struct usb_function *f)
 	struct f_gsi *gsi = func_to_gsi(f);
 	struct usb_composite_dev *cdev = f->config->cdev;
 
-	log_event_dbg("%s", __func__);
+	log_event_dbg("%s for prot_id:%d", __func__, gsi->prot_id);
 
 	/*
 	 * If the function is in USB3 Function Suspend state, resume is
@@ -2615,7 +2629,7 @@ static void gsi_resume(struct usb_function *f)
 	post_event(&gsi->d_port, EVT_RESUMED);
 	queue_delayed_work(gsi->d_port.ipa_usb_wq, &gsi->d_port.usb_ipa_w, 0);
 
-	log_event_dbg("%s: completed", __func__);
+	log_event_dbg("%s: for prot_id:%d completed", __func__, gsi->prot_id);
 }
 
 static int gsi_get_status(struct usb_function *f)
@@ -2830,15 +2844,12 @@ fail:
 	return -ENOMEM;
 }
 
-static void ipa_ready_callback(void *user_data)
+void ipa_ready_callback(void *ops)
 {
-	struct f_gsi *gsi = user_data;
-
-	log_event_info("%s: ipa is ready\n", __func__);
-
-	gsi->d_port.ipa_ready = true;
-	wake_up_interruptible(&gsi->d_port.wait_for_ipa_ready);
+	memcpy(&ipa_ops, ops, sizeof(struct ipa_usb_ops));
+	complete_all(&wait_for_ipa_ready);
 }
+EXPORT_SYMBOL(ipa_ready_callback);
 
 static int gsi_bind(struct usb_configuration *c, struct usb_function *f)
 {
@@ -2906,8 +2917,8 @@ static int gsi_bind(struct usb_configuration *c, struct usb_function *f)
 		rndis_set_param_medium(gsi->params, RNDIS_MEDIUM_802_3, 0);
 
 		/* export host's Ethernet address in CDC format */
-		random_ether_addr(gsi->d_port.ipa_init_params.device_ethaddr);
-		random_ether_addr(gsi->d_port.ipa_init_params.host_ethaddr);
+		eth_random_addr(gsi->d_port.ipa_init_params.device_ethaddr);
+		eth_random_addr(gsi->d_port.ipa_init_params.host_ethaddr);
 		log_event_dbg("setting host_ethaddr=%pM, device_ethaddr = %pM",
 		gsi->d_port.ipa_init_params.host_ethaddr,
 		gsi->d_port.ipa_init_params.device_ethaddr);
@@ -3105,13 +3116,13 @@ static int gsi_bind(struct usb_configuration *c, struct usb_function *f)
 		info.notify_buf_len = GSI_CTRL_NOTIFY_BUFF_LEN;
 
 		/* export host's Ethernet address in CDC format */
-		random_ether_addr(gsi->d_port.ipa_init_params.device_ethaddr);
-		random_ether_addr(gsi->d_port.ipa_init_params.host_ethaddr);
+		eth_random_addr(gsi->d_port.ipa_init_params.device_ethaddr);
+		eth_random_addr(gsi->d_port.ipa_init_params.host_ethaddr);
 		log_event_dbg("setting host_ethaddr=%pM, device_ethaddr = %pM",
 		gsi->d_port.ipa_init_params.host_ethaddr,
 		gsi->d_port.ipa_init_params.device_ethaddr);
 
-		snprintf(gsi->ethaddr, sizeof(gsi->ethaddr),
+		scnprintf(gsi->ethaddr, sizeof(gsi->ethaddr),
 		"%02X%02X%02X%02X%02X%02X",
 		gsi->d_port.ipa_init_params.host_ethaddr[0],
 		gsi->d_port.ipa_init_params.host_ethaddr[1],
@@ -3147,21 +3158,17 @@ static int gsi_bind(struct usb_configuration *c, struct usb_function *f)
 	if (status)
 		goto dereg_rndis;
 
-	status = ipa_register_ipa_ready_cb(ipa_ready_callback, gsi);
+	status = wait_for_completion_timeout(&wait_for_ipa_ready,
+				msecs_to_jiffies(GSI_IPA_READY_TIMEOUT));
 	if (!status) {
-		log_event_info("%s: ipa is not ready", __func__);
-		status = wait_event_interruptible_timeout(
-			gsi->d_port.wait_for_ipa_ready, gsi->d_port.ipa_ready,
-			msecs_to_jiffies(GSI_IPA_READY_TIMEOUT));
-		if (!status) {
-			log_event_err("%s: ipa ready timeout", __func__);
-			status = -ETIMEDOUT;
-			goto dereg_rndis;
-		}
+		log_event_err("%s: ipa ready timeout", __func__);
+		status = -ETIMEDOUT;
+		goto dereg_rndis;
 	}
 
+	gsi->d_port.ipa_ops = &ipa_ops;
 	gsi->d_port.ipa_usb_notify_cb = ipa_usb_notify_cb;
-	status = ipa_usb_init_teth_prot(gsi->prot_id,
+	status = gsi->d_port.ipa_ops->init_teth_prot(gsi->prot_id,
 		&gsi->d_port.ipa_init_params, gsi->d_port.ipa_usb_notify_cb,
 		gsi);
 	if (status) {
@@ -3204,13 +3211,13 @@ static void gsi_unbind(struct usb_configuration *c, struct usb_function *f)
 	 * 1. Make sure that any running work completed
 	 * 2. Make sure to wait until all pending work completed i.e. workqueue
 	 * is not having any pending work.
-	 * Above conditions are making sure that ipa_usb_deinit_teth_prot()
+	 * Above conditions are making sure that deinit_teth_prot()
 	 * with ipa driver shall not fail due to unexpected state.
 	 */
 	drain_workqueue(gsi->d_port.ipa_usb_wq);
 	log_event_dbg("%s:id:%d: dwq end", __func__, gsi->prot_id);
 
-	ipa_usb_deinit_teth_prot(gsi->prot_id);
+	gsi->d_port.ipa_ops->deinit_teth_prot(gsi->prot_id);
 
 	/* Reset string ids */
 	rndis_gsi_string_defs[0].id = 0;
@@ -3237,9 +3244,7 @@ static void gsi_unbind(struct usb_configuration *c, struct usb_function *f)
 
 
 static void gsi_free_func(struct usb_function *f)
-{
-	pr_debug("%s\n", __func__);
-}
+{ }
 
 static int gsi_bind_config(struct f_gsi *gsi)
 {
@@ -3308,8 +3313,6 @@ static struct f_gsi *gsi_function_init(enum ipa_usb_teth_prot prot_id)
 	}
 
 	spin_lock_init(&gsi->d_port.lock);
-
-	init_waitqueue_head(&gsi->d_port.wait_for_ipa_ready);
 
 	INIT_DELAYED_WORK(&gsi->d_port.usb_ipa_w, ipa_work_handler);
 
@@ -3508,7 +3511,7 @@ static ssize_t gsi_rndis_class_id_show(struct config_item *item, char *page)
 {
 	struct f_gsi *gsi = to_gsi_opts(item)->gsi;
 
-	return snprintf(page, PAGE_SIZE, "%d\n", gsi->rndis_id);
+	return scnprintf(page, PAGE_SIZE, "%d\n", gsi->rndis_id);
 }
 
 static ssize_t gsi_rndis_class_id_store(struct config_item *item,
@@ -3543,6 +3546,9 @@ static struct config_item_type gsi_func_rndis_type = {
 
 static void gsi_inst_clean(struct gsi_opts *opts)
 {
+	if (!opts)
+		return;
+
 	if (opts->gsi->c_port.cdev.dev) {
 		struct cdev *cdev = &opts->gsi->c_port.cdev;
 		int minor = MINOR(cdev->dev);
@@ -3603,7 +3609,7 @@ static int gsi_set_inst_name(struct usb_function_instance *fi,
 	 * create instance name with prefixing "gsi." to differentiate
 	 * ipc log debugfs entry
 	 */
-	snprintf(gsi_inst_name, sizeof(gsi_inst_name), "gsi.%s", name);
+	scnprintf(gsi_inst_name, sizeof(gsi_inst_name), "gsi.%s", name);
 	ipc_log_ctxt = ipc_log_context_create(NUM_LOG_PAGES, gsi_inst_name, 0);
 	if (!ipc_log_ctxt)
 		pr_err("%s: Err allocating ipc_log_ctxt for prot:%s\n",
@@ -3625,7 +3631,7 @@ static void gsi_free_inst(struct usb_function_instance *f)
 	enum ipa_usb_teth_prot prot_id;
 	struct f_gsi *gsi;
 
-	if (!opts->gsi)
+	if (!opts || !opts->gsi)
 		return;
 
 	prot_id = opts->gsi->prot_id;
@@ -3680,7 +3686,7 @@ static struct usb_function *gsi_alloc(struct usb_function_instance *fi)
 }
 
 DECLARE_USB_FUNCTION(gsi, gsi_alloc_inst, gsi_alloc);
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("GSI function driver");
 
 static int fgsi_init(void)
@@ -3699,7 +3705,7 @@ static int fgsi_init(void)
 	for (i = 0; i < IPA_USB_MAX_TETH_PROT_SIZE; i++)
 		mutex_init(&inst_status[i].gsi_lock);
 
-	gsi_class = class_create(THIS_MODULE, "gsi_usb");
+	gsi_class = class_create("gsi_usb");
 	if (IS_ERR(gsi_class)) {
 		ret = PTR_ERR(gsi_class);
 		gsi_class = NULL;

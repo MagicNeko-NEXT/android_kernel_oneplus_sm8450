@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/init.h>
@@ -13,24 +14,28 @@
 #include <linux/ratelimit.h>
 #include <linux/slab.h>
 #include <linux/fs.h>
-#include <linux/btpower.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
 #include <sound/soc-dapm.h>
 #include <sound/tlv.h>
+#include "btpower.h"
 #include "btfm_slim.h"
 #include "btfm_slim_slave.h"
 #define DELAY_FOR_PORT_OPEN_MS (200)
 #define SLIM_MANF_ID_QCOM	0x217
 #define SLIM_PROD_CODE		0x221
-#define BT_CMD_SLIM_TEST		0xbfac
+#define BT_CMD_SLIM_TEST	0xbfac
+
+#define BTFM_SLIM_MIN_USLEEP	5000
+#define BTFM_SLIM_MAX_USLEEP	(BTFM_SLIM_MIN_USLEEP + 100)
 
 struct class *btfm_slim_class;
 static int btfm_slim_major;
 
 struct btfmslim *btfm_slim_drv_data;
 
+static bool btfm_is_port_opening_delayed = true;
 static int btfm_num_ports_open;
 
 int btfm_slim_write(struct btfmslim *btfmslim,
@@ -56,7 +61,7 @@ int btfm_slim_write(struct btfmslim *btfmslim,
 			break;
 		}
 
-		usleep_range(5000, 5100);
+		usleep_range(BTFM_SLIM_MIN_USLEEP, BTFM_SLIM_MAX_USLEEP);
 	}
 	if (ret) {
 		BTFMSLIM_DBG("retrying to Write 0x%02x to reg 0x%x ret %d",
@@ -70,6 +75,7 @@ int btfm_slim_read(struct btfmslim *btfmslim, uint32_t reg, uint8_t pgd)
 	int ret = -1;
 	int slim_read_tries = SLIM_SLAVE_RW_MAX_TRIES;
 	uint32_t reg_addr;
+
 	BTFMSLIM_DBG("Read from %s", pgd?"PGD":"IFD");
 	reg_addr = SLIM_SLAVE_REG_OFFSET + reg;
 
@@ -82,16 +88,29 @@ int btfm_slim_read(struct btfmslim *btfmslim, uint32_t reg, uint8_t pgd)
 		mutex_unlock(&btfmslim->xfer_lock);
 		if (ret > 0)
 			break;
-		usleep_range(5000, 5100);
+		usleep_range(BTFM_SLIM_MIN_USLEEP, BTFM_SLIM_MAX_USLEEP);
 	}
-
 	return ret;
+}
+
+static bool btfm_slim_is_sb_reset_needed(int chip_ver)
+{
+	switch (chip_ver) {
+	case QCA_APACHE_SOC_ID_0100:
+	case QCA_APACHE_SOC_ID_0110:
+	case QCA_APACHE_SOC_ID_0120:
+	case QCA_APACHE_SOC_ID_0121:
+		return true;
+	default:
+		return false;
+	}
 }
 
 int btfm_slim_enable_ch(struct btfmslim *btfmslim, struct btfmslim_ch *ch,
 	uint8_t rxport, uint32_t rates, uint8_t nchan)
 {
-	int ret, i;
+	int ret = -1;
+	int i = 0;
 	struct btfmslim_ch *chan = ch;
 	int chipset_ver;
 
@@ -133,6 +152,23 @@ int btfm_slim_enable_ch(struct btfmslim *btfmslim, struct btfmslim_ch *ch,
 	chipset_ver = btpower_get_chipset_version();
 	BTFMSLIM_INFO("chipset soc version:%x", chipset_ver);
 
+	/* Delay port opening for few chipsets if:
+	 *	1. for 8k, feedback channel
+	 *	2. 44.1k, 88.2k rxports
+	 */
+	if (((rates == 8000 && btfm_feedback_ch_setting && rxport == 0) ||
+		(rxport == 1 && (rates == 44100 || rates == 88200))) &&
+		btfm_slim_is_sb_reset_needed(chipset_ver)) {
+
+		BTFMSLIM_INFO("btfm_is_port_opening_delayed %d",
+					btfm_is_port_opening_delayed);
+		if (!btfm_is_port_opening_delayed) {
+			BTFMSLIM_INFO("SB reset needed, sleeping");
+			btfm_is_port_opening_delayed = true;
+			msleep(DELAY_FOR_PORT_OPEN_MS);
+		}
+	}
+
 	/* for feedback channel, PCM bit should not be set */
 	if (btfm_feedback_ch_setting) {
 		BTFMSLIM_DBG("port open for feedback ch, not setting PCM bit");
@@ -155,7 +191,6 @@ int btfm_slim_enable_ch(struct btfmslim *btfmslim, struct btfmslim_ch *ch,
 
 	if (ret == 0)
 		btfm_num_ports_open++;
-
 	BTFMSLIM_INFO("btfm_num_ports_open: %d", btfm_num_ports_open);
 	return ret;
 error:
@@ -169,7 +204,8 @@ error:
 int btfm_slim_disable_ch(struct btfmslim *btfmslim, struct btfmslim_ch *ch,
 			uint8_t rxport, uint8_t nchan)
 {
-	int ret, i;
+	int ret = -1;
+	int i = 0;
 	int chipset_ver = 0;
 
 	if (!btfmslim || !ch)
@@ -180,6 +216,8 @@ int btfm_slim_disable_ch(struct btfmslim *btfmslim, struct btfmslim_ch *ch,
 		BTFMSLIM_ERR("Channel not enabled yet. returning");
 		return -EINVAL;
 	}
+
+	btfm_is_port_opening_delayed = false;
 
 	if (rxport && (btfmslim->sample_rate == 44100 ||
 		btfmslim->sample_rate == 88200)) {
@@ -220,12 +258,8 @@ int btfm_slim_disable_ch(struct btfmslim *btfmslim, struct btfmslim_ch *ch,
 		}
 	}
 	ch->dai.sconfig.port_mask = 0;
-	if (ch->dai.sconfig.chs != NULL) {
-		kfree(ch->dai.sconfig.chs);
-		BTFMSLIM_INFO("setting ch->dai.sconfig.chs to NULL");
-		ch->dai.sconfig.chs = NULL;
-	} else
-		BTFMSLIM_ERR("ch->dai.sconfig.chs is already NULL");
+	kfree(ch->dai.sconfig.chs);
+	ch->dai.sconfig.chs = 0;
 
 	if (btfm_num_ports_open > 0)
 		btfm_num_ports_open--;
@@ -240,13 +274,9 @@ int btfm_slim_disable_ch(struct btfmslim *btfmslim, struct btfmslim_ch *ch,
 		chipset_ver == QCA_HSP_SOC_ID_0210 ||
 		chipset_ver == QCA_HSP_SOC_ID_1201 ||
 		chipset_ver == QCA_HSP_SOC_ID_1211 ||
-		chipset_ver == QCA_APACHE_SOC_ID_0100 ||
-		chipset_ver == QCA_APACHE_SOC_ID_0110 ||
-		chipset_ver == QCA_APACHE_SOC_ID_0120 ||
-		chipset_ver == QCA_APACHE_SOC_ID_0121 ||
-		chipset_ver == QCA_MOSELLE_SOC_ID_0100 ||
-		chipset_ver == QCA_MOSELLE_SOC_ID_0110 ||
-		chipset_ver == QCA_MOSELLE_SOC_ID_0120)) {
+		chipset_ver == QCA_HAMILTON_SOC_ID_0100 ||
+		chipset_ver == QCA_HAMILTON_SOC_ID_0101 ||
+		chipset_ver == QCA_HAMILTON_SOC_ID_0200)) {
 		BTFMSLIM_INFO("SB reset needed after all ports disabled, sleeping");
 		msleep(DELAY_FOR_PORT_OPEN_MS);
 	}
@@ -305,13 +335,12 @@ static int btfm_slim_get_logical_addr(struct slim_device *slim)
 		usleep_range(1000, 1100);
 		BTFMSLIM_DBG("retyring get logical addr");
 	} while (time_before(jiffies, timeout));
-
 	return ret;
 }
 
 int btfm_slim_hw_init(struct btfmslim *btfmslim)
 {
-	int ret;
+	int ret = -1;
 	int chipset_ver;
 	struct slim_device *slim;
 	struct slim_device *slim_ifd;
@@ -363,8 +392,7 @@ int btfm_slim_hw_init(struct btfmslim *btfmslim)
 		slim_ifd->e_addr.instance = 0x0;
 		slim_ifd->laddr = 0x0;
 	} else if (chipset_ver == QCA_MOSELLE_SOC_ID_0100 ||
-		chipset_ver == QCA_MOSELLE_SOC_ID_0110 ||
-		chipset_ver == QCA_MOSELLE_SOC_ID_0120) {
+		chipset_ver == QCA_MOSELLE_SOC_ID_0110) {
 		BTFMSLIM_INFO("chipset is Moselle, overwriting EA");
 		slim->is_laddr_valid = false;
 		slim->e_addr.manf_id = SLIM_MANF_ID_QCOM;
@@ -441,15 +469,15 @@ int btfm_slim_hw_init(struct btfmslim *btfmslim)
 		slim_ifd->e_addr.instance = 0x0;
 		slim_ifd->laddr = 0x0;
 	}
-	BTFMSLIM_INFO(
-		"PGD Enum Addr: manu id:%.02x prod code:%.02x dev idx:%.02x instance:%.02x",
-		slim->e_addr.manf_id, slim->e_addr.prod_code,
-		slim->e_addr.dev_index, slim->e_addr.instance);
+		BTFMSLIM_INFO(
+			"PGD Enum Addr: manu id:%.02x prod code:%.02x dev idx:%.02x instance:%.02x",
+			slim->e_addr.manf_id, slim->e_addr.prod_code,
+			slim->e_addr.dev_index, slim->e_addr.instance);
 
-	BTFMSLIM_INFO(
-		"IFD Enum Addr: manu id:%.02x prod code:%.02x dev idx:%.02x instance:%.02x",
-		slim_ifd->e_addr.manf_id, slim_ifd->e_addr.prod_code,
-		slim_ifd->e_addr.dev_index, slim_ifd->e_addr.instance);
+		BTFMSLIM_INFO(
+			"IFD Enum Addr: manu id:%.02x prod code:%.02x dev idx:%.02x instance:%.02x",
+			slim_ifd->e_addr.manf_id, slim_ifd->e_addr.prod_code,
+			slim_ifd->e_addr.dev_index, slim_ifd->e_addr.instance);
 
 	/* Assign Logical Address for PGD (Ported Generic Device)
 	 * enumeration address
@@ -507,14 +535,14 @@ int btfm_slim_hw_deinit(struct btfmslim *btfmslim)
 static int btfm_slim_status(struct slim_device *sdev,
 				enum slim_device_status status)
 {
+	int ret = 0;
 	struct device *dev = &sdev->dev;
 	struct btfmslim *btfm_slim;
-	int ret = 0;
+
 	btfm_slim = dev_get_drvdata(dev);
 	ret = btfm_slim_register_codec(btfm_slim);
 	if (ret)
 		BTFMSLIM_ERR("error, registering slimbus codec failed");
-
 	return ret;
 }
 
@@ -588,7 +616,7 @@ static int btfm_slim_probe(struct slim_device *slim)
 		goto register_err;
 	}
 
-	btfm_slim_class = class_create(THIS_MODULE, "btfmslim-dev");
+	btfm_slim_class = class_create("btfmslim-dev");
 	if (IS_ERR(btfm_slim_class)) {
 		BTFMSLIM_ERR("%s: coudn't create class\n", __func__);
 		ret = -1;
@@ -620,6 +648,7 @@ static void btfm_slim_remove(struct slim_device *slim)
 {
 	struct device *dev = &slim->dev;
 	struct btfmslim *btfm_slim = dev_get_drvdata(dev);
+
 	BTFMSLIM_DBG("");
 	mutex_destroy(&btfm_slim->io_lock);
 	mutex_destroy(&btfm_slim->xfer_lock);
@@ -656,5 +685,5 @@ static struct slim_driver btfm_slim_driver = {
 };
 
 module_slim_driver(btfm_slim_driver);
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("BTFM Slimbus Slave driver");

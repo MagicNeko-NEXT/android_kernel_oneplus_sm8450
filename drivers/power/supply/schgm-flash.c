@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022, 2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "SCHG-FLASH: %s: " fmt, __func__
@@ -12,7 +12,6 @@
 #include <linux/of_irq.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
-#include <linux/pmic-voter.h>
 #include <linux/power_supply.h>
 #include <linux/printk.h>
 #include <linux/regmap.h>
@@ -36,14 +35,7 @@ struct schgm_flash_dev {
 
 static int smblib_read(struct schgm_flash_dev *chg, u16 addr, u8 *val)
 {
-	unsigned int value;
-	int rc = 0;
-
-	rc = regmap_read(chg->regmap, addr, &value);
-	if (rc >= 0)
-		*val = (u8)value;
-
-	return rc;
+	return regmap_read(chg->regmap, addr, (unsigned int *) val);
 }
 
 static int smblib_write(struct schgm_flash_dev *chg, u16 addr, u8 val)
@@ -298,4 +290,4 @@ static struct platform_driver schgm_flash_driver = {
 module_platform_driver(schgm_flash_driver);
 
 MODULE_DESCRIPTION("QTI PMIC SCHGM Flash driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

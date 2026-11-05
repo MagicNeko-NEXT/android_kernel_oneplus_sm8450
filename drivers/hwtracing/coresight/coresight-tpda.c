@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2014-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/kernel.h>
@@ -17,6 +18,8 @@
 
 #include "coresight-priv.h"
 #include "coresight-common.h"
+#include "coresight-trace-id.h"
+#include "coresight-tpda.h"
 
 #define tpda_writel(drvdata, val, off)	__raw_writel((val), drvdata->base + off)
 #define tpda_readl(drvdata, off)	__raw_readl(drvdata->base + off)
@@ -32,38 +35,7 @@ do {									\
 	mb(); /* ensure unlock take effect before we configure */	\
 } while (0)
 
-#define TPDA_CR			(0x000)
-#define TPDA_Pn_CR(n)		(0x004 + (n * 4))
-#define TPDA_FPID_CR		(0x084)
-#define TPDA_FREQREQ_VAL	(0x088)
-#define TPDA_SYNCR		(0x08C)
-#define TPDA_FLUSH_CR		(0x090)
-#define TPDA_FLUSH_SR		(0x094)
-#define TPDA_FLUSH_ERR		(0x098)
-
-#define TPDA_MAX_INPORTS	32
-
 DEFINE_CORESIGHT_DEVLIST(tpda_devs, "tpda");
-
-struct tpda_drvdata {
-	void __iomem		*base;
-	struct device		*dev;
-	struct coresight_device	*csdev;
-	struct mutex		lock;
-	bool			enable;
-	uint32_t		atid;
-	uint32_t		bc_esize[TPDA_MAX_INPORTS];
-	uint32_t		tc_esize[TPDA_MAX_INPORTS];
-	uint32_t		dsb_esize[TPDA_MAX_INPORTS];
-	uint32_t		cmb_esize[TPDA_MAX_INPORTS];
-	bool			trig_async;
-	bool			trig_flag_ts;
-	bool			trig_freq;
-	bool			freq_ts;
-	uint32_t		freq_req_val;
-	bool			freq_req;
-	bool			cmbchan_mode;
-};
 
 static void __tpda_enable_pre_port(struct tpda_drvdata *drvdata)
 {
@@ -180,16 +152,64 @@ static void __tpda_enable(struct tpda_drvdata *drvdata, int port)
 	TPDA_LOCK(drvdata);
 }
 
-static int tpda_enable(struct coresight_device *csdev, int inport, int outport)
+static int tpda_alloc_trace_id(struct coresight_device *csdev)
 {
+	struct tpda_drvdata *drvdata = dev_get_drvdata(csdev->dev.parent);
+	int trace_id;
+	int i, nr_conns;
+
+	nr_conns = csdev->pdata->nr_inconns;
+
+	for (i = 0; i < nr_conns; i++)
+		if (atomic_read(&csdev->pdata->in_conns[i]->dest_refcnt) != 0)
+			return 0;
+
+	trace_id = coresight_trace_id_get_system_id();
+	if (trace_id < 0)
+		return trace_id;
+
+	drvdata->atid = trace_id;
+
+	return 0;
+}
+
+static void tpda_release_trace_id(struct coresight_device *csdev)
+{
+	struct tpda_drvdata *drvdata = dev_get_drvdata(csdev->dev.parent);
+	int i, nr_conns;
+
+	nr_conns = csdev->pdata->nr_inconns;
+
+	for (i = 0; i < nr_conns; i++)
+		if (atomic_read(&csdev->pdata->in_conns[i]->dest_refcnt) != 0)
+			return;
+
+	coresight_trace_id_put_system_id(drvdata->atid);
+
+	drvdata->atid = 0;
+}
+
+static int tpda_enable(struct coresight_device *csdev,
+		       struct coresight_connection *in,
+		       struct coresight_connection *out)
+{
+	int ret;
 	struct tpda_drvdata *drvdata = dev_get_drvdata(csdev->dev.parent);
 
 	mutex_lock(&drvdata->lock);
-	__tpda_enable(drvdata, inport);
+
+	ret = tpda_alloc_trace_id(csdev);
+	if (ret < 0) {
+		mutex_unlock(&drvdata->lock);
+		return ret;
+	}
+
+	__tpda_enable(drvdata, in->dest_port);
 	drvdata->enable = true;
+	atomic_inc(&in->dest_refcnt);
 	mutex_unlock(&drvdata->lock);
 
-	dev_info(drvdata->dev, "TPDA inport %d enabled\n", inport);
+	dev_info(drvdata->dev, "TPDA inport %d enabled\n", in->dest_port);
 	return 0;
 }
 
@@ -206,17 +226,20 @@ static void __tpda_disable(struct tpda_drvdata *drvdata, int port)
 	TPDA_LOCK(drvdata);
 }
 
-static void tpda_disable(struct coresight_device *csdev, int inport,
-			   int outport)
+static void tpda_disable(struct coresight_device *csdev,
+			 struct coresight_connection *in,
+			 struct coresight_connection *out)
 {
 	struct tpda_drvdata *drvdata = dev_get_drvdata(csdev->dev.parent);
 
 	mutex_lock(&drvdata->lock);
-	__tpda_disable(drvdata, inport);
+	__tpda_disable(drvdata, in->dest_port);
 	drvdata->enable = false;
+	atomic_dec(&in->dest_refcnt);
+	tpda_release_trace_id(csdev);
 	mutex_unlock(&drvdata->lock);
 
-	dev_info(drvdata->dev, "TPDA inport %d disabled\n", inport);
+	dev_info(drvdata->dev, "TPDA inport %d disabled\n", in->dest_port);
 }
 
 static const struct coresight_ops_link tpda_link_ops = {
@@ -687,13 +710,6 @@ static int tpda_parse_cmb(struct tpda_drvdata *drvdata)
 static int tpda_parse_of_data(struct tpda_drvdata *drvdata)
 {
 	int ret;
-	struct device_node *node = drvdata->dev->of_node;
-
-	ret = of_property_read_u32(node, "qcom,tpda-atid", &drvdata->atid);
-	if (ret) {
-		dev_err(drvdata->dev, "TPDA ATID is not specified\n");
-		return -EINVAL;
-	}
 
 	ret = tpda_parse_tc(drvdata);
 	if (ret) {
@@ -771,6 +787,17 @@ static int tpda_probe(struct amba_device *adev, const struct amba_id *id)
 	drvdata->dev = &adev->dev;
 	dev_set_drvdata(dev, drvdata);
 
+	drvdata->atclk = devm_clk_get_optional_enabled(dev, "atclk"); /* optional */
+	if (!drvdata->atclk && of_property_read_bool(dev->of_node, "qcom,atclk-dependence")) {
+		dev_err(dev, "atclk is NULL\n");
+		return -EPROBE_DEFER;
+	}
+
+	if (IS_ERR(drvdata->atclk)) {
+		ret = PTR_ERR(drvdata->atclk);
+		return  ret == -ETIMEDOUT ? -EPROBE_DEFER : ret;
+	}
+
 	drvdata->base = devm_ioremap_resource(dev, &adev->res);
 	if (!drvdata->base)
 		return -ENOMEM;
@@ -782,7 +809,7 @@ static int tpda_probe(struct amba_device *adev, const struct amba_id *id)
 		return ret;
 
 	if (!coresight_authstatus_enabled(drvdata->base))
-		goto err;
+		return -EPERM;
 
 	tpda_init_default_data(drvdata);
 
@@ -796,13 +823,37 @@ static int tpda_probe(struct amba_device *adev, const struct amba_id *id)
 	if (IS_ERR(drvdata->csdev))
 		return PTR_ERR(drvdata->csdev);
 
-	pm_runtime_put(&adev->dev);
-
+	pm_runtime_put_sync(&adev->dev);
 	dev_dbg(drvdata->dev, "TPDA initialized\n");
 	return 0;
-err:
-	return -EPERM;
 }
+
+#ifdef CONFIG_PM
+static int tpda_runtime_suspend(struct device *dev)
+{
+	struct tpda_drvdata *drvdata = dev_get_drvdata(dev);
+
+	if (drvdata && !IS_ERR(drvdata->atclk))
+		clk_disable_unprepare(drvdata->atclk);
+
+	return 0;
+}
+
+static int tpda_runtime_resume(struct device *dev)
+{
+	struct tpda_drvdata *drvdata = dev_get_drvdata(dev);
+
+	if (drvdata && !IS_ERR(drvdata->atclk))
+		clk_prepare_enable(drvdata->atclk);
+
+	return 0;
+}
+#endif
+
+static const struct dev_pm_ops tpda_dev_pm_ops = {
+	SET_RUNTIME_PM_OPS(tpda_runtime_suspend,
+			   tpda_runtime_resume, NULL)
+};
 
 static void __exit tpda_remove(struct amba_device *adev)
 {
@@ -825,6 +876,7 @@ static struct amba_driver tpda_driver = {
 	.drv = {
 		.name   = "coresight-tpda",
 		.owner	= THIS_MODULE,
+		.pm = &tpda_dev_pm_ops,
 		.suppress_bind_attrs = true,
 	},
 	.probe          = tpda_probe,
@@ -834,5 +886,5 @@ static struct amba_driver tpda_driver = {
 
 module_amba_driver(tpda_driver);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Trace, Profiling & Diagnostic Aggregator driver");

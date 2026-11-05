@@ -111,10 +111,12 @@ struct vport *ovs_vport_locate(const struct net *net, const char *name)
  *
  * @priv_size: Size of private data area to allocate.
  * @ops: vport device ops
+ * @parms: information about new vport.
  *
  * Allocate and initialize a new vport defined by @ops.  The vport will contain
  * a private data area of size @priv_size that can be accessed using
- * vport_priv().  vports that are no longer needed should be released with
+ * vport_priv().  Some parameters of the vport will be initialized from @parms.
+ * @vports that are no longer needed should be released with
  * vport_free().
  */
 struct vport *ovs_vport_alloc(int priv_size, const struct vport_ops *ops,
@@ -122,6 +124,7 @@ struct vport *ovs_vport_alloc(int priv_size, const struct vport_ops *ops,
 {
 	struct vport *vport;
 	size_t alloc_size;
+	int err;
 
 	alloc_size = sizeof(struct vport);
 	if (priv_size) {
@@ -133,17 +136,29 @@ struct vport *ovs_vport_alloc(int priv_size, const struct vport_ops *ops,
 	if (!vport)
 		return ERR_PTR(-ENOMEM);
 
+	vport->upcall_stats = netdev_alloc_pcpu_stats(struct vport_upcall_stats_percpu);
+	if (!vport->upcall_stats) {
+		err = -ENOMEM;
+		goto err_kfree_vport;
+	}
+
 	vport->dp = parms->dp;
 	vport->port_no = parms->port_no;
 	vport->ops = ops;
 	INIT_HLIST_NODE(&vport->dp_hash_node);
 
 	if (ovs_vport_set_upcall_portids(vport, parms->upcall_portids)) {
-		kfree(vport);
-		return ERR_PTR(-EINVAL);
+		err = -EINVAL;
+		goto err_free_percpu;
 	}
 
 	return vport;
+
+err_free_percpu:
+	free_percpu(vport->upcall_stats);
+err_kfree_vport:
+	kfree(vport);
+	return ERR_PTR(err);
 }
 EXPORT_SYMBOL_GPL(ovs_vport_alloc);
 
@@ -163,6 +178,7 @@ void ovs_vport_free(struct vport *vport)
 	 * it is safe to use raw dereference.
 	 */
 	kfree(rcu_dereference_raw(vport->upcall_portids));
+	free_percpu(vport->upcall_stats);
 	kfree(vport);
 }
 EXPORT_SYMBOL_GPL(ovs_vport_free);
@@ -283,6 +299,57 @@ void ovs_vport_get_stats(struct vport *vport, struct ovs_vport_stats *stats)
 }
 
 /**
+ *	ovs_vport_get_upcall_stats - retrieve upcall stats
+ *
+ * @vport: vport from which to retrieve the stats.
+ * @skb: sk_buff where upcall stats should be appended.
+ *
+ * Retrieves upcall stats for the given device.
+ *
+ * Must be called with ovs_mutex or rcu_read_lock.
+ */
+int ovs_vport_get_upcall_stats(struct vport *vport, struct sk_buff *skb)
+{
+	u64 tx_success = 0, tx_fail = 0;
+	struct nlattr *nla;
+	int i;
+
+	for_each_possible_cpu(i) {
+		const struct vport_upcall_stats_percpu *stats;
+		u64 n_success, n_fail;
+		unsigned int start;
+
+		stats = per_cpu_ptr(vport->upcall_stats, i);
+		do {
+			start = u64_stats_fetch_begin(&stats->syncp);
+			n_success = u64_stats_read(&stats->n_success);
+			n_fail = u64_stats_read(&stats->n_fail);
+		} while (u64_stats_fetch_retry(&stats->syncp, start));
+		tx_success += n_success;
+		tx_fail += n_fail;
+	}
+
+	nla = nla_nest_start_noflag(skb, OVS_VPORT_ATTR_UPCALL_STATS);
+	if (!nla)
+		return -EMSGSIZE;
+
+	if (nla_put_u64_64bit(skb, OVS_VPORT_UPCALL_ATTR_SUCCESS, tx_success,
+			      OVS_VPORT_ATTR_PAD)) {
+		nla_nest_cancel(skb, nla);
+		return -EMSGSIZE;
+	}
+
+	if (nla_put_u64_64bit(skb, OVS_VPORT_UPCALL_ATTR_FAIL, tx_fail,
+			      OVS_VPORT_ATTR_PAD)) {
+		nla_nest_cancel(skb, nla);
+		return -EMSGSIZE;
+	}
+	nla_nest_end(skb, nla);
+
+	return 0;
+}
+
+/**
  *	ovs_vport_get_options - retrieve device options
  *
  * @vport: vport from which to retrieve the options.
@@ -338,6 +405,9 @@ int ovs_vport_set_upcall_portids(struct vport *vport, const struct nlattr *ids)
 	struct vport_portids *old, *vport_portids;
 
 	if (!nla_len(ids) || nla_len(ids) % sizeof(u32))
+		return -EINVAL;
+
+	if (nla_len(ids) / sizeof(u32) > nr_cpu_ids)
 		return -EINVAL;
 
 	old = ovsl_dereference(vport->upcall_portids);
@@ -495,15 +565,17 @@ void ovs_vport_send(struct vport *vport, struct sk_buff *skb, u8 mac_proto)
 
 	if (unlikely(packet_length(skb, vport->dev) > mtu &&
 		     !skb_is_gso(skb))) {
-		net_warn_ratelimited("%s: dropped over-mtu packet: %d > %d\n",
-				     vport->dev->name,
-				     packet_length(skb, vport->dev), mtu);
 		vport->dev->stats.tx_errors++;
+		if (vport->dev->flags & IFF_UP)
+			net_warn_ratelimited("%s: dropped over-mtu packet: "
+					     "%d > %d\n", vport->dev->name,
+					     packet_length(skb, vport->dev),
+					     mtu);
 		goto drop;
 	}
 
 	skb->dev = vport->dev;
-	skb->tstamp = 0;
+	skb_clear_tstamp(skb);
 	vport->ops->send(skb);
 	return;
 

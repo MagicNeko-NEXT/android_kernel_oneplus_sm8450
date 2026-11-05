@@ -17,7 +17,7 @@
 #include <linux/err.h>
 #include <linux/percpu.h>
 #include <linux/kernel.h>
-#include <linux/jhash.h>
+#include <linux/siphash.h>
 #include <linux/moduleparam.h>
 #include <linux/export.h>
 #include <net/net_namespace.h>
@@ -41,7 +41,7 @@ EXPORT_SYMBOL_GPL(nf_ct_expect_hash);
 unsigned int nf_ct_expect_max __read_mostly;
 
 static struct kmem_cache *nf_ct_expect_cachep __read_mostly;
-static unsigned int nf_ct_expect_hashrnd __read_mostly;
+static siphash_aligned_key_t nf_ct_expect_hashrnd;
 
 /* nf_conntrack_expect helper functions */
 void nf_ct_unlink_expect_report(struct nf_conntrack_expect *exp,
@@ -49,12 +49,16 @@ void nf_ct_unlink_expect_report(struct nf_conntrack_expect *exp,
 {
 	struct nf_conn_help *master_help = nfct_help(exp->master);
 	struct net *net = nf_ct_exp_net(exp);
+	struct nf_conntrack_net *cnet;
 
+	lockdep_nfct_expect_lock_held();
 	WARN_ON(!master_help);
 	WARN_ON(timer_pending(&exp->timeout));
 
 	hlist_del_rcu(&exp->hnode);
-	net->ct.expect_count--;
+
+	cnet = nf_ct_pernet(net);
+	cnet->expect_count--;
 
 	hlist_del_rcu(&exp->lnode);
 	master_help->expecting[exp->class]--;
@@ -78,15 +82,26 @@ static void nf_ct_expectation_timed_out(struct timer_list *t)
 
 static unsigned int nf_ct_expect_dst_hash(const struct net *n, const struct nf_conntrack_tuple *tuple)
 {
-	unsigned int hash, seed;
+	struct {
+		union nf_inet_addr dst_addr;
+		u32 net_mix;
+		u16 dport;
+		u8 l3num;
+		u8 protonum;
+	} __aligned(SIPHASH_ALIGNMENT) combined;
+	u32 hash;
 
 	get_random_once(&nf_ct_expect_hashrnd, sizeof(nf_ct_expect_hashrnd));
 
-	seed = nf_ct_expect_hashrnd ^ net_hash_mix(n);
+	memset(&combined, 0, sizeof(combined));
 
-	hash = jhash2(tuple->dst.u3.all, ARRAY_SIZE(tuple->dst.u3.all),
-		      (((tuple->dst.protonum ^ tuple->src.l3num) << 16) |
-		       (__force __u16)tuple->dst.u.all) ^ seed);
+	combined.dst_addr = tuple->dst.u3;
+	combined.net_mix = net_hash_mix(n);
+	combined.dport = (__force __u16)tuple->dst.u.all;
+	combined.l3num = tuple->src.l3num;
+	combined.protonum = tuple->dst.protonum;
+
+	hash = siphash(&combined, sizeof(combined), &nf_ct_expect_hashrnd);
 
 	return reciprocal_scale(hash, nf_ct_expect_hsize);
 }
@@ -104,6 +119,8 @@ nf_ct_exp_equal(const struct nf_conntrack_tuple *tuple,
 
 bool nf_ct_remove_expect(struct nf_conntrack_expect *exp)
 {
+	lockdep_nfct_expect_lock_held();
+
 	if (del_timer(&exp->timeout)) {
 		nf_ct_unlink_expect(exp);
 		nf_ct_expect_put(exp);
@@ -118,10 +135,11 @@ __nf_ct_expect_find(struct net *net,
 		    const struct nf_conntrack_zone *zone,
 		    const struct nf_conntrack_tuple *tuple)
 {
+	struct nf_conntrack_net *cnet = nf_ct_pernet(net);
 	struct nf_conntrack_expect *i;
 	unsigned int h;
 
-	if (!net->ct.expect_count)
+	if (!cnet->expect_count)
 		return NULL;
 
 	h = nf_ct_expect_dst_hash(net, tuple);
@@ -156,12 +174,15 @@ EXPORT_SYMBOL_GPL(nf_ct_expect_find_get);
 struct nf_conntrack_expect *
 nf_ct_find_expectation(struct net *net,
 		       const struct nf_conntrack_zone *zone,
-		       const struct nf_conntrack_tuple *tuple)
+		       const struct nf_conntrack_tuple *tuple, bool unlink)
 {
+	struct nf_conntrack_net *cnet = nf_ct_pernet(net);
 	struct nf_conntrack_expect *i, *exp = NULL;
 	unsigned int h;
 
-	if (!net->ct.expect_count)
+	lockdep_nfct_expect_lock_held();
+
+	if (!cnet->expect_count)
 		return NULL;
 
 	h = nf_ct_expect_dst_hash(net, tuple);
@@ -187,15 +208,15 @@ nf_ct_find_expectation(struct net *net,
 	 * about to invoke ->destroy(), or nf_ct_delete() via timeout
 	 * or early_drop().
 	 *
-	 * The atomic_inc_not_zero() check tells:  If that fails, we
+	 * The refcount_inc_not_zero() check tells:  If that fails, we
 	 * know that the ct is being destroyed.  If it succeeds, we
 	 * can be sure the ct cannot disappear underneath.
 	 */
 	if (unlikely(nf_ct_is_dying(exp->master) ||
-		     !atomic_inc_not_zero(&exp->master->ct_general.use)))
+		     !refcount_inc_not_zero(&exp->master->ct_general.use)))
 		return NULL;
 
-	if (exp->flags & NF_CT_EXPECT_PERMANENT) {
+	if (exp->flags & NF_CT_EXPECT_PERMANENT || !unlink) {
 		refcount_inc(&exp->use);
 		return exp;
 	} else if (del_timer(&exp->timeout)) {
@@ -368,6 +389,7 @@ EXPORT_SYMBOL_GPL(nf_ct_expect_put);
 
 static void nf_ct_expect_insert(struct nf_conntrack_expect *exp)
 {
+	struct nf_conntrack_net *cnet;
 	struct nf_conn_help *master_help = nfct_help(exp->master);
 	struct nf_conntrack_helper *helper;
 	struct net *net = nf_ct_exp_net(exp);
@@ -389,7 +411,8 @@ static void nf_ct_expect_insert(struct nf_conntrack_expect *exp)
 	master_help->expecting[exp->class]++;
 
 	hlist_add_head_rcu(&exp->hnode, &nf_ct_expect_hash[h]);
-	net->ct.expect_count++;
+	cnet = nf_ct_pernet(net);
+	cnet->expect_count++;
 
 	NF_CT_STAT_INC(net, expect_create);
 }
@@ -415,6 +438,7 @@ static inline int __nf_ct_expect_check(struct nf_conntrack_expect *expect,
 {
 	const struct nf_conntrack_expect_policy *p;
 	struct nf_conntrack_expect *i;
+	struct nf_conntrack_net *cnet;
 	struct nf_conn *master = expect->master;
 	struct nf_conn_help *master_help = nfct_help(master);
 	struct nf_conntrack_helper *helper;
@@ -422,6 +446,8 @@ static inline int __nf_ct_expect_check(struct nf_conntrack_expect *expect,
 	struct hlist_node *next;
 	unsigned int h;
 	int ret = 0;
+
+	lockdep_nfct_expect_lock_held();
 
 	if (!master_help) {
 		ret = -ESHUTDOWN;
@@ -458,7 +484,8 @@ static inline int __nf_ct_expect_check(struct nf_conntrack_expect *expect,
 		}
 	}
 
-	if (net->ct.expect_count >= nf_ct_expect_max) {
+	cnet = nf_ct_pernet(net);
+	if (cnet->expect_count >= nf_ct_expect_max) {
 		net_warn_ratelimited("nf_conntrack: expectation table full\n");
 		ret = -EMFILE;
 	}
@@ -478,8 +505,9 @@ int nf_ct_expect_related_report(struct nf_conntrack_expect *expect,
 
 	nf_ct_expect_insert(expect);
 
-	spin_unlock_bh(&nf_conntrack_expect_lock);
 	nf_ct_expect_event_report(IPEXP_NEW, expect, portid, report);
+	spin_unlock_bh(&nf_conntrack_expect_lock);
+
 	return 0;
 out:
 	spin_unlock_bh(&nf_conntrack_expect_lock);
@@ -607,10 +635,14 @@ static int exp_seq_show(struct seq_file *s, void *v)
 {
 	struct nf_conntrack_expect *expect;
 	struct nf_conntrack_helper *helper;
+	struct net *net = seq_file_net(s);
 	struct hlist_node *n = v;
 	char *delim = "";
 
 	expect = hlist_entry(n, struct nf_conntrack_expect, hnode);
+
+	if (!net_eq(nf_ct_exp_net(expect), net))
+		return 0;
 
 	if (expect->timeout.function)
 		seq_printf(s, "%ld ", timer_pending(&expect->timeout)
@@ -686,7 +718,6 @@ module_param_named(expect_hashsize, nf_ct_expect_hsize, uint, 0400);
 
 int nf_conntrack_expect_pernet_init(struct net *net)
 {
-	net->ct.expect_count = 0;
 	return exp_proc_init(net);
 }
 

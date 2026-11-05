@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2017-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "Minidump: " fmt
@@ -16,9 +17,10 @@
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/slab.h>
-#include <linux/android_debug_symbols.h>
+#include <linux/gunyah/gh_rm_drv.h>
 #include <linux/soc/qcom/smem.h>
 #include <soc/qcom/minidump.h>
+#include "debug_symbol.h"
 #include "minidump_private.h"
 #include "elf.h"
 
@@ -35,7 +37,6 @@
  */
 struct md_table {
 	u32			revision;
-	u32                     num_regions;
 	struct md_ss_toc	*md_ss_toc;
 	struct md_global_toc	*md_gbl_toc;
 	struct md_ss_region	*md_regions;
@@ -61,13 +62,16 @@ struct md_elfhdr {
 /* Protect elfheader and smem table from deferred calls contention */
 static DEFINE_SPINLOCK(mdt_lock);
 static DEFINE_RWLOCK(mdt_remove_lock);
-static struct md_table		minidump_table;
+static struct md_table		*minidump_table;
+struct workqueue_struct *minidump_rm_wq;
 static struct md_elfhdr		minidump_elfheader;
 static int first_removed_entry = INT_MAX;
 static bool md_init_done;
+static unsigned int num_regions;
+static bool is_rm_minidump;
 
 /* Number of pending entries to be added in ToC regions */
-static unsigned int pendings;
+static LIST_HEAD(pending_list);
 
 static inline char *elf_lookup_string(struct elfhdr *hdr, int offset)
 {
@@ -88,29 +92,59 @@ static inline unsigned int set_section_name(const char *name)
 		return 0;
 
 	ret = idx;
-	idx += strlcpy((strtab + idx), name, MAX_REGION_NAME_LENGTH);
+	idx += strscpy((strtab + idx), name, MAX_REGION_NAME_LENGTH);
 	minidump_elfheader.strtable_idx = idx + 1;
 
 	return ret;
 }
 
-struct md_region *md_get_region(char *name)
+struct md_region md_get_region(char *name)
 {
-	struct md_region *mdr;
-	int i, regno = minidump_table.num_regions;
+	struct md_region *mdr = NULL, tmp = {0};
+	int i, j, regno;
+	struct elfhdr *hdr = minidump_elfheader.ehdr;
+	struct elf_phdr *phdr;
+	struct elf_shdr *shdr;
+	char *hdr_name;
 
-	for (i = 0; i < regno; i++) {
-		mdr = &minidump_table.entry[i];
-		if (!strcmp(mdr->name, name))
-			return mdr;
+	if (is_rm_minidump) {
+		for (i = 0; i < hdr->e_shnum; i++) {
+			shdr = elf_section(hdr, i);
+			hdr_name = elf_lookup_string(hdr, shdr->sh_name);
+			if (hdr_name && !strcmp(hdr_name, name)) {
+				for (j = 0; j < hdr->e_phnum; j++) {
+					phdr = elf_program(hdr, j);
+					if (shdr->sh_addr == phdr->p_vaddr) {
+						strscpy(tmp.name, hdr_name,
+							sizeof(tmp.name));
+						tmp.phys_addr = phdr->p_vaddr;
+						tmp.virt_addr = phdr->p_paddr;
+						tmp.size = phdr->p_filesz;
+						goto out;
+					}
+				}
+			}
+		}
+	} else {
+		if (!minidump_table)
+			goto out;
+		regno = num_regions;
+		for (i = 0; i < regno; i++) {
+			mdr = &minidump_table->entry[i];
+			if (!strcmp(mdr->name, name)) {
+				tmp = *mdr;
+				goto out;
+			}
+		}
 	}
-	return NULL;
+out:
+	return tmp;
 }
 
 static inline int md_region_num(const char *name, int *seqno)
 {
-	struct md_ss_region *mde = minidump_table.md_regions;
-	int i, regno = minidump_table.md_ss_toc->ss_region_count;
+	struct md_ss_region *mde = minidump_table->md_regions;
+	int i, regno = minidump_table->md_ss_toc->ss_region_count;
 	int ret = -EINVAL;
 
 	for (i = 0; i < regno; i++, mde++) {
@@ -126,38 +160,46 @@ static inline int md_region_num(const char *name, int *seqno)
 static inline int md_entry_num(const struct md_region *entry)
 {
 	struct md_region *mdr;
-	int i, regno = minidump_table.num_regions;
+	int i, regno = num_regions;
 
 	for (i = 0; i < regno; i++) {
-		mdr = &minidump_table.entry[i];
+		mdr = &minidump_table->entry[i];
 		if (!strcmp(mdr->name, entry->name))
 			return i;
 	}
 	return -ENOENT;
 }
 
-/* Update Mini dump table in SMEM */
-static void md_update_ss_toc(const struct md_region *entry)
+static inline int md_elf_entry_number(const struct md_region *entry)
 {
-	struct md_ss_region *mdr;
+	struct elf_shdr *shdr;
+	char *hdr_name;
+	int i;
+
+	for (i = 0; i < minidump_elfheader.ehdr->e_shnum; i++) {
+		shdr = elf_section(minidump_elfheader.ehdr, i);
+		hdr_name = elf_lookup_string(minidump_elfheader.ehdr,
+					     shdr->sh_name);
+		if (!hdr_name)
+			return -EINVAL;
+
+		if (!strcmp(hdr_name, entry->name))
+			return i;
+	}
+	return -ENOENT;
+}
+
+/* Update elf header */
+static void md_add_elf_header(const struct md_region *entry)
+{
 	struct elfhdr *hdr = minidump_elfheader.ehdr;
 	struct elf_shdr *shdr = elf_section(hdr, hdr->e_shnum++);
 	struct elf_phdr *phdr = elf_program(hdr, hdr->e_phnum++);
-	int seq = 0, reg_cnt = minidump_table.md_ss_toc->ss_region_count;
 
-	mdr = &minidump_table.md_regions[reg_cnt];
-
-	strlcpy(mdr->name, entry->name, sizeof(mdr->name));
-	mdr->region_base_address = entry->phys_addr;
-	mdr->region_size = entry->size;
-	if (md_region_num(entry->name, &seq) >= 0)
-		mdr->seq_num = seq + 1;
-
-	/* Update elf header */
 	shdr->sh_type = SHT_PROGBITS;
-	shdr->sh_name = set_section_name(mdr->name);
+	shdr->sh_name = set_section_name(entry->name);
 	shdr->sh_addr = (elf_addr_t)entry->virt_addr;
-	shdr->sh_size = mdr->region_size;
+	shdr->sh_size = entry->size;
 	shdr->sh_flags = SHF_WRITE;
 	shdr->sh_offset = minidump_elfheader.elf_offset;
 	shdr->sh_entsize = 0;
@@ -166,149 +208,28 @@ static void md_update_ss_toc(const struct md_region *entry)
 	phdr->p_offset = minidump_elfheader.elf_offset;
 	phdr->p_vaddr = entry->virt_addr;
 	phdr->p_paddr = entry->phys_addr;
-	phdr->p_filesz = phdr->p_memsz =  mdr->region_size;
+	phdr->p_filesz = phdr->p_memsz = entry->size;
 	phdr->p_flags = PF_R | PF_W;
 	minidump_elfheader.elf_offset += shdr->sh_size;
-	mdr->md_valid = MD_REGION_VALID;
-	minidump_table.md_ss_toc->ss_region_count++;
 }
 
-bool msm_minidump_enabled(void)
+static void md_update_elf_header(int entryno, const struct md_region *entry)
 {
-	bool ret = false;
-	unsigned long flags;
-
-	spin_lock_irqsave(&mdt_lock, flags);
-	if (minidump_table.md_ss_toc &&
-		(minidump_table.md_ss_toc->md_ss_enable_status ==
-		 MD_SS_ENABLED))
-		ret = true;
-	spin_unlock_irqrestore(&mdt_lock, flags);
-	return ret;
-}
-EXPORT_SYMBOL(msm_minidump_enabled);
-
-static inline int validate_region(const struct md_region *entry)
-{
-	if (!entry)
-		return -EINVAL;
-
-	if ((strlen(entry->name) > MAX_NAME_LENGTH) || !entry->virt_addr ||
-		(!IS_ALIGNED(entry->size, 4))) {
-		pr_err("Invalid entry details\n");
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-int msm_minidump_update_region(int regno, const struct md_region *entry)
-{
-	int ret = 0;
-	struct md_region *mdr;
-	struct md_ss_region *mdssr;
 	struct elfhdr *hdr = minidump_elfheader.ehdr;
 	struct elf_shdr *shdr;
 	struct elf_phdr *phdr;
-	unsigned long flags;
 
-	/* Ensure that init completes before we update regions */
-	if (!smp_load_acquire(&md_init_done))
-		return -EINVAL;
+	if (is_rm_minidump)
+		shdr = elf_section(hdr, entryno + 3);
+	else
+		shdr = elf_section(hdr, entryno + 4);
 
-	if (validate_region(entry) || (regno >= MAX_NUM_ENTRIES))
-		return -EINVAL;
-
-	read_lock_irqsave(&mdt_remove_lock, flags);
-
-	if (regno >= first_removed_entry) {
-		pr_err("Region:[%s] was moved\n", entry->name);
-		ret = -EINVAL;
-		goto err_unlock;
-	}
-
-	ret = md_entry_num(entry);
-	if (ret < 0) {
-		pr_err("Region:[%s] does not exist to update.\n", entry->name);
-		goto err_unlock;
-	}
-
-	mdr = &minidump_table.entry[regno];
-	mdr->virt_addr = entry->virt_addr;
-	mdr->phys_addr = entry->phys_addr;
-
-	mdssr = &minidump_table.md_regions[regno + 1];
-	mdssr->region_base_address = entry->phys_addr;
-
-	shdr = elf_section(hdr, regno + 4);
-	phdr = elf_program(hdr, regno + 1);
+	phdr = elf_program(hdr, entryno + 1);
 
 	shdr->sh_addr = (elf_addr_t)entry->virt_addr;
 	phdr->p_vaddr = entry->virt_addr;
 	phdr->p_paddr = entry->phys_addr;
-
-err_unlock:
-	read_unlock_irqrestore(&mdt_remove_lock, flags);
-
-	return ret;
 }
-EXPORT_SYMBOL(msm_minidump_update_region);
-
-int msm_minidump_add_region(const struct md_region *entry)
-{
-	u32 entries;
-	u32 toc_init;
-	struct md_region *mdr;
-	unsigned long flags;
-
-	if (validate_region(entry))
-		return -EINVAL;
-
-	spin_lock_irqsave(&mdt_lock, flags);
-	if (md_entry_num(entry) >= 0) {
-		spin_unlock_irqrestore(&mdt_lock, flags);
-		pr_info("Entry name already exist.\n");
-		return -EEXIST;
-	}
-
-	entries = minidump_table.num_regions;
-	if (entries >= MAX_NUM_ENTRIES) {
-		pr_err("Maximum entries reached.\n");
-		spin_unlock_irqrestore(&mdt_lock, flags);
-		return -ENOMEM;
-	}
-
-	toc_init = 0;
-	if (minidump_table.md_ss_toc &&
-		(minidump_table.md_ss_toc->md_ss_enable_status ==
-		MD_SS_ENABLED)) {
-		toc_init = 1;
-		if (minidump_table.md_ss_toc->ss_region_count >= MAX_NUM_ENTRIES) {
-			spin_unlock_irqrestore(&mdt_lock, flags);
-			pr_err("Maximum regions in minidump table reached.\n");
-			return -ENOMEM;
-		}
-	}
-
-	mdr = &minidump_table.entry[entries];
-	strlcpy(mdr->name, entry->name, sizeof(mdr->name));
-	mdr->virt_addr = entry->virt_addr;
-	mdr->phys_addr = entry->phys_addr;
-	mdr->size = entry->size;
-	mdr->id = entry->id;
-
-	minidump_table.num_regions = entries + 1;
-
-	if (toc_init)
-		md_update_ss_toc(entry);
-	else
-		pendings++;
-
-	spin_unlock_irqrestore(&mdt_lock, flags);
-
-	return entries;
-}
-EXPORT_SYMBOL(msm_minidump_add_region);
 
 int msm_minidump_clear_headers(const struct md_region *entry)
 {
@@ -325,9 +246,10 @@ int msm_minidump_clear_headers(const struct md_region *entry)
 		if ((phdr->p_paddr == entry->phys_addr) &&
 			(phdr->p_memsz == entry->size))
 			break;
+
 	}
 	if (i == hdr->e_phnum) {
-		pr_err("Cannot find entry in elf\n");
+		printk_deferred("Cannot find entry in elf\n");
 		return -EINVAL;
 	}
 	pidx = i;
@@ -342,13 +264,13 @@ int msm_minidump_clear_headers(const struct md_region *entry)
 
 	}
 	if (i == hdr->e_shnum) {
-		pr_err("Cannot find entry in elf\n");
+		printk_deferred("Cannot find entry in elf\n");
 		return -EINVAL;
 	}
 	shidx = i;
 
 	if (shdr->sh_offset != phdr->p_offset) {
-		pr_err("Invalid entry details in elf, Minidump broken..\n");
+		printk_deferred("Invalid entry details in elf, Minidump broken..\n");
 		return -EINVAL;
 	}
 
@@ -385,80 +307,479 @@ int msm_minidump_clear_headers(const struct md_region *entry)
 	return 0;
 }
 
-int msm_minidump_remove_region(const struct md_region *entry)
+static void md_rm_update_work(struct md_region *entry)
 {
-	int rcount, ecount, seq = 0, rgno, entryno, ret;
+	int slot_num, entryno, ret;
 	unsigned long flags;
 
-	if (!entry || !minidump_table.md_ss_toc ||
-		(minidump_table.md_ss_toc->md_ss_enable_status !=
-						MD_SS_ENABLED))
+	slot_num = gh_rm_minidump_get_slot_from_name(0, entry->name,
+						     strlen(entry->name));
+	if (slot_num < 0) {
+		printk_deferred(
+			"Get slot number:[%s] failed:%d unable to get slot number\n",
+			entry->name, slot_num);
+		return;
+	}
+
+	ret = gh_rm_minidump_deregister_slot(slot_num);
+	if (ret < 0) {
+		printk_deferred(
+			"Update region:[%s] failed:%d unable to deregister\n",
+			entry->name, ret);
+		return;
+	}
+	slot_num =
+		gh_rm_minidump_register_range(entry->phys_addr, entry->size,
+					      entry->name, strlen(entry->name));
+	if (slot_num < 0) {
+		printk_deferred(
+			"Update region:[%s] failed:%d unable to register\n",
+			entry->name, ret);
+		return;
+	}
+
+	spin_lock_irqsave(&mdt_lock, flags);
+	entryno = md_elf_entry_number(entry);
+	if (entryno < 0) {
+		printk_deferred(
+			"Update entry:%s failed, minidump table is corrupt\n",
+			entry->name);
+		md_update_elf_header(entryno, entry);
+	}
+	spin_unlock_irqrestore(&mdt_lock, flags);
+}
+
+static void md_rm_add_work(struct md_region *entry)
+{
+	int slot_num;
+	unsigned long flags;
+
+	slot_num =
+		gh_rm_minidump_register_range(entry->phys_addr, entry->size,
+					      entry->name, strlen(entry->name));
+	spin_lock_irqsave(&mdt_lock, flags);
+	if (slot_num < 0) {
+		num_regions--;
+		pr_err("Failed to register minidump entry:%s ret:%d\n",
+		       entry->name, slot_num);
+		msm_minidump_clear_headers(entry);
+		goto out;
+	}
+
+out:
+	spin_unlock_irqrestore(&mdt_lock, flags);
+}
+
+static void md_rm_remove_work(struct md_region *entry)
+{
+	int ret, slot_num;
+
+	slot_num = gh_rm_minidump_get_slot_from_name(0, entry->name,
+						     strlen(entry->name));
+	if (slot_num < 0) {
+		pr_err("Failed to find slot number of minidump entry:%s ret:%d\n",
+		       entry->name, slot_num);
+		return;
+	}
+
+	ret = gh_rm_minidump_deregister_slot(slot_num);
+	if (ret < 0) {
+		pr_err("Failed to deregister minidump entry:%s ret:%d\n",
+		       entry->name, ret);
+		return;
+	}
+
+}
+
+static void minidump_rm_work(struct work_struct *work)
+{
+	struct md_rm_request *rm_work =
+		container_of(work, struct md_rm_request, work);
+	enum minidump_entry_cmd cmd;
+
+	cmd = rm_work->work_cmd;
+
+	switch (cmd) {
+	case MINIDUMP_ADD:
+		md_rm_add_work(&rm_work->entry);
+		break;
+	case MINIDUMP_REMOVE:
+		md_rm_remove_work(&rm_work->entry);
+		break;
+	case MINIDUMP_UPDATE:
+		md_rm_update_work(&rm_work->entry);
+		break;
+	default:
+		printk_deferred("No command for minidump rm work\n");
+		break;
+	}
+	kfree(rm_work);
+}
+
+/* Update Mini dump table in SMEM */
+static void md_add_ss_toc(const struct md_region *entry)
+{
+	struct md_ss_region *ss_mdr;
+	struct md_region *mdr;
+	int seq = 0, reg_cnt = minidump_table->md_ss_toc->ss_region_count;
+
+	mdr = &minidump_table->entry[num_regions];
+	strscpy(mdr->name, entry->name, sizeof(mdr->name));
+	mdr->virt_addr = entry->virt_addr;
+	mdr->phys_addr = entry->phys_addr;
+	mdr->size = entry->size;
+	mdr->id = entry->id;
+
+	ss_mdr = &minidump_table->md_regions[reg_cnt];
+	strscpy(ss_mdr->name, entry->name, sizeof(ss_mdr->name));
+	ss_mdr->region_base_address = entry->phys_addr;
+	ss_mdr->region_size = entry->size;
+	if (md_region_num(entry->name, &seq) >= 0)
+		ss_mdr->seq_num = seq + 1;
+
+	ss_mdr->md_valid = MD_REGION_VALID;
+	minidump_table->md_ss_toc->ss_region_count++;
+}
+
+static int md_rm_add_region(const struct md_region *entry)
+{
+	struct md_rm_request *rm_work;
+
+	/* alloc a RM entry for workqueue, need free in work */
+	rm_work = kzalloc(sizeof(*rm_work), GFP_ATOMIC);
+	if (!rm_work)
+		return -ENOMEM;
+	rm_work->entry = *entry;
+	rm_work->work_cmd = MINIDUMP_ADD;
+	INIT_WORK(&rm_work->work, minidump_rm_work);
+	queue_work(minidump_rm_wq, &rm_work->work);
+
+	return 0;
+}
+
+bool msm_minidump_enabled(void)
+{
+	bool ret = false;
+	unsigned long flags;
+
+	if (is_rm_minidump) {
+		/* If minidump driver init successfully, minidump is enabled */
+		if (smp_load_acquire(&md_init_done))
+			ret = true;
+	} else {
+		spin_lock_irqsave(&mdt_lock, flags);
+		if (minidump_table && minidump_table->md_ss_toc &&
+		    (minidump_table->md_ss_toc->md_ss_enable_status ==
+		     MD_SS_ENABLED))
+			ret = true;
+		spin_unlock_irqrestore(&mdt_lock, flags);
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(msm_minidump_enabled);
+
+int msm_minidump_get_available_region(void)
+{
+	int res = -EBUSY;
+	unsigned long flags;
+
+	if (is_rm_minidump) {
+		res = gh_rm_minidump_get_info();
+		if (res < 0)
+			pr_err("Fail to get minidump available region ret=%d\n",
+			       res);
+	} else {
+		spin_lock_irqsave(&mdt_lock, flags);
+		res = MAX_NUM_ENTRIES - num_regions;
+		spin_unlock_irqrestore(&mdt_lock, flags);
+	}
+
+	return res;
+}
+EXPORT_SYMBOL_GPL(msm_minidump_get_available_region);
+
+static inline int validate_region(const struct md_region *entry)
+{
+	if (!entry)
+		return -EINVAL;
+
+	if ((strlen(entry->name) > MAX_NAME_LENGTH) || !entry->virt_addr ||
+		(!IS_ALIGNED(entry->size, 4))) {
+		printk_deferred("Invalid entry details\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int md_update_ss_toc(int regno, const struct md_region *entry)
+{
+	int ret = 0;
+	struct md_region *mdr;
+	struct md_ss_region *mdssr;
+
+	if (regno >= first_removed_entry) {
+		printk_deferred("Region:[%s] was moved\n", entry->name);
+		return -EINVAL;
+	}
+
+	ret = md_entry_num(entry);
+	if (ret < 0) {
+		printk_deferred("Region:[%s] does not exist to update\n",
+				entry->name);
+		return ret;
+	}
+
+	mdr = &minidump_table->entry[regno];
+	mdr->virt_addr = entry->virt_addr;
+	mdr->phys_addr = entry->phys_addr;
+
+	mdssr = &minidump_table->md_regions[regno + 1];
+	mdssr->region_base_address = entry->phys_addr;
+	return 0;
+}
+
+static int md_rm_update(int regno, const struct md_region *entry)
+{
+	int entryno;
+	struct md_rm_request *rm_work;
+
+	entryno = md_elf_entry_number(entry);
+	if (entryno < 0) {
+		printk_deferred("Not able to find the entry %s in table\n",
+				entry->name);
+		return entryno;
+	}
+	rm_work = kzalloc(sizeof(*rm_work), GFP_ATOMIC);
+	if (!rm_work)
+		return -ENOMEM;
+	rm_work->work_cmd = MINIDUMP_UPDATE;
+	rm_work->entry = *entry;
+	INIT_WORK(&rm_work->work, minidump_rm_work);
+	queue_work(minidump_rm_wq, &rm_work->work);
+
+	return 0;
+}
+
+int msm_minidump_update_region(int regno, const struct md_region *entry)
+{
+	int ret = 0;
+	unsigned long flags;
+
+	/* Ensure that init completes before we update regions */
+	if (!smp_load_acquire(&md_init_done))
+		return -EINVAL;
+
+	if (validate_region(entry) || (regno >= MAX_NUM_ENTRIES))
+		return -EINVAL;
+
+	read_lock_irqsave(&mdt_remove_lock, flags);
+	if (is_rm_minidump)
+		ret = md_rm_update(regno, entry);
+	else {
+		ret = md_update_ss_toc(regno, entry);
+		md_update_elf_header(regno, entry);
+	}
+	read_unlock_irqrestore(&mdt_remove_lock, flags);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(msm_minidump_update_region);
+
+int msm_minidump_add_region(const struct md_region *entry)
+{
+	u32 toc_init;
+	struct md_pending_region *pending_region;
+	unsigned long flags;
+	int ret;
+
+	if (validate_region(entry))
+		return -EINVAL;
+
+	spin_lock_irqsave(&mdt_lock, flags);
+
+	if (num_regions >= MAX_NUM_ENTRIES) {
+		printk_deferred("Maximum entries reached\n");
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	toc_init = 0;
+	if (!is_rm_minidump && minidump_table && minidump_table->md_ss_toc &&
+	    (minidump_table->md_ss_toc->md_ss_enable_status == MD_SS_ENABLED)) {
+		toc_init = 1;
+		if (minidump_table->md_ss_toc->ss_region_count >= MAX_NUM_ENTRIES) {
+			printk_deferred("Maximum regions in minidump table reached\n");
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
+
+	if (!is_rm_minidump && toc_init) {
+		if (md_entry_num(entry) >= 0) {
+			printk_deferred("Entry name already exist\n");
+			ret = -EEXIST;
+			goto out;
+		}
+		md_add_ss_toc(entry);
+		md_add_elf_header(entry);
+		/* Ensure that init completes before register region */
+	} else if (is_rm_minidump && smp_load_acquire(&md_init_done)) {
+		if (md_elf_entry_number(entry) >= 0) {
+			printk_deferred("Entry name already exist\n");
+			ret = -EEXIST;
+			goto out;
+		}
+		ret = md_rm_add_region(entry);
+		md_add_elf_header(entry);
+		if (ret)
+			goto out;
+	} else {
+		/* Local table not initialized
+		 * add to pending list, need free after initialized
+		 */
+		pending_region = kzalloc(sizeof(*pending_region), GFP_ATOMIC);
+		if (!pending_region) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		pending_region->entry = *entry;
+		list_add_tail(&pending_region->list, &pending_list);
+	}
+	ret = num_regions;
+	num_regions++;
+
+out:
+	spin_unlock_irqrestore(&mdt_lock, flags);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(msm_minidump_add_region);
+
+static int md_rm_remove_region(const struct md_region *entry)
+{
+	int ret;
+	struct md_rm_request *rm_work;
+
+	ret = md_elf_entry_number(entry);
+	if (ret < 0) {
+		printk_deferred("Not able to find the entry %s in table\n",
+				entry->name);
+		return ret;
+	}
+	rm_work = kzalloc(sizeof(*rm_work), GFP_ATOMIC);
+	if (!rm_work)
+		return -ENOMEM;
+	ret = msm_minidump_clear_headers(entry);
+	if (ret) {
+		printk_deferred("Fail to remove entry %s in elf header\n",
+				entry->name);
+		kfree(rm_work);
+		return ret;
+	}
+	rm_work->work_cmd = MINIDUMP_REMOVE;
+	rm_work->entry = *entry;
+	INIT_WORK(&rm_work->work, minidump_rm_work);
+	queue_work(minidump_rm_wq, &rm_work->work);
+	num_regions--;
+
+	return 0;
+}
+
+static int md_remove_ss_toc(const struct md_region *entry)
+{
+	int ecount, rcount, entryno, rgno, seq = 0, ret;
+
+	if (!minidump_table->md_ss_toc ||
+	    (minidump_table->md_ss_toc->md_ss_enable_status != MD_SS_ENABLED))
+		return -EINVAL;
+
+	entryno = md_entry_num(entry);
+	if (entryno < 0) {
+		printk_deferred("Not able to find the entry %s in table\n",
+				entry->name);
+		return entryno;
+	}
+	ecount = num_regions;
+	rgno = md_region_num(entry->name, &seq);
+	if (rgno < 0) {
+		printk_deferred(
+			"Not able to find the region %s (%d,%d) in table\n",
+			entry->name, entryno, rgno);
+		return -EINVAL;
+	}
+	rcount = minidump_table->md_ss_toc->ss_region_count;
+	if (first_removed_entry > entryno)
+		first_removed_entry = entryno;
+	minidump_table->md_ss_toc->md_ss_toc_init = 0;
+	/* Remove entry from: entry list, ss region list and elf header */
+	memmove(&minidump_table->entry[entryno],
+		&minidump_table->entry[entryno + 1],
+		((ecount - entryno - 1) * sizeof(struct md_region)));
+	memset(&minidump_table->entry[ecount - 1], 0, sizeof(struct md_region));
+
+	memmove(&minidump_table->md_regions[rgno],
+		&minidump_table->md_regions[rgno + 1],
+		((rcount - rgno - 1) * sizeof(struct md_ss_region)));
+	memset(&minidump_table->md_regions[rcount - 1], 0,
+	       sizeof(struct md_ss_region));
+
+	ret = msm_minidump_clear_headers(entry);
+	if (ret)
+		return ret;
+
+	minidump_table->md_ss_toc->ss_region_count--;
+	minidump_table->md_ss_toc->md_ss_toc_init = 1;
+	num_regions--;
+
+	return 0;
+}
+
+int msm_minidump_remove_region(const struct md_region *entry)
+{
+	int ret;
+	unsigned long flags;
+
+	if (!entry)
+		return -EINVAL;
+
+	/* Ensure that init completes before we remove regions */
+	if (!smp_load_acquire(&md_init_done))
+		return -EINVAL;
+
+	if (!is_rm_minidump &&
+	    (!minidump_table->md_ss_toc ||
+	     (minidump_table->md_ss_toc->md_ss_enable_status != MD_SS_ENABLED)))
 		return -EINVAL;
 
 	spin_lock_irqsave(&mdt_lock, flags);
 	write_lock(&mdt_remove_lock);
-	ret = md_entry_num(entry);
-	if (ret < 0) {
-		write_unlock(&mdt_remove_lock);
-		spin_unlock_irqrestore(&mdt_lock, flags);
-		pr_info("Not able to find the entry %s in table\n", entry->name);
-		return ret;
-	}
-	entryno = ret;
-	rgno = md_region_num(entry->name, &seq);
-	if (rgno < 0) {
-		write_unlock(&mdt_remove_lock);
-		spin_unlock_irqrestore(&mdt_lock, flags);
-		pr_err("Not able to find the region %s (%d,%d) in table\n",
-			entry->name, entryno, rgno);
-		return -EINVAL;
-	}
-	ecount = minidump_table.num_regions;
-	rcount = minidump_table.md_ss_toc->ss_region_count;
-	if (first_removed_entry > entryno)
-		first_removed_entry = entryno;
-	minidump_table.md_ss_toc->md_ss_toc_init = 0;
 
-	/* Remove entry from: entry list, ss region list and elf header */
-	memmove(&minidump_table.entry[entryno],
-		&minidump_table.entry[entryno + 1],
-		((ecount - entryno - 1) * sizeof(struct md_region)));
-	memset(&minidump_table.entry[ecount - 1], 0, sizeof(struct md_region));
+	if (is_rm_minidump)
+		ret = md_rm_remove_region(entry);
+	else
+		ret = md_remove_ss_toc(entry);
 
-
-	memmove(&minidump_table.md_regions[rgno],
-		&minidump_table.md_regions[rgno + 1],
-		((rcount - rgno - 1) * sizeof(struct md_ss_region)));
-	memset(&minidump_table.md_regions[rcount - 1], 0,
-					sizeof(struct md_ss_region));
-
-	ret = msm_minidump_clear_headers(entry);
-	if (ret)
-		goto out;
-
-	minidump_table.md_ss_toc->ss_region_count--;
-	minidump_table.md_ss_toc->md_ss_toc_init = 1;
-	minidump_table.num_regions--;
-out:
 	write_unlock(&mdt_remove_lock);
 	spin_unlock_irqrestore(&mdt_lock, flags);
 
 	if (ret)
-		pr_err("Minidump is broken..disable Minidump collection\n");
+		printk_deferred("Failed to remove region:%s\n", entry->name);
 	return ret;
 }
-EXPORT_SYMBOL(msm_minidump_remove_region);
+EXPORT_SYMBOL_GPL(msm_minidump_remove_region);
 
 static int msm_minidump_add_header(void)
 {
-	struct md_ss_region *mdreg = &minidump_table.md_regions[0];
+	struct md_ss_region *mdreg;
 	struct elfhdr *ehdr;
 	struct elf_shdr *shdr;
 	struct elf_phdr *phdr;
 	unsigned int strtbl_off, elfh_size, phdr_off;
 	char *banner, *linux_banner;
+	int slot_num;
 
-	linux_banner = android_debug_symbol(ADS_LINUX_BANNER);
+	linux_banner = DEBUG_SYMBOL_LOOKUP(linux_banner);
 	/* Header buffer contains:
 	 * elf header, MAX_NUM_ENTRIES+4 of section and program elf headers,
 	 * string table section and linux banner.
@@ -474,9 +795,20 @@ static int msm_minidump_add_header(void)
 	if (!minidump_elfheader.ehdr)
 		return -ENOMEM;
 
-	strlcpy(mdreg->name, "KELF_HEADER", sizeof(mdreg->name));
-	mdreg->region_base_address = virt_to_phys(minidump_elfheader.ehdr);
-	mdreg->region_size = elfh_size;
+	if (is_rm_minidump) {
+		slot_num = gh_rm_minidump_register_range(
+			virt_to_phys(minidump_elfheader.ehdr), elfh_size,
+			"KELF_HDR", strlen("KELF_HDR"));
+		if (slot_num < 0) {
+			pr_err("Failed to register elf_header minidump entry\n");
+			return -EBUSY;
+		}
+	} else {
+		mdreg = &minidump_table->md_regions[0];
+		strscpy(mdreg->name, "KELF_HDR", sizeof(mdreg->name));
+		mdreg->region_base_address = virt_to_phys(minidump_elfheader.ehdr);
+		mdreg->region_size = elfh_size;
+	}
 
 	ehdr = minidump_elfheader.ehdr;
 	/* Assign section/program headers offset */
@@ -519,16 +851,18 @@ static int msm_minidump_add_header(void)
 	shdr++;
 
 	/* 3rd section is for minidump_table VA, used by parsers */
-	shdr->sh_type = SHT_PROGBITS;
-	shdr->sh_entsize = 0;
-	shdr->sh_flags = 0;
-	shdr->sh_addr = (elf_addr_t)&minidump_table;
-	shdr->sh_name = set_section_name("minidump_table");
-	shdr++;
+	if (!is_rm_minidump) {
+		shdr->sh_type = SHT_PROGBITS;
+		shdr->sh_entsize = 0;
+		shdr->sh_flags = 0;
+		shdr->sh_addr = (elf_addr_t)minidump_table;
+		shdr->sh_name = set_section_name("minidump_table");
+		shdr++;
+	}
 
 	/* 4th section is linux banner */
 	banner = (char *)ehdr + strtbl_off + MAX_STRTBL_SIZE;
-	strlcpy(banner, linux_banner, MAX_STRTBL_SIZE);
+	strscpy(banner, linux_banner, MAX_STRTBL_SIZE);
 
 	shdr->sh_type = SHT_PROGBITS;
 	shdr->sh_offset = (elf_addr_t)(strtbl_off + MAX_STRTBL_SIZE);
@@ -547,9 +881,13 @@ static int msm_minidump_add_header(void)
 
 	/* Update headers count*/
 	ehdr->e_phnum = 1;
-	ehdr->e_shnum = 4;
+	if (is_rm_minidump)
+		ehdr->e_shnum = 3;
+	else
+		ehdr->e_shnum = 4;
 
-	mdreg->md_valid = MD_REGION_VALID;
+	if (!is_rm_minidump)
+		mdreg->md_valid = MD_REGION_VALID;
 	return 0;
 }
 
@@ -564,57 +902,113 @@ static int msm_minidump_driver_remove(struct platform_device *pdev)
 
 static int msm_minidump_driver_probe(struct platform_device *pdev)
 {
-	unsigned int i;
+	unsigned int region_number;
 	size_t size;
-	struct md_region *mdr;
+	struct md_pending_region *pending_region, *tmp;
+	struct md_rm_request *rm_region;
 	struct md_global_toc *md_global_toc;
 	struct md_ss_toc *md_ss_toc;
 	unsigned long flags;
+	int ret;
 
-	/* Get Minidump table */
-	md_global_toc = qcom_smem_get(QCOM_SMEM_HOST_ANY, SBL_MINIDUMP_SMEM_ID,
-				      &size);
-	if (IS_ERR_OR_NULL(md_global_toc)) {
-		pr_err("SMEM is not initialized.\n");
-		return PTR_ERR(md_global_toc);
+	if (!debug_symbol_available())
+		return -EPROBE_DEFER;
+
+	is_rm_minidump =
+		of_device_is_compatible(pdev->dev.of_node, "qcom,minidump-rm");
+
+	if (is_rm_minidump) {
+		ret = gh_rm_minidump_get_info();
+		if (ret < 0) {
+			pr_err("Get minidump info failed ret=%d\n", ret);
+			return ret;
+		}
+		pr_debug("Get available slot number:%d\n", ret);
+
+		minidump_rm_wq = alloc_workqueue("minidump_wq",
+						 WQ_HIGHPRI | WQ_UNBOUND, 1);
+		if (!minidump_rm_wq) {
+			pr_err("Unable to initialize workqueue\n");
+			return -EINVAL;
+		}
+	} else {
+		/* Get Minidump table */
+		md_global_toc = qcom_smem_get(QCOM_SMEM_HOST_ANY,
+					      SBL_MINIDUMP_SMEM_ID, &size);
+		if (IS_ERR_OR_NULL(md_global_toc)) {
+			pr_err("SMEM is not initialized\n");
+			return PTR_ERR(md_global_toc);
+		}
+
+		/*Check global minidump support initialization */
+		if (size < sizeof(*md_global_toc) || !md_global_toc->md_toc_init) {
+			pr_err("System Minidump TOC not initialized\n");
+			return -ENODEV;
+		}
+
+		minidump_table = devm_kzalloc(
+			&pdev->dev, sizeof(*minidump_table), GFP_KERNEL);
+		if (!minidump_table)
+			return -ENOMEM;
+
+		minidump_table->md_gbl_toc = md_global_toc;
+		minidump_table->revision = md_global_toc->md_revision;
+		md_ss_toc = &md_global_toc->md_ss_toc[MD_SS_HLOS_ID];
+
+		md_ss_toc->encryption_status = MD_SS_ENCR_DONE;
+		md_ss_toc->encryption_required = MD_SS_ENCR_NOTREQ;
+
+		minidump_table->md_ss_toc = md_ss_toc;
+		minidump_table->md_regions = devm_kzalloc(
+			&pdev->dev,
+			(MAX_NUM_ENTRIES * sizeof(struct md_ss_region)),
+			GFP_KERNEL);
+		if (!minidump_table->md_regions)
+			return -ENOMEM;
+
+		md_ss_toc->md_ss_smem_regions_baseptr =
+			virt_to_phys(minidump_table->md_regions);
+
+		md_ss_toc->ss_region_count = 1;
 	}
-
-	/*Check global minidump support initialization */
-	if (size < sizeof(*md_global_toc) || !md_global_toc->md_toc_init) {
-		pr_err("System Minidump TOC not initialized\n");
-		return -ENODEV;
-	}
-
-	minidump_table.md_gbl_toc = md_global_toc;
-	minidump_table.revision = md_global_toc->md_revision;
-	md_ss_toc = &md_global_toc->md_ss_toc[MD_SS_HLOS_ID];
-
-	md_ss_toc->encryption_status = MD_SS_ENCR_DONE;
-	md_ss_toc->encryption_required = MD_SS_ENCR_NOTREQ;
-
-	minidump_table.md_ss_toc = md_ss_toc;
-	minidump_table.md_regions = devm_kzalloc(&pdev->dev, (MAX_NUM_ENTRIES *
-				sizeof(struct md_ss_region)), GFP_KERNEL);
-	if (!minidump_table.md_regions)
-		return -ENOMEM;
-
-	md_ss_toc->md_ss_smem_regions_baseptr =
-				virt_to_phys(minidump_table.md_regions);
 
 	/* First entry would be ELF header */
-	md_ss_toc->ss_region_count = 1;
-	msm_minidump_add_header();
+	ret = msm_minidump_add_header();
+	if (ret < 0) {
+		pr_err("failed to init minidump header\n");
+		return ret;
+	}
 
 	/* Add pending entries to HLOS TOC */
 	spin_lock_irqsave(&mdt_lock, flags);
-	md_ss_toc->md_ss_toc_init = 1;
-	md_ss_toc->md_ss_enable_status = MD_SS_ENABLED;
-	for (i = 0; i < pendings; i++) {
-		mdr = &minidump_table.entry[i];
-		md_update_ss_toc(mdr);
+	/* only need initialize when use smem */
+	if (!is_rm_minidump) {
+		md_ss_toc->md_ss_toc_init = 1;
+		md_ss_toc->md_ss_enable_status = MD_SS_ENABLED;
 	}
-
-	pendings = 0;
+	region_number = 0;
+	list_for_each_entry_safe(pending_region, tmp, &pending_list, list) {
+		if (is_rm_minidump) {
+			rm_region = kzalloc(sizeof(*rm_region), GFP_ATOMIC);
+			if (!rm_region) {
+				spin_unlock_irqrestore(&mdt_lock, flags);
+				return -ENOMEM;
+			}
+			rm_region->entry = pending_region->entry;
+			rm_region->work_cmd = MINIDUMP_ADD;
+			INIT_WORK(&rm_region->work, minidump_rm_work);
+			queue_work(minidump_rm_wq, &rm_region->work);
+			md_add_elf_header(&pending_region->entry);
+		} else {
+			/* Add pending entry to minidump table and ss toc */
+			minidump_table->entry[region_number] =
+				pending_region->entry;
+			md_add_ss_toc(&minidump_table->entry[region_number]);
+		}
+		list_del(&pending_region->list);
+		kfree(pending_region);
+		region_number++;
+	}
 	spin_unlock_irqrestore(&mdt_lock, flags);
 
 	/* All updates above should be visible, before init completes */
@@ -628,6 +1022,7 @@ static int msm_minidump_driver_probe(struct platform_device *pdev)
 
 static const struct of_device_id msm_minidump_of_match[] = {
 	{ .compatible = "qcom,minidump" },
+	{ .compatible = "qcom,minidump-rm"},
 	{ }
 };
 MODULE_DEVICE_TABLE(of, msm_minidump_of_match);
@@ -643,4 +1038,5 @@ static struct platform_driver msm_minidump_driver = {
 module_platform_driver(msm_minidump_driver);
 
 MODULE_DESCRIPTION("MSM Mini Dump Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_IMPORT_NS(MINIDUMP);
+MODULE_LICENSE("GPL");

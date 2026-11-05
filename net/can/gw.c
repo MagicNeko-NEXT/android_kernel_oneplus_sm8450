@@ -199,6 +199,68 @@ static void mod_set_fddata(struct canfd_frame *cf, struct cf_mod *mod)
 	memcpy(cf->data, mod->modframe.set.data, CANFD_MAX_DLEN);
 }
 
+/* retrieve valid CC DLC value and store it into 'len' */
+static void mod_retrieve_ccdlc(struct canfd_frame *cf)
+{
+	struct can_frame *ccf = (struct can_frame *)cf;
+
+	/* len8_dlc is only valid if len == CAN_MAX_DLEN */
+	if (ccf->len != CAN_MAX_DLEN)
+		return;
+
+	/* do we have a valid len8_dlc value from 9 .. 15 ? */
+	if (ccf->len8_dlc > CAN_MAX_DLEN && ccf->len8_dlc <= CAN_MAX_RAW_DLC)
+		ccf->len = ccf->len8_dlc;
+}
+
+/* convert valid CC DLC value in 'len' into struct can_frame elements */
+static void mod_store_ccdlc(struct canfd_frame *cf)
+{
+	struct can_frame *ccf = (struct can_frame *)cf;
+
+	/* clear potential leftovers */
+	ccf->len8_dlc = 0;
+
+	/* plain data length 0 .. 8 - that was easy */
+	if (ccf->len <= CAN_MAX_DLEN)
+		return;
+
+	/* potentially broken values are caught in can_can_gw_rcv() */
+	if (ccf->len > CAN_MAX_RAW_DLC)
+		return;
+
+	/* we have a valid dlc value from 9 .. 15 in ccf->len */
+	ccf->len8_dlc = ccf->len;
+	ccf->len = CAN_MAX_DLEN;
+}
+
+static void mod_and_ccdlc(struct canfd_frame *cf, struct cf_mod *mod)
+{
+	mod_retrieve_ccdlc(cf);
+	mod_and_len(cf, mod);
+	mod_store_ccdlc(cf);
+}
+
+static void mod_or_ccdlc(struct canfd_frame *cf, struct cf_mod *mod)
+{
+	mod_retrieve_ccdlc(cf);
+	mod_or_len(cf, mod);
+	mod_store_ccdlc(cf);
+}
+
+static void mod_xor_ccdlc(struct canfd_frame *cf, struct cf_mod *mod)
+{
+	mod_retrieve_ccdlc(cf);
+	mod_xor_len(cf, mod);
+	mod_store_ccdlc(cf);
+}
+
+static void mod_set_ccdlc(struct canfd_frame *cf, struct cf_mod *mod)
+{
+	mod_set_len(cf, mod);
+	mod_store_ccdlc(cf);
+}
+
 static void canframecpy(struct canfd_frame *dst, struct can_frame *src)
 {
 	/* Copy the struct members separately to ensure that no uninitialized
@@ -207,7 +269,7 @@ static void canframecpy(struct canfd_frame *dst, struct can_frame *src)
 	 */
 
 	dst->can_id = src->can_id;
-	dst->len = src->can_dlc;
+	dst->len = src->len;
 	*(u64 *)dst->data = *(u64 *)src->data;
 }
 
@@ -312,10 +374,10 @@ static void cgw_csum_crc8_rel(struct canfd_frame *cf,
 		return;
 
 	if (from <= to) {
-		for (i = crc8->from_idx; i <= crc8->to_idx; i++)
+		for (i = from; i <= to; i++)
 			crc = crc8->crctab[crc ^ cf->data[i]];
 	} else {
-		for (i = crc8->from_idx; i >= crc8->to_idx; i--)
+		for (i = from; i >= to; i--)
 			crc = crc8->crctab[crc ^ cf->data[i]];
 	}
 
@@ -334,7 +396,7 @@ static void cgw_csum_crc8_rel(struct canfd_frame *cf,
 		break;
 	}
 
-	cf->data[crc8->result_idx] = crc ^ crc8->final_xor_val;
+	cf->data[res] = crc ^ crc8->final_xor_val;
 }
 
 static void cgw_csum_crc8_pos(struct canfd_frame *cf,
@@ -402,10 +464,10 @@ static void can_can_gw_rcv(struct sk_buff *skb, void *data)
 
 	/* process strictly Classic CAN or CAN FD frames */
 	if (gwj->flags & CGW_FLAGS_CAN_FD) {
-		if (skb->len != CANFD_MTU)
+		if (!can_is_canfd_skb(skb))
 			return;
 	} else {
-		if (skb->len != CAN_MTU)
+		if (!can_is_can_skb(skb))
 			return;
 	}
 
@@ -864,8 +926,8 @@ static int cgw_parse_attr(struct nlmsghdr *nlh, struct cf_mod *mod,
 			if (mb.modtype & CGW_MOD_ID)
 				mod->modfunc[modidx++] = mod_and_id;
 
-			if (mb.modtype & CGW_MOD_LEN)
-				mod->modfunc[modidx++] = mod_and_len;
+			if (mb.modtype & CGW_MOD_DLC)
+				mod->modfunc[modidx++] = mod_and_ccdlc;
 
 			if (mb.modtype & CGW_MOD_DATA)
 				mod->modfunc[modidx++] = mod_and_data;
@@ -880,8 +942,8 @@ static int cgw_parse_attr(struct nlmsghdr *nlh, struct cf_mod *mod,
 			if (mb.modtype & CGW_MOD_ID)
 				mod->modfunc[modidx++] = mod_or_id;
 
-			if (mb.modtype & CGW_MOD_LEN)
-				mod->modfunc[modidx++] = mod_or_len;
+			if (mb.modtype & CGW_MOD_DLC)
+				mod->modfunc[modidx++] = mod_or_ccdlc;
 
 			if (mb.modtype & CGW_MOD_DATA)
 				mod->modfunc[modidx++] = mod_or_data;
@@ -896,8 +958,8 @@ static int cgw_parse_attr(struct nlmsghdr *nlh, struct cf_mod *mod,
 			if (mb.modtype & CGW_MOD_ID)
 				mod->modfunc[modidx++] = mod_xor_id;
 
-			if (mb.modtype & CGW_MOD_LEN)
-				mod->modfunc[modidx++] = mod_xor_len;
+			if (mb.modtype & CGW_MOD_DLC)
+				mod->modfunc[modidx++] = mod_xor_ccdlc;
 
 			if (mb.modtype & CGW_MOD_DATA)
 				mod->modfunc[modidx++] = mod_xor_data;
@@ -912,8 +974,8 @@ static int cgw_parse_attr(struct nlmsghdr *nlh, struct cf_mod *mod,
 			if (mb.modtype & CGW_MOD_ID)
 				mod->modfunc[modidx++] = mod_set_id;
 
-			if (mb.modtype & CGW_MOD_LEN)
-				mod->modfunc[modidx++] = mod_set_len;
+			if (mb.modtype & CGW_MOD_DLC)
+				mod->modfunc[modidx++] = mod_set_ccdlc;
 
 			if (mb.modtype & CGW_MOD_DATA)
 				mod->modfunc[modidx++] = mod_set_data;
@@ -1103,6 +1165,13 @@ static int cgw_create_job(struct sk_buff *skb,  struct nlmsghdr *nlh,
 	if (gwj->dst.dev->type != ARPHRD_CAN)
 		goto out;
 
+	/* is sending the skb back to the incoming interface intended? */
+	if (gwj->src.dev == gwj->dst.dev &&
+	    !(gwj->flags & CGW_FLAGS_CAN_IIF_TX_OK)) {
+		err = -EINVAL;
+		goto out;
+	}
+
 	ASSERT_RTNL();
 
 	err = cgw_register_filter(net, gwj);
@@ -1212,16 +1281,19 @@ static int __net_init cangw_pernet_init(struct net *net)
 	return 0;
 }
 
-static void __net_exit cangw_pernet_exit(struct net *net)
+static void __net_exit cangw_pernet_exit_batch(struct list_head *net_list)
 {
+	struct net *net;
+
 	rtnl_lock();
-	cgw_remove_all_jobs(net);
+	list_for_each_entry(net, net_list, exit_list)
+		cgw_remove_all_jobs(net);
 	rtnl_unlock();
 }
 
 static struct pernet_operations cangw_pernet_ops = {
 	.init = cangw_pernet_init,
-	.exit = cangw_pernet_exit,
+	.exit_batch = cangw_pernet_exit_batch,
 };
 
 static __init int cgw_module_init(void)

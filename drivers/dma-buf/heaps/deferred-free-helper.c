@@ -19,8 +19,10 @@
 static LIST_HEAD(free_list);
 static size_t list_nr_pages;
 wait_queue_head_t freelist_waitqueue;
-struct task_struct *freelist_task;
 static DEFINE_SPINLOCK(free_list_lock);
+
+struct task_struct *freelist_task;
+EXPORT_SYMBOL_GPL(freelist_task);
 
 void deferred_free(struct deferred_freelist_item *item,
 		   void (*free)(struct deferred_freelist_item*,
@@ -62,7 +64,7 @@ static size_t free_one_item(enum df_reason reason)
 	return nr_pages;
 }
 
-unsigned long get_freelist_nr_pages(void)
+static unsigned long get_freelist_nr_pages(void)
 {
 	unsigned long nr_pages;
 	unsigned long flags;
@@ -72,7 +74,6 @@ unsigned long get_freelist_nr_pages(void)
 	spin_unlock_irqrestore(&free_list_lock, flags);
 	return nr_pages;
 }
-EXPORT_SYMBOL_GPL(get_freelist_nr_pages);
 
 static unsigned long freelist_shrink_count(struct shrinker *shrinker,
 					   struct shrink_control *sc)
@@ -132,7 +133,7 @@ static int deferred_freelist_init(void)
 	}
 	sched_set_normal(freelist_task, 19);
 
-	return register_shrinker(&freelist_shrinker);
+	return register_shrinker(&freelist_shrinker, "dmabuf-deferred-free-shrinker");
 }
 module_init(deferred_freelist_init);
 MODULE_LICENSE("GPL v2");

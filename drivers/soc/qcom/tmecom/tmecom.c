@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt)	"tmecom: [%s][%d]:" fmt, __func__, __LINE__
@@ -30,7 +29,7 @@ struct tmecom {
 	bool rx_done;
 };
 
-#if IS_ENABLED(CONFIG_DEBUG_FS)
+#if IS_ENABLED(CONFIG_DEBUG_FS) && IS_ENABLED(CONFIG_QTI_HW_KEY_MANAGER)
 #include <linux/tme_hwkm_master_defs.h>
 #include <linux/tme_hwkm_master.h>
 
@@ -165,16 +164,15 @@ err_exit:
 	mutex_unlock(&tdev->lock);
 	return ret;
 }
-EXPORT_SYMBOL(tmecom_process_request);
+EXPORT_SYMBOL_GPL(tmecom_process_request);
 
-#if IS_ENABLED(CONFIG_DEBUG_FS)
+#if IS_ENABLED(CONFIG_DEBUG_FS) && IS_ENABLED(CONFIG_QTI_HW_KEY_MANAGER)
 static ssize_t tmecom_debugfs_write(struct file *file,
 		const char __user *userstr, size_t len, loff_t *pos)
 {
 	int ret = 0;
 	size_t rxlen = 0;
 	struct tme_ext_err_info *err_info = (struct tme_ext_err_info *)dpkt;
-
 
 	if (!len || (len > MBOX_MAX_MSG_LEN)) {
 		pr_err("invalid message length\n");
@@ -212,8 +210,6 @@ static void tmecom_receive_message(struct mbox_client *client, void *message)
 {
 	struct tmecom *tdev = dev_get_drvdata(client->dev);
 	struct qmp_pkt *pkt = NULL;
-
-	pr_debug("%s entered\n", __func__);
 
 	if (!message) {
 		dev_err(tdev->dev, "spurious message received\n");
@@ -272,7 +268,7 @@ static int tmecom_probe(struct platform_device *pdev)
 
 	init_waitqueue_head(&tdev->waitq);
 
-#if IS_ENABLED(CONFIG_DEBUG_FS)
+#if IS_ENABLED(CONFIG_DEBUG_FS) && IS_ENABLED(CONFIG_QTI_HW_KEY_MANAGER)
 	debugfs_file = debugfs_create_file(name, 0220, NULL, tdev,
 			&tmecom_debugfs_ops);
 	if (!debugfs_file)
@@ -287,18 +283,18 @@ static int tmecom_probe(struct platform_device *pdev)
 
 	dev_info(&pdev->dev, "tmecom probe success\n");
 	return 0;
-#if IS_ENABLED(CONFIG_DEBUG_FS)
+#if IS_ENABLED(CONFIG_DEBUG_FS) && IS_ENABLED(CONFIG_QTI_HW_KEY_MANAGER)
 err:
-#endif /* CONFIG_DEBUG_FS */
 	mbox_free_channel(tdev->chan);
 	return -ENOMEM;
+#endif /* CONFIG_DEBUG_FS */
 }
 
 static int tmecom_remove(struct platform_device *pdev)
 {
 	struct tmecom *tdev = platform_get_drvdata(pdev);
 
-#if IS_ENABLED(CONFIG_DEBUG_FS)
+#if IS_ENABLED(CONFIG_DEBUG_FS) && IS_ENABLED(CONFIG_QTI_HW_KEY_MANAGER)
 	debugfs_remove(debugfs_file);
 #endif /* CONFIG_DEBUG_FS */
 
@@ -326,4 +322,4 @@ static struct platform_driver tmecom_driver = {
 module_platform_driver(tmecom_driver);
 
 MODULE_DESCRIPTION("MSM TMECom QTI mailbox protocol client");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2021-2023, Qualcomm Innovation Center, Inc. All rights reserved.
  *
  */
 
@@ -146,4 +147,4 @@ static __exit void exit_watchdog(void)
 }
 module_exit(exit_watchdog);
 MODULE_DESCRIPTION("QCOM Soc Watchdog Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

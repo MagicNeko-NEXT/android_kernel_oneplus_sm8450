@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2021-2023, Qualcomm Innovation Center, Inc. All rights reserved.
  *
  */
 
@@ -29,9 +30,9 @@
  *  gh_wdt_call() - Sends ARM SMCCC 1.1 Calls to the hypervisor
  *
  *  @smc_id: The smc id needed to interact with the watchdog in the hypervisor
- *  @arg1:   A u32 value to be sent to the the hypervisor
- *  @arg2:   A u16 value to be sent to the the hypervisor
- *  @arg3:   A u16 value to be sent to the the hypervisor
+ *  @arg1:   A u32 value to be sent to the hypervisor
+ *  @arg2:   A u16 value to be sent to the hypervisor
+ *  @arg3:   A u16 value to be sent to the hypervisor
  *
  *  The hypervisor takes input via  ARM SMCCC Calls. The position of
  *  these values matter. u16 values are needed to set both the bark
@@ -233,7 +234,7 @@ static int gh_show_wdt_status(struct msm_watchdog_data *wdog_dd)
 			hret, ret);
 	} else {
 		dev_err(wdog_dd->dev,
-			"vWdog-CTL: %d, vWdog-time since last pet: %d, vWdog-expired status: %d\n",
+			"vWdog-CTL: %lu, vWdog-time since last pet: %lu, vWdog-expired status: %lu\n",
 			res.a1 & 1, res.a2, (res.a1 >> 31) & 1);
 	}
 
@@ -303,4 +304,4 @@ static __exit void exit_watchdog(void)
 }
 module_exit(exit_watchdog);
 MODULE_DESCRIPTION("QCOM Gunyah Watchdog Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

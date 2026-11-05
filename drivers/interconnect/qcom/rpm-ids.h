@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Copyright (c) 2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  *
  */
 
@@ -136,6 +136,7 @@
 #define ICBID_MASTER_SNOC_BIMC_2		108
 #define ICBID_MASTER_BIMC_SNOC_1		109
 #define ICBID_MASTER_A0NOC_SNOC		110
+#define ICBID_MASTER_ANOC_SNOC		ICBID_MASTER_A0NOC_SNOC
 #define ICBID_MASTER_A1NOC_SNOC		111
 #define ICBID_MASTER_A2NOC_SNOC		112
 #define ICBID_MASTER_PIMEM		113
@@ -353,6 +354,7 @@
 #define ICBID_SLAVE_PNOC_A1NOC		139
 #define ICBID_SLAVE_SNOC_VMEM		140
 #define ICBID_SLAVE_A0NOC_SNOC		141
+#define ICBID_SLAVE_ANOC_SNOC		ICBID_SLAVE_A0NOC_SNOC
 #define ICBID_SLAVE_A1NOC_SNOC		142
 #define ICBID_SLAVE_A2NOC_SNOC		143
 #define ICBID_SLAVE_A0NOC_CFG		144

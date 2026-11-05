@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0+
 /*
- * btnode.c - NILFS B-tree node cache
+ * NILFS B-tree node cache
  *
  * Copyright (C) 2005-2008 Nippon Telegraph and Telephone Corporation.
  *
@@ -35,6 +35,7 @@ void nilfs_init_btnc_inode(struct inode *btnc_inode)
 	ii->i_flags = 0;
 	memset(&ii->i_bmap_data, 0, sizeof(struct nilfs_bmap));
 	mapping_set_gfp_mask(btnc_inode->i_mapping, GFP_NOFS);
+	btnc_inode->i_mapping->a_ops = &nilfs_buffer_cache_aops;
 }
 
 void nilfs_btnode_cache_clear(struct address_space *btnc)
@@ -84,7 +85,7 @@ failed:
 }
 
 int nilfs_btnode_submit_block(struct address_space *btnc, __u64 blocknr,
-			      sector_t pblocknr, int mode, int mode_flags,
+			      sector_t pblocknr, blk_opf_t opf,
 			      struct buffer_head **pbh, sector_t *submit_ptr)
 {
 	struct buffer_head *bh;
@@ -117,13 +118,13 @@ int nilfs_btnode_submit_block(struct address_space *btnc, __u64 blocknr,
 		}
 	}
 
-	if (mode_flags & REQ_RAHEAD) {
+	if (opf & REQ_RAHEAD) {
 		if (pblocknr != *submit_ptr + 1 || !trylock_buffer(bh)) {
 			err = -EBUSY; /* internal code */
 			brelse(bh);
 			goto out_locked;
 		}
-	} else { /* mode == READ */
+	} else { /* opf == REQ_OP_READ */
 		lock_buffer(bh);
 	}
 	if (buffer_uptodate(bh)) {
@@ -135,7 +136,7 @@ int nilfs_btnode_submit_block(struct address_space *btnc, __u64 blocknr,
 	bh->b_blocknr = pblocknr; /* set block address for read */
 	bh->b_end_io = end_buffer_read_sync;
 	get_bh(bh);
-	submit_bh(mode, mode_flags, bh);
+	submit_bh(opf, bh);
 	bh->b_blocknr = blocknr; /* set back to the given block address */
 	*submit_ptr = pblocknr;
 	err = 0;
@@ -201,7 +202,7 @@ int nilfs_btnode_prepare_change_key(struct address_space *btnc,
 		struct page *opage = obh->b_page;
 		lock_page(opage);
 retry:
-		/* BUG_ON(oldkey != obh->b_page->index); */
+		/* BUG_ON(oldkey != obh->b_folio->index); */
 		if (unlikely(oldkey != opage->index))
 			NILFS_PAGE_BUG(opage,
 				       "invalid oldkey %lld (newkey=%lld)",

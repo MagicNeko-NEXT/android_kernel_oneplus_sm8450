@@ -115,13 +115,13 @@ static irqreturn_t rmi_f34_attention(int irq, void *ctx)
 			complete(&f34->v5.cmd_done);
 	} else {
 		ret = rmi_read_block(f34->fn->rmi_dev,
-				     f34->fn->fd.data_base_addr +
-						f34->v7.off.flash_status,
-				     &status, sizeof(status));
-		rmi_dbg(RMI_DEBUG_FN, &fn->dev, "%s: status: %#02x, ret: %d\n",
+					f34->fn->fd.data_base_addr +
+						V7_COMMAND_OFFSET,
+					&status, sizeof(status));
+		rmi_dbg(RMI_DEBUG_FN, &f34->fn->dev, "%s: cmd: %#02x, ret: %d\n",
 			__func__, status, ret);
 
-		if (!ret && !(status & 0x1f))
+		if (!ret && status == CMD_V7_IDLE)
 			complete(&f34->v7.cmd_done);
 	}
 
@@ -369,7 +369,7 @@ static int rmi_firmware_update(struct rmi_driver_data *data,
 		return -ENODEV;
 	}
 
-	if (f34->bl_version == 7) {
+	if (f34->bl_version >= 7) {
 		if (data->pdt_props & HAS_BSR) {
 			dev_err(dev, "%s: LTS not supported\n", __func__);
 			return -ENODEV;
@@ -381,7 +381,7 @@ static int rmi_firmware_update(struct rmi_driver_data *data,
 	}
 
 	/* Enter flash mode */
-	if (f34->bl_version == 7)
+	if (f34->bl_version >= 7)
 		ret = rmi_f34v7_start_reflash(f34, fw);
 	else
 		ret = rmi_f34_enable_flash(f34);
@@ -412,7 +412,7 @@ static int rmi_firmware_update(struct rmi_driver_data *data,
 	f34 = dev_get_drvdata(&data->f34_container->dev);
 
 	/* Perform firmware update */
-	if (f34->bl_version == 7)
+	if (f34->bl_version >= 7)
 		ret = rmi_f34v7_do_reflash(f34, fw);
 	else
 		ret = rmi_f34_update_firmware(f34, fw);

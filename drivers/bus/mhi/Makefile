@@ -1,5 +1,11 @@
-# core layer
-obj-y += controllers/
-obj-y += devices/
 # Host MHI stack
-obj-y += host/
+obj-y  += host/
+
+# Endpoint MHI stack
+obj-y += ep/
+
+# MHI Devices stack
+obj-y += devices/
+
+#MHI Controller stack
+obj-y += controllers/

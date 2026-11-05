@@ -6,7 +6,7 @@
  *  based heavily on the work of Stephen Cox, with additional
  *  help from RedRat Ltd.
  *
- * This driver began life based an an old version of the first-generation
+ * This driver began life based on an old version of the first-generation
  * lirc_mceusb driver from the lirc 0.7.2 distribution. It was then
  * significantly rewritten by Stephen Cox with the aid of RedRat Ltd's
  * Chris Dodge.
@@ -422,7 +422,7 @@ static int redrat3_send_cmd(int cmd, struct redrat3_dev *rr3)
 static int redrat3_enable_detector(struct redrat3_dev *rr3)
 {
 	struct device *dev = rr3->dev;
-	u8 ret;
+	int ret;
 
 	ret = redrat3_send_cmd(RR3_RC_DET_ENABLE, rr3);
 	if (ret != 0)
@@ -1155,9 +1155,9 @@ static int redrat3_dev_resume(struct usb_interface *intf)
 {
 	struct redrat3_dev *rr3 = usb_get_intfdata(intf);
 
-	if (usb_submit_urb(rr3->narrow_urb, GFP_ATOMIC))
+	if (usb_submit_urb(rr3->narrow_urb, GFP_NOIO))
 		return -EIO;
-	if (usb_submit_urb(rr3->wide_urb, GFP_ATOMIC))
+	if (usb_submit_urb(rr3->wide_urb, GFP_NOIO))
 		return -EIO;
 	led_classdev_resume(&rr3->led);
 	return 0;

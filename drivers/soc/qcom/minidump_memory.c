@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
+#include <linux/align.h>
 #include <linux/mm.h>
 #include <linux/swap.h>
 #include <linux/mman.h>
 #include <linux/seq_buf.h>
 #include <linux/vmalloc.h>
-#include <linux/android_debug_symbols.h>
 #include <linux/cma.h>
 #include <linux/slab.h>
 #include <linux/page_ext.h>
@@ -21,9 +22,37 @@
 #include <linux/dma-buf.h>
 #include <linux/dma-resv.h>
 #include <linux/fdtable.h>
+#include <linux/qcom_dma_heap.h>
+#include "debug_symbol.h"
 #include "minidump_memory.h"
 #include "../../../mm/slab.h"
 #include "../mm/internal.h"
+
+/* Meminfo */
+static struct seq_buf *md_meminfo_seq_buf;
+
+/* Slabinfo */
+static struct seq_buf *md_slabinfo_seq_buf;
+
+static size_t md_pageowner_dump_size = SZ_2M;
+static char *md_pageowner_dump_addr;
+
+static size_t md_slabowner_dump_size = SZ_2M;
+static char *md_slabowner_dump_addr;
+
+static size_t md_dma_buf_info_size = SZ_256K;
+static char *md_dma_buf_info_addr;
+
+static size_t md_dma_buf_procs_size = SZ_256K;
+static char *md_dma_buf_procs_addr;
+
+static unsigned long *md_debug_totalcma_pages;
+static struct list_head *md_debug_slab_caches;
+static struct mutex *md_debug_slab_mutex;
+static struct static_key *md_debug_page_owner_inited;
+static struct static_key *md_debug_slub_debug_enabled;
+static unsigned long *md_debug_min_low_pfn;
+static unsigned long *md_debug_max_pfn;
 
 #define DMA_BUF_HASH_SIZE (1 << 20)
 #define DMA_BUF_HASH_SEED 0x9747b28c
@@ -42,12 +71,20 @@ struct dma_buf_priv {
 	size_t size;
 };
 
+#define MD_DEBUG_LOOKUP(_var, type) \
+	do { \
+		md_debug_##_var = (type *)DEBUG_SYMBOL_LOOKUP(_var); \
+		if (!md_debug_##_var) { \
+			pr_err("minidump: %s symbol not available in vmlinux\n", #_var); \
+		} \
+	} while (0)
+
 static void show_val_kb(struct seq_buf *m, const char *s, unsigned long num)
 {
-	seq_buf_printf(m, "%s : %lld KB\n", s, num << (PAGE_SHIFT - 10));
+	seq_buf_printf(m, "%s : %ld KB\n", s, num << (PAGE_SHIFT - 10));
 }
 
-void md_dump_meminfo(struct seq_buf *m)
+static void md_dump_meminfo(struct seq_buf *m)
 {
 	struct sysinfo i;
 	long cached;
@@ -55,7 +92,8 @@ void md_dump_meminfo(struct seq_buf *m)
 	unsigned long pages[NR_LRU_LISTS];
 	unsigned long sreclaimable, sunreclaim;
 	int lru;
-	unsigned long *addr;
+
+	MD_DEBUG_LOOKUP(totalcma_pages, unsigned long);
 
 	si_meminfo(&i);
 	si_swapinfo(&i);
@@ -119,13 +157,14 @@ void md_dump_meminfo(struct seq_buf *m)
 		   global_node_page_state(NR_KERNEL_SCS_KB));
 #endif
 	show_val_kb(m, "PageTables:     ",
-		    global_zone_page_state(NR_PAGETABLE));
+		    global_node_page_state(NR_PAGETABLE));
 	show_val_kb(m, "Bounce:         ",
 		    global_zone_page_state(NR_BOUNCE));
 	show_val_kb(m, "WritebackTmp:   ",
 		    global_node_page_state(NR_WRITEBACK_TEMP));
 	seq_buf_printf(m, "VmallocTotal:   %8lu kB\n",
 		   (unsigned long)VMALLOC_TOTAL >> 10);
+	show_val_kb(m, "VmallocUsed: ", vmalloc_nr_pages());
 	show_val_kb(m, "Percpu:         ", pcpu_nr_pages());
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
@@ -142,8 +181,7 @@ void md_dump_meminfo(struct seq_buf *m)
 #endif
 
 #ifdef CONFIG_CMA
-	addr = (unsigned long *)android_debug_symbol(ADS_TOTAL_CMA);
-	show_val_kb(m, "CmaTotal:       ", *addr);
+	show_val_kb(m, "CmaTotal:       ", *md_debug_totalcma_pages);
 	show_val_kb(m, "CmaFree:        ",
 		    global_zone_page_state(NR_FREE_CMA_PAGES));
 #endif
@@ -184,34 +222,40 @@ static void slabinfo_stats(struct seq_buf *m, struct kmem_cache *cachep)
 #endif
 }
 
-void md_dump_slabinfo(struct seq_buf *m)
+static void md_dump_slabinfo(struct seq_buf *m)
 {
 	struct kmem_cache *s;
 	struct slabinfo sinfo;
-	struct list_head *slab_caches;
-	struct mutex *slab_mutex;
 
-	slab_caches = (struct list_head *)android_debug_symbol(ADS_SLAB_CACHES);
-	slab_mutex = (struct mutex *) android_debug_symbol(ADS_SLAB_MUTEX);
+	MD_DEBUG_LOOKUP(slab_caches, struct list_head);
+	MD_DEBUG_LOOKUP(slab_mutex, struct mutex);
+
+	if (!md_debug_slab_caches)
+		return;
+
+	if (!md_debug_slab_mutex)
+		return;
+
+	if (!mutex_trylock(md_debug_slab_mutex))
+		return;
 
 	/* print_slabinfo_header */
-		seq_buf_printf(m,
-				"# name            <active_objs> <num_objs> <objsize> <objperslab> <pagesperslab>");
-		seq_buf_printf(m,
-				" : tunables <limit> <batchcount> <sharedfactor>");
-		seq_buf_printf(m,
-				" : slabdata <active_slabs> <num_slabs> <sharedavail>");
-	#ifdef CONFIG_DEBUG_SLAB
-		seq_buf_printf(m,
-				" : globalstat <listallocs> <maxobjs> <grown> <reaped> <error> <maxfreeable> <nodeallocs> <remotefrees> <alienoverflow>");
-		seq_buf_printf(m,
-				" : cpustat <allochit> <allocmiss> <freehit> <freemiss>");
-	#endif
-		seq_buf_printf(m, "\n");
+	seq_buf_printf(m,
+			"# name            <active_objs> <num_objs> <objsize> <objperslab> <pagesperslab>");
+	seq_buf_printf(m,
+			" : tunables <limit> <batchcount> <sharedfactor>");
+	seq_buf_printf(m,
+			" : slabdata <active_slabs> <num_slabs> <sharedavail>");
+#ifdef CONFIG_DEBUG_SLAB
+	seq_buf_printf(m,
+			" : globalstat <listallocs> <maxobjs> <grown> <reaped> <error> <maxfreeable> <nodeallocs> <remotefrees> <alienoverflow>");
+	seq_buf_printf(m,
+			" : cpustat <allochit> <allocmiss> <freehit> <freemiss>");
+#endif
+	seq_buf_printf(m, "\n");
 
 	/* Loop through all slabs */
-	mutex_lock(slab_mutex);
-	list_for_each_entry(s, slab_caches, list) {
+	list_for_each_entry(s, md_debug_slab_caches, list) {
 		memset(&sinfo, 0, sizeof(sinfo));
 		get_slabinfo(s, &sinfo);
 
@@ -226,9 +270,11 @@ void md_dump_slabinfo(struct seq_buf *m)
 		slabinfo_stats(m, s);
 		seq_buf_printf(m, "\n");
 	}
-	mutex_unlock(slab_mutex);
+	mutex_unlock(md_debug_slab_mutex);
 }
-#endif
+#else
+static inline void md_dump_slabinfo(void) {}
+#endif /* CONFIG_SLUB_DEBUG */
 
 bool md_register_memory_dump(int size, char *name)
 {
@@ -247,7 +293,7 @@ bool md_register_memory_dump(int size, char *name)
 	}
 
 	buffer_start = page_to_virt(page);
-	strlcpy(md_entry.name, name, sizeof(md_entry.name));
+	strscpy(md_entry.name, name, sizeof(md_entry.name));
 	md_entry.virt_addr = (uintptr_t) buffer_start;
 	md_entry.phys_addr = virt_to_phys(buffer_start);
 	md_entry.size = size;
@@ -270,9 +316,9 @@ bool md_register_memory_dump(int size, char *name)
 	if (!strcmp(name, "SLABOWNER"))
 		WRITE_ONCE(md_slabowner_dump_addr, buffer_start);
 #endif
-	if (!strcmp(name, "DMABUF_INFO"))
+	if (!strcmp(name, "DMA_INFO"))
 		WRITE_ONCE(md_dma_buf_info_addr, buffer_start);
-	if (!strcmp(name, "DMABUF_PROCS"))
+	if (!strcmp(name, "DMA_PROC"))
 		WRITE_ONCE(md_dma_buf_procs_addr, buffer_start);
 	return true;
 }
@@ -280,19 +326,19 @@ bool md_register_memory_dump(int size, char *name)
 bool md_unregister_memory_dump(char *name)
 {
 	struct page *page;
-	struct md_region *mdr;
+	struct md_region mdr;
 	struct md_region md_entry;
 
 	mdr = md_get_region(name);
-	if (!mdr) {
+	if (!mdr.virt_addr) {
 		pr_err("minidump entry for %s not found\n", name);
 		return false;
 	}
-	strlcpy(md_entry.name, mdr->name, sizeof(md_entry.name));
-	md_entry.virt_addr = mdr->virt_addr;
-	md_entry.phys_addr = mdr->phys_addr;
-	md_entry.size = mdr->size;
-	page = virt_to_page(mdr->virt_addr);
+	strscpy(md_entry.name, mdr.name, sizeof(md_entry.name));
+	md_entry.virt_addr = mdr.virt_addr;
+	md_entry.phys_addr = mdr.phys_addr;
+	md_entry.size = mdr.size;
+	page = virt_to_page(mdr.virt_addr);
 
 	if (msm_minidump_remove_region(&md_entry) < 0)
 		return false;
@@ -342,9 +388,9 @@ static void update_dump_size(char *name, size_t size, char **addr, size_t *dump_
 #ifdef CONFIG_PAGE_OWNER
 static unsigned long page_owner_filter = 0xF;
 static unsigned long page_owner_handles_size =  SZ_16K;
-static int nr_handles;
+static int nr_page_owner_handles, nr_slab_owner_handles;
 static LIST_HEAD(accounted_call_site_list);
-static DEFINE_MUTEX(accounted_call_site_lock);
+static DEFINE_SPINLOCK(accounted_call_site_lock);
 struct accounted_call_site {
 	struct list_head list;
 	char name[50];
@@ -352,28 +398,31 @@ struct accounted_call_site {
 
 bool is_page_owner_enabled(void)
 {
-	return  *(bool *)android_debug_symbol(ADS_PAGE_OWNER_ENABLED);
+	if (md_debug_page_owner_inited &&
+		atomic_read(&md_debug_page_owner_inited->enabled))
+		return true;
+	return false;
+
 }
 
 static bool found_stack(depot_stack_handle_t handle,
-		 char *dump_addr, char *cur)
+		 char *dump_addr, size_t dump_size,
+		 unsigned long handles_size, int *nr_handles)
 {
 	int *handles, i;
 
 	handles = (int *) (dump_addr +
-			md_pageowner_dump_size - page_owner_handles_size);
+			dump_size - handles_size);
 
-	for (i = 0; i < nr_handles; i++)
+	for (i = 0; i < *nr_handles; i++)
 		if (handle == handles[i])
 			return true;
 
-	if ((handles + nr_handles)
-		< (int *)(dump_addr +
-			md_pageowner_dump_size)) {
-		handles[nr_handles] = handle;
-		nr_handles += 1;
+	if ((handles + *nr_handles) < (int *)(dump_addr + dump_size)) {
+		handles[*nr_handles] = handle;
+		*nr_handles += 1;
 	} else {
-		pr_err_ratelimited("Can't stores handles increase page_owner_handles_size\n");
+		pr_err_ratelimited("Can't stores handles increase handles size\n");
 	}
 	return false;
 }
@@ -382,7 +431,7 @@ static bool check_unaccounted(char *buf, ssize_t count,
 		struct page *page, depot_stack_handle_t handle)
 {
 	int i, ret = 0;
-	unsigned long *entries;
+	unsigned long *entries, flags;
 	unsigned int nr_entries;
 	struct accounted_call_site *call_site;
 
@@ -397,16 +446,16 @@ static bool check_unaccounted(char *buf, ssize_t count,
 		if (ret == count - 1)
 			return false;
 
-		mutex_lock(&accounted_call_site_lock);
+		spin_lock_irqsave(&accounted_call_site_lock, flags);
 		list_for_each_entry(call_site,
 				&accounted_call_site_list, list) {
 			if (strnstr(buf, call_site->name,
 					strlen(buf))) {
-				mutex_unlock(&accounted_call_site_lock);
+				spin_unlock_irqrestore(&accounted_call_site_lock, flags);
 				return false;
 			}
 		}
-		mutex_unlock(&accounted_call_site_lock);
+		spin_unlock_irqrestore(&accounted_call_site_lock, flags);
 	}
 	return true;
 }
@@ -456,7 +505,11 @@ dump:
 	nr_entries = stack_depot_fetch(handle, &entries);
 	if ((buf > (md_pageowner_dump_addr +
 			md_pageowner_dump_size - page_owner_handles_size))
-			|| !found_stack(handle, md_pageowner_dump_addr, buf)) {
+			|| !found_stack(handle,
+				md_pageowner_dump_addr,
+				md_pageowner_dump_size,
+				page_owner_handles_size,
+				&nr_page_owner_handles)) {
 		ret = scnprintf(buf, count, "%lu %u %u\n",
 				pfn, handle, nr_entries);
 		if (ret == count - 1)
@@ -475,26 +528,32 @@ err:
 	return ret;
 }
 
-void md_dump_pageowner(char *addr, size_t dump_size)
+static void md_dump_pageowner(char *addr, size_t dump_size)
 {
 	unsigned long pfn;
 	struct page *page;
 	struct page_ext *page_ext;
 	depot_stack_handle_t handle;
 	ssize_t size;
-	unsigned long min_low_pfn, max_pfn;
 
-	min_low_pfn = *(unsigned long *)android_debug_symbol(ADS_MIN_LOW_PFN);
-	max_pfn = *(unsigned long *)android_debug_symbol(ADS_MAX_PFN);
+	MD_DEBUG_LOOKUP(min_low_pfn, unsigned long);
+	MD_DEBUG_LOOKUP(max_pfn, unsigned long);
+
+	if (!md_debug_min_low_pfn)
+		return;
+
+	if (!md_debug_max_pfn)
+		return;
+
 	page = NULL;
-	pfn = min_low_pfn;
+	pfn = *md_debug_min_low_pfn;
 
 	/* Find a valid PFN or the start of a MAX_ORDER_NR_PAGES area */
 	while (!pfn_valid(pfn) && (pfn & (MAX_ORDER_NR_PAGES - 1)) != 0)
 		pfn++;
 
 	/* Find an allocated page */
-	for (; pfn < max_pfn; pfn++) {
+	for (; pfn < *md_debug_max_pfn; pfn++) {
 		/*
 		 * If the new page is in a new MAX_ORDER_NR_PAGES area,
 		 * validate the area as existing, skip it if not
@@ -503,10 +562,6 @@ void md_dump_pageowner(char *addr, size_t dump_size)
 			pfn += MAX_ORDER_NR_PAGES - 1;
 			continue;
 		}
-
-		/* Check for holes within a MAX_ORDER area */
-		if (!pfn_valid_within(pfn))
-			continue;
 
 		page = pfn_to_page(pfn);
 		if (PageBuddy(page)) {
@@ -517,35 +572,39 @@ void md_dump_pageowner(char *addr, size_t dump_size)
 			continue;
 		}
 
-		page_ext = lookup_page_ext(page);
+		page_ext = page_ext_get(page);
 		if (unlikely(!page_ext))
-			continue;
+			goto next;
 
 		/*
 		 * Some pages could be missed by concurrent allocation or free,
 		 * because we don't hold the zone lock.
 		 */
 		if (!test_bit(PAGE_EXT_OWNER, &page_ext->flags))
-			continue;
+			goto next;
 
 		/*
 		 * Although we do have the info about past allocation of free
 		 * pages, it's not relevant for current memory usage.
 		 */
 		if (!test_bit(PAGE_EXT_OWNER_ALLOCATED, &page_ext->flags))
-			continue;
+			goto next;
 
 		handle = get_page_owner_handle(page_ext, pfn);
 		if (!handle)
-			continue;
+			goto next;
 
 		size = dump_page_owner_md(addr, dump_size, pfn, page, handle);
 		if (size == dump_size - 1) {
 			pr_err("pageowner minidump region exhausted\n");
+			page_ext_put(page_ext);
 			return;
 		}
+
 		dump_size -= size;
 		addr += size;
+next:
+		page_ext_put(page_ext);
 	}
 }
 
@@ -573,7 +632,7 @@ static ssize_t page_owner_dump_size_read(struct file *file, char __user *ubuf,
 {
 	char buf[100];
 
-	snprintf(buf, sizeof(buf), "%llu MB\n",
+	snprintf(buf, sizeof(buf), "%zu MB\n",
 			md_pageowner_dump_size / SZ_1M);
 	return simple_read_from_buffer(ubuf, count, offset, buf, strlen(buf));
 }
@@ -667,6 +726,7 @@ static ssize_t page_owner_call_site_write(struct file *file,
 {
 	struct accounted_call_site *call_site;
 	char buf[50];
+	unsigned long flags;
 
 	if (count >= 50) {
 		pr_err_ratelimited("Input string size too large\n");
@@ -689,10 +749,10 @@ static ssize_t page_owner_call_site_write(struct file *file,
 	if (!call_site)
 		return -ENOMEM;
 
-	strlcpy(call_site->name, buf, strlen(call_site->name));
-	mutex_lock(&accounted_call_site_lock);
+	strscpy(call_site->name, buf, strlen(call_site->name));
+	spin_lock_irqsave(&accounted_call_site_lock, flags);
 	list_add_tail(&call_site->list, &accounted_call_site_list);
-	mutex_unlock(&accounted_call_site_lock);
+	spin_unlock_irqrestore(&accounted_call_site_lock, flags);
 
 	return count;
 }
@@ -702,6 +762,7 @@ static ssize_t page_owner_call_site_read(struct file *file, char __user *ubuf,
 {
 	char *kbuf;
 	struct accounted_call_site *call_site;
+	unsigned long flags;
 	int i = 1, ret = 0;
 	size_t size = PAGE_SIZE;
 
@@ -710,18 +771,18 @@ static ssize_t page_owner_call_site_read(struct file *file, char __user *ubuf,
 		return -ENOMEM;
 
 	ret = scnprintf(kbuf, count, "%s\n", "Accounted call sites:");
-	mutex_lock(&accounted_call_site_lock);
+	spin_lock_irqsave(&accounted_call_site_lock, flags);
 	list_for_each_entry(call_site, &accounted_call_site_list, list) {
 		ret += scnprintf(kbuf + ret, size - ret,
 			"%d. %s\n", i, call_site->name);
 		i += 1;
 		if (ret == size) {
 			ret = -ENOMEM;
-			mutex_unlock(&accounted_call_site_lock);
+			spin_unlock_irqrestore(&accounted_call_site_lock, flags);
 			goto err;
 		}
 	}
-	mutex_unlock(&accounted_call_site_lock);
+	spin_unlock_irqrestore(&accounted_call_site_lock, flags);
 	ret = simple_read_from_buffer(ubuf, count, offset, kbuf, strlen(kbuf));
 err:
 	kfree(kbuf);
@@ -734,7 +795,7 @@ static const struct file_operations proc_page_owner_call_site_ops = {
 	.read	= page_owner_call_site_read,
 };
 
-void md_debugfs_pageowner(struct dentry *minidump_dir)
+static void md_debugfs_pageowner(struct dentry *minidump_dir)
 {
 	debugfs_create_file("page_owner_dump_size_mb", 0400, minidump_dir, NULL,
 			&proc_page_owner_dump_size_ops);
@@ -745,54 +806,27 @@ void md_debugfs_pageowner(struct dentry *minidump_dir)
 	debugfs_create_file("page_owner_call_sites", 0400, minidump_dir, NULL,
 			&proc_page_owner_call_site_ops);
 }
-#endif
+#else
+static inline bool is_page_owner_enabled(void)
+{
+	return false;
+}
+static inline void md_debugfs_pageowner(struct dentry *minidump_dir) {}
+static inline void md_dump_pageowner(char *addr, size_t dump_size);
+#endif /* CONFIG_PAGE_OWNER */
 
 #ifdef CONFIG_SLUB_DEBUG
 #define STACK_HASH_SEED 0x9747b28c
 
 static unsigned long slab_owner_filter;
 static unsigned long slab_owner_handles_size = SZ_16K;
-static int num_handles;
 
-bool is_slub_debug_enabled(void)
+static bool is_slub_debug_enabled(void)
 {
-	slab_flags_t slub_debug;
-
-	slub_debug = *(slab_flags_t *)android_debug_symbol(ADS_SLUB_DEBUG);
-	if (slub_debug)
+	if (md_debug_slub_debug_enabled &&
+		atomic_read(&md_debug_slub_debug_enabled->enabled))
 		return true;
 	return false;
-}
-
-static bool find_stack(u32 handle,
-		 char *md_slabowner_dump_addr, char *cur)
-{
-	int *handles, i;
-
-	handles = (int *) (md_slabowner_dump_addr +
-			md_slabowner_dump_size - slab_owner_handles_size);
-
-	for (i = 0; i < num_handles; i++)
-		if (handle == handles[i])
-			return true;
-
-	if ((handles + num_handles)
-		< (int *)(md_slabowner_dump_addr +
-			md_slabowner_dump_size)) {
-		handles[num_handles] = handle;
-		num_handles += 1;
-	} else {
-		pr_err_ratelimited("Can't stores handles increase slab_owner_handle_size\n");
-	}
-	return false;
-}
-
-/* Calculate hash for a stack */
-static u32 hash_stack(const unsigned long *entries, unsigned int size)
-{
-	return jhash2((u32 *)entries,
-			       size * sizeof(unsigned long) / sizeof(u32),
-			       STACK_HASH_SEED);
 }
 
 static int dump_tracking(const struct kmem_cache *s,
@@ -800,47 +834,46 @@ static int dump_tracking(const struct kmem_cache *s,
 		const struct track *t, void *private)
 {
 	int ret = 0;
-	u32 handle, nr_entries;
+	u32 nr_entries;
 	struct priv_buf *priv_buf;
 	char *buf;
 	size_t size;
+	unsigned long *entries;
 
-	if (!t->addr)
+	if (!t->addr || !t->handle)
 		return 0;
 
 	priv_buf = (struct priv_buf *)private;
 	buf = priv_buf->buf + priv_buf->offset;
 	size = priv_buf->size - priv_buf->offset;
-#ifdef CONFIG_STACKTRACE
+#ifdef CONFIG_STACKDEPOT
 	{
 		int i;
 
-		for (i = 0; i < TRACK_ADDRS_COUNT; i++)
-			if (t->addrs[i])
-				continue;
-			else
-				break;
-		nr_entries = i;
-		handle = hash_stack(t->addrs, nr_entries);
+		nr_entries = stack_depot_fetch(t->handle, &entries);
 
 		if ((buf > (md_slabowner_dump_addr +
 			md_slabowner_dump_size - slab_owner_handles_size))
-			|| !find_stack(handle, md_slabowner_dump_addr, buf)) {
+			|| !found_stack(t->handle,
+				md_slabowner_dump_addr,
+				md_slabowner_dump_size,
+				slab_owner_handles_size,
+				&nr_slab_owner_handles)) {
 
 			ret = scnprintf(buf, size, "%p %u %u\n",
-				object, handle, nr_entries);
+				object, t->handle, nr_entries);
 			if (ret == size - 1)
 				goto err;
 
 			for (i = 0; i < nr_entries; i++) {
 				ret += scnprintf(buf + ret, size - ret,
-						"%p\n", (void *)t->addrs[i]);
+						"%p\n", (void *)entries[i]);
 				if (ret == size - 1)
 					goto err;
 			}
 		} else {
 			ret = scnprintf(buf, size, "%p %u %u\n",
-					object, handle, 0);
+					object, t->handle, 0);
 		}
 	}
 #else
@@ -852,7 +885,7 @@ err:
 	return ret;
 }
 
-void md_dump_slabowner(char *m, size_t dump_size)
+static void md_dump_slabowner(char *m, size_t dump_size)
 {
 	struct kmem_cache *s;
 	int node;
@@ -871,20 +904,20 @@ void md_dump_slabowner(char *m, size_t dump_size)
 		s = kmalloc_caches[KMALLOC_NORMAL][i];
 		if (!s)
 			continue;
-		ret = scnprintf(buf.buf, buf.size, "%s\n", s->name);
-		if (ret == buf.size - 1)
+		buf.offset += scnprintf(buf.buf + buf.offset, buf.size - buf.offset,
+					"%s\n", s->name);
+		if (buf.offset == buf.size - 1)
 			return;
-		buf.buf += ret;
 		for_each_kmem_cache_node(s, node, n) {
 			unsigned long flags;
-			struct page *page;
+			struct slab *slab;
 
 			if (!atomic_long_read(&n->nr_slabs))
 				continue;
 
 			spin_lock_irqsave(&n->list_lock, flags);
-			list_for_each_entry(page, &n->partial, lru) {
-				ret  = get_each_object_track(s, page, TRACK_ALLOC,
+			list_for_each_entry(slab, &n->partial, slab_list) {
+				ret  = get_each_object_track(s, slab, TRACK_ALLOC,
 						dump_tracking, &buf);
 				if (buf.offset == buf.size - 1) {
 					spin_unlock_irqrestore(&n->list_lock, flags);
@@ -892,8 +925,8 @@ void md_dump_slabowner(char *m, size_t dump_size)
 					return;
 				}
 			}
-			list_for_each_entry(page, &n->full, lru) {
-				ret  = get_each_object_track(s, page, TRACK_ALLOC,
+			list_for_each_entry(slab, &n->full, slab_list) {
+				ret  = get_each_object_track(s, slab, TRACK_ALLOC,
 						dump_tracking, &buf);
 				if (buf.offset == buf.size - 1) {
 					spin_unlock_irqrestore(&n->list_lock, flags);
@@ -903,10 +936,9 @@ void md_dump_slabowner(char *m, size_t dump_size)
 			}
 			spin_unlock_irqrestore(&n->list_lock, flags);
 		}
-		ret = scnprintf(buf.buf, buf.size, "\n");
-		if (ret == buf.size - 1)
+		buf.offset += scnprintf(buf.buf + buf.offset, buf.size - buf.offset, "\n");
+		if (buf.offset == buf.size - 1)
 			return;
-		buf.buf += ret;
 	}
 }
 
@@ -930,7 +962,7 @@ static ssize_t slab_owner_dump_size_read(struct file *file, char __user *ubuf,
 {
 	char buf[100];
 
-	snprintf(buf, sizeof(buf), "%llu MB\n", md_slabowner_dump_size/SZ_1M);
+	snprintf(buf, sizeof(buf), "%zu MB\n", md_slabowner_dump_size/SZ_1M);
 	return simple_read_from_buffer(ubuf, count, offset, buf, strlen(buf));
 }
 
@@ -1021,7 +1053,7 @@ static const struct file_operations proc_slab_owner_handle_ops = {
 	.read	= slab_owner_handle_read,
 };
 
-void md_debugfs_slabowner(struct dentry *minidump_dir)
+static void md_debugfs_slabowner(struct dentry *minidump_dir)
 {
 	int i;
 
@@ -1036,6 +1068,13 @@ void md_debugfs_slabowner(struct dentry *minidump_dir)
 			set_bit(i, &slab_owner_filter);
 	}
 }
+#else
+static inline bool is_slub_debug_enabled(void)
+{
+	return false;
+}
+static inline void md_dump_slabowner(char *m, size_t dump_size) {}
+static inline void md_debugfs_slabowner(struct dentry *minidump_dir) {}
 #endif	/* CONFIG_SLUB_DEBUG */
 
 static int dump_bufinfo(const struct dma_buf *buf_obj, void *private)
@@ -1043,10 +1082,9 @@ static int dump_bufinfo(const struct dma_buf *buf_obj, void *private)
 	int ret;
 	struct dma_buf_attachment *attach_obj;
 	struct dma_resv *robj;
-	struct dma_resv_list *fobj;
+	struct dma_resv_iter cursor;
 	struct dma_fence *fence;
-	unsigned int seq;
-	int attach_count, shared_count, i = 0;
+	int attach_count;
 	struct dma_buf_priv *buf = (struct dma_buf_priv *)private;
 	struct priv_buf *priv_buf = buf->priv_buf;
 
@@ -1069,35 +1107,13 @@ static int dump_bufinfo(const struct dma_buf *buf_obj, void *private)
 		goto err;
 
 	robj = buf_obj->resv;
-	while (true) {
-		seq = read_seqcount_begin(&robj->seq);
-		rcu_read_lock();
-		fobj = rcu_dereference(robj->fence);
-		shared_count = fobj ? fobj->shared_count : 0;
-		fence = rcu_dereference(robj->fence_excl);
-		if (!read_seqcount_retry(&robj->seq, seq))
-			break;
-		rcu_read_unlock();
-	}
-
-	if (fence) {
-		ret = scnprintf(priv_buf->buf + priv_buf->offset,
-				priv_buf->size - priv_buf->offset,
-				"\tExclusive fence: %s %s %ssignalled\n",
-				fence->ops->get_driver_name(fence),
-				fence->ops->get_timeline_name(fence),
-				dma_fence_is_signaled(fence) ? "" : "un");
-		priv_buf->offset += ret;
-		if (priv_buf->offset == priv_buf->size - 1)
-			goto err;
-	}
-	for (i = 0; i < shared_count; i++) {
-		fence = rcu_dereference(fobj->shared[i]);
+	dma_resv_for_each_fence(&cursor, robj,
+				DMA_RESV_USAGE_BOOKKEEP, fence) {
 		if (!dma_fence_get_rcu(fence))
 			continue;
 		ret = scnprintf(priv_buf->buf + priv_buf->offset,
 				priv_buf->size - priv_buf->offset,
-				"\tShared fence: %s %s %ssignalled\n",
+				"\tFence: %s %s %ssignalled\n",
 				fence->ops->get_driver_name(fence),
 				fence->ops->get_timeline_name(fence),
 				dma_fence_is_signaled(fence) ? "" : "un");
@@ -1106,7 +1122,6 @@ static int dump_bufinfo(const struct dma_buf *buf_obj, void *private)
 			goto err;
 		dma_fence_put(fence);
 	}
-	rcu_read_unlock();
 
 	ret = scnprintf(priv_buf->buf + priv_buf->offset,
 			priv_buf->size - priv_buf->offset,
@@ -1144,11 +1159,14 @@ err:
 	return -ENOSPC;
 }
 
-void md_dma_buf_info(char *m, size_t dump_size)
+static void md_dma_buf_info(char *m, size_t dump_size)
 {
 	int ret;
 	struct dma_buf_priv dma_buf_priv;
 	struct priv_buf buf;
+
+	if (!in_task() || in_atomic())
+		return;
 
 	buf.buf = m;
 	buf.size = dump_size;
@@ -1163,7 +1181,7 @@ void md_dma_buf_info(char *m, size_t dump_size)
 			"size", "flags", "mode", "count", "ino");
 	buf.offset = ret;
 
-	get_each_dmabuf(dump_bufinfo, &dma_buf_priv);
+	dma_buf_get_each(dump_bufinfo, &dma_buf_priv);
 
 	scnprintf(buf.buf + buf.offset, buf.size - buf.offset,
 			"\nTotal %d objects, %zu bytes\n",
@@ -1180,7 +1198,7 @@ static ssize_t dma_buf_info_size_write(struct file *file,
 		pr_err_ratelimited("Invalid format for size\n");
 		return -EINVAL;
 	}
-	update_dump_size("DMABUF_INFO", size,
+	update_dump_size("DMA_INFO", size,
 			&md_dma_buf_info_addr, &md_dma_buf_info_size);
 	return count;
 }
@@ -1190,7 +1208,7 @@ static ssize_t dma_buf_info_size_read(struct file *file, char __user *ubuf,
 {
 	char buf[100];
 
-	snprintf(buf, sizeof(buf), "%llu MB\n", md_dma_buf_info_size/SZ_1M);
+	snprintf(buf, sizeof(buf), "%zu MB\n", md_dma_buf_info_size/SZ_1M);
 	return simple_read_from_buffer(ubuf, count, offset, buf, strlen(buf));
 }
 
@@ -1200,7 +1218,7 @@ static const struct file_operations proc_dma_buf_info_size_ops = {
 	.read	= dma_buf_info_size_read,
 };
 
-void md_debugfs_dmabufinfo(struct dentry *minidump_dir)
+static void md_debugfs_dmabufinfo(struct dentry *minidump_dir)
 {
 	debugfs_create_file("dma_buf_info_size_mb", 0400, minidump_dir, NULL,
 			    &proc_dma_buf_info_size_ops);
@@ -1215,7 +1233,7 @@ static int get_dma_info(const void *data, struct file *file, unsigned int n)
 	int ret;
 	u32 index;
 
-	if (!is_dma_buf_file(file))
+	if (!qcom_is_dma_buf_file(file))
 		return 0;
 
 	dma_buf_priv = (struct dma_buf_priv *)data;
@@ -1257,7 +1275,7 @@ static int get_dma_info(const void *data, struct file *file, unsigned int n)
 	return 0;
 }
 
-void md_dma_buf_procs(char *m, size_t dump_size)
+static void md_dma_buf_procs(char *m, size_t dump_size)
 {
 	struct task_struct *task, *thread;
 	struct files_struct *files;
@@ -1318,7 +1336,7 @@ static ssize_t dma_buf_procs_size_write(struct file *file,
 		pr_err_ratelimited("Invalid format for size\n");
 		return -EINVAL;
 	}
-	update_dump_size("DMABUF_PROCS", size,
+	update_dump_size("DMA_PROC", size,
 			&md_dma_buf_procs_addr, &md_dma_buf_procs_size);
 	return count;
 }
@@ -1328,7 +1346,7 @@ static ssize_t dma_buf_procs_size_read(struct file *file, char __user *ubuf,
 {
 	char buf[100];
 
-	snprintf(buf, sizeof(buf), "%llu MB\n", md_dma_buf_procs_size/SZ_1M);
+	snprintf(buf, sizeof(buf), "%zu MB\n", md_dma_buf_procs_size/SZ_1M);
 	return simple_read_from_buffer(ubuf, count, offset, buf, strlen(buf));
 }
 
@@ -1338,8 +1356,70 @@ static const struct file_operations proc_dma_buf_procs_size_ops = {
 	.read	= dma_buf_procs_size_read,
 };
 
-void md_debugfs_dmabufprocs(struct dentry *minidump_dir)
+static void md_debugfs_dmabufprocs(struct dentry *minidump_dir)
 {
 	debugfs_create_file("dma_buf_procs_size_mb", 0400, minidump_dir, NULL,
 			&proc_dma_buf_procs_size_ops);
+}
+
+void md_dump_memory(void)
+{
+	if (md_meminfo_seq_buf)
+		md_dump_meminfo(md_meminfo_seq_buf);
+
+	if (md_slabinfo_seq_buf)
+		md_dump_slabinfo(md_slabinfo_seq_buf);
+
+	if (md_pageowner_dump_addr)
+		md_dump_pageowner(md_pageowner_dump_addr,
+				  md_pageowner_dump_size - page_owner_handles_size);
+
+	if (md_slabowner_dump_addr)
+		md_dump_slabowner(md_slabowner_dump_addr,
+				  md_slabowner_dump_size - slab_owner_handles_size);
+
+	if (md_dma_buf_info_addr)
+		md_dma_buf_info(md_dma_buf_info_addr, md_dma_buf_info_size);
+	if (md_dma_buf_procs_addr)
+		md_dma_buf_procs(md_dma_buf_procs_addr, md_dma_buf_procs_size);
+
+}
+
+int md_minidump_memory_init(void)
+{
+	int error = 0;
+	struct dentry *minidump_dir = NULL;
+
+	MD_DEBUG_LOOKUP(page_owner_inited, struct static_key);
+	MD_DEBUG_LOOKUP(slub_debug_enabled, struct static_key);
+
+	/* error set by MD_DEBUG_LOOKUP */
+	if (error)
+		return error;
+
+	minidump_dir = debugfs_create_dir("minidump", NULL);
+
+	md_register_panic_entries(MD_MEMINFO_PAGES, "MEMINFO",
+				  &md_meminfo_seq_buf);
+#ifdef CONFIG_SLUB_DEBUG
+	md_register_panic_entries(MD_SLABINFO_PAGES, "SLABINFO",
+				  &md_slabinfo_seq_buf);
+#endif
+
+	if (is_page_owner_enabled()) {
+		md_register_memory_dump(md_pageowner_dump_size, "PAGEOWNER");
+		md_debugfs_pageowner(minidump_dir);
+	}
+
+	if (is_slub_debug_enabled()) {
+		md_register_memory_dump(md_slabowner_dump_size, "SLABOWNER");
+		md_debugfs_slabowner(minidump_dir);
+	}
+
+	md_register_memory_dump(md_dma_buf_info_size, "DMA_INFO");
+	md_debugfs_dmabufinfo(minidump_dir);
+	md_register_memory_dump(md_dma_buf_procs_size, "DMA_PROC");
+	md_debugfs_dmabufprocs(minidump_dir);
+
+	return error;
 }

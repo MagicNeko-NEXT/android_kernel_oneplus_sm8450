@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2020, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  */
 
@@ -39,7 +38,6 @@ struct qos_config {
 struct qcom_icc_qosbox {
 	u32 num_ports;
 	const u8 *regs;
-	bool initialized;
 	struct qos_config *config;
 	u32 offsets[];
 };

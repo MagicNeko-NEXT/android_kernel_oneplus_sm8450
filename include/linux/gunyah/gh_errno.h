@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2021, 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  */
 
@@ -11,6 +12,7 @@
 
 #define GH_ERROR_OK			0
 #define GH_ERROR_UNIMPLEMENTED		-1
+#define GH_ERROR_RETRY			-2
 
 #define GH_ERROR_ARG_INVAL		1
 #define GH_ERROR_ARG_SIZE		2
@@ -61,6 +63,7 @@ static inline int gh_remap_error(int gh_error)
 	case GH_ERROR_MSGQUEUE_EMPTY:
 		return -EPERM;
 	case GH_ERROR_UNIMPLEMENTED:
+		return -EOPNOTSUPP;
 	case GH_ERROR_ARG_INVAL:
 	case GH_ERROR_ARG_SIZE:
 	case GH_ERROR_ARG_ALIGN:

@@ -35,6 +35,7 @@ enum bq27xxx_chip {
 	BQ27Z561,
 	BQ28Z610,
 	BQ34Z100,
+	BQ78Z100,
 };
 
 struct bq27xxx_device_info;
@@ -77,10 +78,6 @@ struct bq27xxx_device_info {
 	struct list_head list;
 	struct mutex lock;
 	u8 *regs;
-#ifdef CONFIG_BATTERY_BQ27XXX_RESIST_TABLE_UPDATES_NVM
-	u32 qmax_cell0;
-	u32 resist_table[15];
-#endif
 };
 
 void bq27xxx_battery_update(struct bq27xxx_device_info *di);

@@ -49,10 +49,10 @@ struct inode *omfs_new_inode(struct inode *dir, umode_t mode)
 		goto fail;
 
 	inode->i_ino = new_block;
-	inode_init_owner(inode, NULL, mode);
+	inode_init_owner(&nop_mnt_idmap, inode, NULL, mode);
 	inode->i_mapping->a_ops = &omfs_aops;
 
-	inode->i_atime = inode->i_mtime = inode->i_ctime = current_time(inode);
+	inode->i_atime = inode->i_mtime = inode_set_ctime_current(inode);
 	switch (mode & S_IFMT) {
 	case S_IFDIR:
 		inode->i_op = &omfs_dir_inops;
@@ -135,8 +135,8 @@ static int __omfs_write_inode(struct inode *inode, int wait)
 	oi->i_head.h_magic = OMFS_IMAGIC;
 	oi->i_size = cpu_to_be64(inode->i_size);
 
-	ctime = inode->i_ctime.tv_sec * 1000LL +
-		((inode->i_ctime.tv_nsec + 999)/1000);
+	ctime = inode_get_ctime(inode).tv_sec * 1000LL +
+		((inode_get_ctime(inode).tv_nsec + 999)/1000);
 	oi->i_ctime = cpu_to_be64(ctime);
 
 	omfs_update_checksums(oi);
@@ -233,10 +233,9 @@ struct inode *omfs_iget(struct super_block *sb, ino_t ino)
 
 	inode->i_atime.tv_sec = ctime;
 	inode->i_mtime.tv_sec = ctime;
-	inode->i_ctime.tv_sec = ctime;
+	inode_set_ctime(inode, ctime, nsecs);
 	inode->i_atime.tv_nsec = nsecs;
 	inode->i_mtime.tv_nsec = nsecs;
-	inode->i_ctime.tv_nsec = nsecs;
 
 	inode->i_mapping->a_ops = &omfs_aops;
 
@@ -512,6 +511,12 @@ static int omfs_fill_super(struct super_block *sb, void *data, int silent)
 
 	if (sbi->s_sys_blocksize > PAGE_SIZE) {
 		printk(KERN_ERR "omfs: sysblock size (%d) is out of range\n",
+			sbi->s_sys_blocksize);
+		goto out_brelse_bh;
+	}
+
+	if (sbi->s_sys_blocksize < OMFS_DIR_START) {
+		printk(KERN_ERR "omfs: sysblock size (%d) is too small\n",
 			sbi->s_sys_blocksize);
 		goto out_brelse_bh;
 	}

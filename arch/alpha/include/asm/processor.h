@@ -22,10 +22,6 @@
  */
 #define TASK_UNMAPPED_BASE (TASK_SIZE / 2)
 
-typedef struct {
-	unsigned long seg;
-} mm_segment_t;
-
 /* This is dead.  Everything has been moved to thread_info.  */
 struct thread_struct { };
 #define INIT_THREAD  { }
@@ -36,9 +32,7 @@ extern void start_thread(struct pt_regs *, unsigned long, unsigned long);
 
 /* Free all resources held by a thread. */
 struct task_struct;
-extern void release_thread(struct task_struct *);
-
-unsigned long get_wchan(struct task_struct *p);
+unsigned long __get_wchan(struct task_struct *p);
 
 #define KSTK_EIP(tsk) (task_pt_regs(tsk)->pc)
 
@@ -49,12 +43,6 @@ unsigned long get_wchan(struct task_struct *p);
 
 #define ARCH_HAS_PREFETCH
 #define ARCH_HAS_PREFETCHW
-#define ARCH_HAS_SPINLOCK_PREFETCH
-
-#ifndef CONFIG_SMP
-/* Nothing to prefetch. */
-#define spin_lock_prefetch(lock)  	do { } while (0)
-#endif
 
 extern inline void prefetch(const void *ptr)  
 { 
@@ -65,12 +53,5 @@ extern inline void prefetchw(const void *ptr)
 {
 	__builtin_prefetch(ptr, 1, 3);
 }
-
-#ifdef CONFIG_SMP
-extern inline void spin_lock_prefetch(const void *ptr)  
-{
-	__builtin_prefetch(ptr, 1, 3);
-}
-#endif
 
 #endif /* __ASM_ALPHA_PROCESSOR_H */

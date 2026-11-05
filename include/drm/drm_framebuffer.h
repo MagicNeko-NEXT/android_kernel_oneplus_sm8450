@@ -23,16 +23,17 @@
 #ifndef __DRM_FRAMEBUFFER_H__
 #define __DRM_FRAMEBUFFER_H__
 
+#include <linux/bits.h>
 #include <linux/ctype.h>
 #include <linux/list.h>
 #include <linux/sched.h>
 
+#include <drm/drm_fourcc.h>
 #include <drm/drm_mode_object.h>
 
 struct drm_clip_rect;
 struct drm_device;
 struct drm_file;
-struct drm_format_info;
 struct drm_framebuffer;
 struct drm_gem_object;
 
@@ -100,6 +101,8 @@ struct drm_framebuffer_funcs {
 		     unsigned num_clips);
 };
 
+#define DRM_FRAMEBUFFER_HAS_HANDLE_REF(_i)	BIT(0u + (_i))
+
 /**
  * struct drm_framebuffer - frame buffer object
  *
@@ -147,17 +150,17 @@ struct drm_framebuffer {
 	 * @pitches: Line stride per buffer. For userspace created object this
 	 * is copied from drm_mode_fb_cmd2.
 	 */
-	unsigned int pitches[4];
+	unsigned int pitches[DRM_FORMAT_MAX_PLANES];
 	/**
 	 * @offsets: Offset from buffer start to the actual pixel data in bytes,
 	 * per buffer. For userspace created object this is copied from
 	 * drm_mode_fb_cmd2.
 	 *
 	 * Note that this is a linear offset and does not take into account
-	 * tiling or buffer laytou per @modifier. It meant to be used when the
-	 * actual pixel data for this framebuffer plane starts at an offset,
-	 * e.g.  when multiple planes are allocated within the same backing
-	 * storage buffer object. For tiled layouts this generally means it
+	 * tiling or buffer layout per @modifier. It is meant to be used when
+	 * the actual pixel data for this framebuffer plane starts at an offset,
+	 * e.g. when multiple planes are allocated within the same backing
+	 * storage buffer object. For tiled layouts this generally means its
 	 * @offsets must at least be tile-size aligned, but hardware often has
 	 * stricter requirements.
 	 *
@@ -165,7 +168,7 @@ struct drm_framebuffer {
 	 * data (even for linear buffers). Specifying an x/y pixel offset is
 	 * instead done through the source rectangle in &struct drm_plane_state.
 	 */
-	unsigned int offsets[4];
+	unsigned int offsets[DRM_FORMAT_MAX_PLANES];
 	/**
 	 * @modifier: Data layout modifier. This is used to describe
 	 * tiling, or also special layouts (like compression) of auxiliary
@@ -200,6 +203,12 @@ struct drm_framebuffer {
 	 * universal plane.
 	 */
 	int hot_y;
+#ifndef __GENKSYMS__  //Placing this in a hole in the structure
+	/**
+	 * @internal_flags: Framebuffer flags like DRM_FRAMEBUFFER_HAS_HANDLE_REF.
+	 */
+	unsigned int internal_flags;
+#endif
 	/**
 	 * @filp_head: Placed on &drm_file.fbs, protected by &drm_file.fbs_lock.
 	 */
@@ -210,7 +219,7 @@ struct drm_framebuffer {
 	 * This is used by the GEM framebuffer helpers, see e.g.
 	 * drm_gem_fb_create().
 	 */
-	struct drm_gem_object *obj[4];
+	struct drm_gem_object *obj[DRM_FORMAT_MAX_PLANES];
 };
 
 #define obj_to_fb(x) container_of(x, struct drm_framebuffer, base)

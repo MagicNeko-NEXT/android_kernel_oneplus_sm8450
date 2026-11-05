@@ -29,10 +29,6 @@
  * Git-commit: 6f080eb67dce63c6efa57ef564ca4cd762ccebb0
  * Git-commit: 6fb9593b928c4cb485bef4e88c59c6b9fdf11352
  *
- * Deferred free functionality taken from drivers/dma-buf/heaps/system-heap.c
- * from commit f10ff61bd1ef ("Merge "dt-bindings: ipcc: Add WPSS client to
- * IPCC header"")
- *
  * Copyright (C) 2011 Google, Inc.
  * Copyright (C) 2019, 2020 Linaro Ltd.
  *
@@ -41,6 +37,7 @@
  *	Andrew F. Davis <afd@ti.com>
  *
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/dma-buf.h>
@@ -56,13 +53,15 @@
 #include <linux/kthread.h>
 #include <linux/qcom_dma_heap.h>
 #include <uapi/linux/sched/types.h>
-#include <linux/page_owner.h>
 
 #include "qcom_dma_heap_secure_utils.h"
 #include "qcom_dynamic_page_pool.h"
 #include "qcom_sg_ops.h"
 #include "qcom_system_heap.h"
+#include "qcom_system_movable_heap.h"
+#include "../../../mm/internal.h"
 
+#if IS_ENABLED(CONFIG_QCOM_DMABUF_HEAPS_PAGE_POOL_REFILL)
 #define DYNAMIC_POOL_FILL_MARK (100 * SZ_1M)
 #define DYNAMIC_POOL_LOW_MARK_PERCENT 40UL
 #define DYNAMIC_POOL_LOW_MARK ((DYNAMIC_POOL_FILL_MARK * DYNAMIC_POOL_LOW_MARK_PERCENT) / 100)
@@ -90,14 +89,107 @@ static bool dynamic_pool_count_below_lowmark(struct dynamic_page_pool *pool)
 	return atomic_read(&pool->count) < get_dynamic_pool_lowmark(pool);
 }
 
+/* Based on gfp_zone() in mm/mmzone.c since it is not exported. */
+enum zone_type dynamic_pool_gfp_zone(gfp_t flags)
+{
+	enum zone_type z;
+	gfp_t local_flags = flags;
+	int bit;
+
+	bit = (__force int) ((local_flags) & GFP_ZONEMASK);
+
+	z = (GFP_ZONE_TABLE >> (bit * GFP_ZONES_SHIFT)) &
+					 ((1 << GFP_ZONES_SHIFT) - 1);
+	VM_BUG_ON((GFP_ZONE_BAD >> bit) & 1);
+	return z;
+}
+
+/*
+ * Based on __zone_watermark_ok() in mm/page_alloc.c since it is not exported.
+ *
+ * Return true if free base pages are above 'mark'. For high-order checks it
+ * will return true of the order-0 watermark is reached and there is at least
+ * one free page of a suitable size. Checking now avoids taking the zone lock
+ * to check in the allocation paths if no pages are free.
+ */
+static bool __dynamic_pool_zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
+					     int highest_zoneidx, long free_pages)
+{
+	long min = mark;
+	long unusable_free;
+	int o;
+
+	/*
+	 * Access to high atomic reserves is not required, and CMA should not be
+	 * used, since these allocations are non-movable.
+	 */
+	unusable_free = ((1 << order) - 1) + z->nr_reserved_highatomic;
+#ifdef CONFIG_CMA
+	unusable_free += zone_page_state(z, NR_FREE_CMA_PAGES);
+#endif
+
+	/* free_pages may go negative - that's OK */
+	free_pages -= unusable_free;
+
+	/*
+	 * Check watermarks for an order-0 allocation request. If these
+	 * are not met, then a high-order request also cannot go ahead
+	 * even if a suitable page happened to be free.
+	 *
+	 * 'min' can be taken as 'mark' since we do not expect these allocations
+	 * to require disruptive actions (such as running the OOM killer) or
+	 * a lot of effort.
+	 */
+	if (free_pages <= min + z->lowmem_reserve[highest_zoneidx])
+		return false;
+
+	/* If this is an order-0 request then the watermark is fine */
+	if (!order)
+		return true;
+
+	/* For a high-order request, check at least one suitable page is free */
+	for (o = order; o < MAX_ORDER; o++) {
+		struct free_area *area = &z->free_area[o];
+		int mt;
+
+		if (!area->nr_free)
+			continue;
+
+		for (mt = 0; mt < MIGRATE_PCPTYPES; mt++) {
+#ifdef CONFIG_CMA
+			/*
+			 * Note that this check is needed only
+			 * when MIGRATE_CMA < MIGRATE_PCPTYPES.
+			 */
+			if (mt == MIGRATE_CMA)
+				continue;
+#endif
+			if (!free_area_empty(area, mt))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+/* Based on zone_watermark_ok_safe from mm/page_alloc.c since it is not exported. */
+bool dynamic_pool_zone_watermark_ok_safe(struct zone *z, unsigned int order,
+						unsigned long mark, int highest_zoneidx)
+{
+	long free_pages = zone_page_state(z, NR_FREE_PAGES);
+
+	if (z->percpu_drift_mark && free_pages < z->percpu_drift_mark)
+		free_pages = zone_page_state_snapshot(z, NR_FREE_PAGES);
+
+	return __dynamic_pool_zone_watermark_ok(z, order, mark, highest_zoneidx, free_pages);
+}
+
 /* do a simple check to see if we are in any low memory situation */
 static bool dynamic_pool_refill_ok(struct dynamic_page_pool *pool)
 {
-	struct zonelist *zonelist;
-	struct zoneref *z;
 	struct zone *zone;
-	int mark;
-	enum zone_type classzone_idx = gfp_zone(pool->gfp_mask);
+	int i, mark;
+	enum zone_type classzone_idx = dynamic_pool_gfp_zone(pool->gfp_mask);
 	s64 delta;
 
 	/* check if we are within the refill defer window */
@@ -105,21 +197,21 @@ static bool dynamic_pool_refill_ok(struct dynamic_page_pool *pool)
 	if (delta < DYNAMIC_POOL_REFILL_DEFER_WINDOW_MS)
 		return false;
 
-	zonelist = node_zonelist(numa_node_id(), pool->gfp_mask);
 	/*
 	 * make sure that if we allocate a pool->order page from buddy,
-	 * we don't put the zone watermarks go below the high threshold.
+	 * we don't put the zone watermarks below the high threshold.
 	 * This makes sure there's no unwanted repetitive refilling and
 	 * reclaiming of buddy pages on the pool.
 	 */
-	for_each_zone_zonelist(zone, z, zonelist, classzone_idx) {
+	for (i = classzone_idx; i >= 0; i--) {
+		zone = &NODE_DATA(numa_node_id())->node_zones[i];
+
 		if (!strcmp(zone->name, "DMA32"))
 			continue;
 
 		mark = high_wmark_pages(zone);
 		mark += 1 << pool->order;
-		if (!zone_watermark_ok_safe(zone, pool->order, mark,
-					    classzone_idx)) {
+		if (!dynamic_pool_zone_watermark_ok_safe(zone, pool->order, mark, classzone_idx)) {
 			pool->last_low_watermark_ktime = ktime_get();
 			return false;
 		}
@@ -145,6 +237,84 @@ static void dynamic_page_pool_refill(struct dynamic_page_pool *pool)
 		dynamic_page_pool_add(pool, page);
 	}
 }
+
+static bool dynamic_pool_needs_refill(struct dynamic_page_pool *pool)
+{
+	return pool->order && dynamic_pool_count_below_lowmark(pool);
+}
+
+static int system_heap_refill_worker(void *data)
+{
+	struct dynamic_page_pool **pool_list = data;
+	int i;
+
+	for (;;) {
+		for (i = 0; i < NUM_ORDERS; i++) {
+			if (dynamic_pool_count_below_lowmark(pool_list[i]))
+				dynamic_page_pool_refill(pool_list[i]);
+		}
+
+		set_current_state(TASK_INTERRUPTIBLE);
+		if (unlikely(kthread_should_stop())) {
+			set_current_state(TASK_RUNNING);
+			break;
+		}
+		schedule();
+
+		set_current_state(TASK_RUNNING);
+	}
+
+	return 0;
+}
+
+static int system_heap_create_refill_worker(struct qcom_system_heap *sys_heap, const char *name)
+{
+	struct task_struct *refill_worker;
+	struct sched_attr attr = { .sched_nice = DYNAMIC_POOL_KTHREAD_NICE_VAL };
+	int ret;
+	int i;
+
+	refill_worker = kthread_run(system_heap_refill_worker, sys_heap->pool_list,
+				    "%s-pool-refill-thread", name);
+	if (IS_ERR(refill_worker)) {
+		pr_err("%s: failed to create %s-pool-refill-thread: %ld\n",
+			__func__, name, PTR_ERR(refill_worker));
+		return PTR_ERR(refill_worker);
+	}
+
+	ret = sched_setattr(refill_worker, &attr);
+	if (ret) {
+		pr_warn("%s: failed to set task priority for %s-pool-refill-thread: ret = %d\n",
+			__func__, name, ret);
+		kthread_stop(refill_worker);
+		return ret;
+	}
+
+	for (i = 0; i < NUM_ORDERS; i++)
+		sys_heap->pool_list[i]->refill_worker = refill_worker;
+
+	return ret;
+}
+
+static void system_heap_destroy_refill_worker(struct qcom_system_heap *sys_heap)
+{
+	kthread_stop(sys_heap->pool_list[0]->refill_worker);
+}
+#else
+static bool dynamic_pool_needs_refill(struct dynamic_page_pool *pool)
+{
+	return false;
+}
+
+static int system_heap_create_refill_worker(struct qcom_system_heap *sys_heap, const char *name)
+{
+	return 0;
+}
+
+static void system_heap_destroy_refill_worker(struct qcom_system_heap *sys_heap)
+{
+}
+#endif
 
 static int system_heap_clear_pages(struct page **pages, int num, pgprot_t pgprot)
 {
@@ -180,7 +350,7 @@ static int system_heap_zero_buffer(struct qcom_sg_buffer *buffer)
 	return ret;
 }
 
-static void system_heap_buf_free(struct deferred_freelist_item *item,
+static void system_heap_deferred_free(struct deferred_freelist_item *item,
 				 enum df_reason reason)
 {
 	struct qcom_system_heap *sys_heap;
@@ -200,7 +370,12 @@ static void system_heap_buf_free(struct deferred_freelist_item *item,
 	for_each_sg(table->sgl, sg, table->nents, i) {
 		struct page *page = sg_page(sg);
 
-		if (reason == DF_UNDER_PRESSURE) {
+		/* Do not keep page in the pool if it is a zone movable page */
+		if (is_zone_movable_page(page)) {
+			/* Matches get_page() in qcom_movable_heap_alloc_pages() */
+			put_page(page);
+			__free_pages(page, compound_order(page));
+		} else if (reason == DF_UNDER_PRESSURE) {
 			__free_pages(page, compound_order(page));
 		} else {
 			for (j = 0; j < NUM_ORDERS; j++) {
@@ -214,15 +389,16 @@ static void system_heap_buf_free(struct deferred_freelist_item *item,
 	kfree(buffer);
 }
 
-static void system_heap_free(struct qcom_sg_buffer *buffer)
+void qcom_system_heap_free(struct qcom_sg_buffer *buffer)
 {
-	deferred_free(&buffer->deferred_free, system_heap_buf_free,
-		      PAGE_ALIGN(buffer->len) / PAGE_SIZE);
+	deferred_free(&buffer->deferred_free, system_heap_deferred_free,
+			PAGE_ALIGN(buffer->len) / PAGE_SIZE);
 }
 
 struct page *qcom_sys_heap_alloc_largest_available(struct dynamic_page_pool **pools,
 						   unsigned long size,
-						   unsigned int max_order)
+						   unsigned int max_order,
+						   bool movable)
 {
 	struct page *page = NULL;
 	int i;
@@ -242,43 +418,34 @@ struct page *qcom_sys_heap_alloc_largest_available(struct dynamic_page_pool **po
 			page = dynamic_page_pool_remove(pools[i], false);
 		spin_unlock_irqrestore(&pools[i]->lock, flags);
 
+		if (!page && movable)
+			page = qcom_movable_heap_alloc_pages(pools[i]);
 		if (!page)
 			page = alloc_pages(pools[i]->gfp_mask, pools[i]->order);
 		if (!page)
 			continue;
 
-		if (IS_ENABLED(CONFIG_QCOM_DMABUF_HEAPS_PAGE_POOL_REFILL) &&
-		    pools[i]->order &&
-		    dynamic_pool_count_below_lowmark(pools[i]))
+		if (dynamic_pool_needs_refill(pools[i]))
 			wake_up_process(pools[i]->refill_worker);
-
-		set_page_owner(page, pools[i]->order, GFP_KERNEL);
 
 		return page;
 	}
 	return NULL;
 }
 
-static struct dma_buf *system_heap_allocate(struct dma_heap *heap,
-					       unsigned long len,
-					       unsigned long fd_flags,
-					       unsigned long heap_flags)
+int system_qcom_sg_buffer_alloc(struct dma_heap *heap,
+				struct qcom_sg_buffer *buffer,
+				unsigned long len,
+				bool movable)
 {
 	struct qcom_system_heap *sys_heap;
-	struct qcom_sg_buffer *buffer;
-	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
 	unsigned long size_remaining = len;
 	unsigned int max_order = orders[0];
-	struct dma_buf *dmabuf;
 	struct sg_table *table;
 	struct scatterlist *sg;
 	struct list_head pages;
 	struct page *page, *tmp_page;
 	int i, ret = -ENOMEM;
-
-	buffer = kzalloc(sizeof(*buffer), GFP_KERNEL);
-	if (!buffer)
-		return ERR_PTR(-ENOMEM);
 
 	sys_heap = dma_heap_get_drvdata(heap);
 
@@ -287,7 +454,7 @@ static struct dma_buf *system_heap_allocate(struct dma_heap *heap,
 	buffer->heap = heap;
 	buffer->len = len;
 	buffer->uncached = sys_heap->uncached;
-	buffer->free = system_heap_free;
+	buffer->free = qcom_system_heap_free;
 
 	INIT_LIST_HEAD(&pages);
 	i = 0;
@@ -297,13 +464,14 @@ static struct dma_buf *system_heap_allocate(struct dma_heap *heap,
 		 * has been killed by SIGKILL
 		 */
 		if (fatal_signal_pending(current))
-			goto free_buffer;
+			goto free_mem;
 
 		page = qcom_sys_heap_alloc_largest_available(sys_heap->pool_list,
 							     size_remaining,
-							     max_order);
+							     max_order,
+							     movable);
 		if (!page)
-			goto free_buffer;
+			goto free_mem;
 
 		list_add_tail(&page->lru, &pages);
 		size_remaining -= page_size(page);
@@ -313,7 +481,7 @@ static struct dma_buf *system_heap_allocate(struct dma_heap *heap,
 
 	table = &buffer->sg_table;
 	if (sg_alloc_table(table, i, GFP_KERNEL))
-		goto free_buffer;
+		goto free_mem;
 
 	sg = table->sgl;
 	list_for_each_entry_safe(page, tmp_page, &pages, lru) {
@@ -333,11 +501,41 @@ static struct dma_buf *system_heap_allocate(struct dma_heap *heap,
 		dma_unmap_sgtable(dma_heap_get_dev(heap), table, DMA_BIDIRECTIONAL, 0);
 	}
 
-	buffer->vmperm = mem_buf_vmperm_alloc(table);
+	return 0;
 
+free_mem:
+	list_for_each_entry_safe(page, tmp_page, &pages, lru) {
+		/* Unpin the memory first if it was borrowed from movable zone */
+		if (is_zone_movable_page(page))
+			put_page(page);
+		__free_pages(page, compound_order(page));
+	}
+
+	return ret;
+}
+
+static struct dma_buf *system_heap_allocate(struct dma_heap *heap,
+					    unsigned long len,
+					    u32 fd_flags,
+					    u64 heap_flags)
+{
+	struct qcom_sg_buffer *buffer;
+	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
+	struct dma_buf *dmabuf;
+	int ret;
+
+	buffer = kzalloc(sizeof(*buffer), GFP_KERNEL);
+	if (!buffer)
+		return ERR_PTR(-ENOMEM);
+
+	ret = system_qcom_sg_buffer_alloc(heap, buffer, len, false);
+	if (ret)
+		goto free_buf_struct;
+
+	buffer->vmperm = mem_buf_vmperm_alloc(&buffer->sg_table);
 	if (IS_ERR(buffer->vmperm)) {
 		ret = PTR_ERR(buffer->vmperm);
-		goto free_sg;
+		goto free_sys_heap_mem;
 	}
 
 	/* create the dmabuf */
@@ -345,48 +543,23 @@ static struct dma_buf *system_heap_allocate(struct dma_heap *heap,
 	exp_info.size = buffer->len;
 	exp_info.flags = fd_flags;
 	exp_info.priv = buffer;
-	dmabuf = mem_buf_dma_buf_export(&exp_info, &qcom_sg_buf_ops);
+	dmabuf = qcom_dma_buf_export(&exp_info, &qcom_sg_buf_ops);
 	if (IS_ERR(dmabuf)) {
 		ret = PTR_ERR(dmabuf);
-		goto vmperm_release;
+		goto free_vmperm;
 	}
 
 	return dmabuf;
 
-vmperm_release:
+free_vmperm:
 	mem_buf_vmperm_release(buffer->vmperm);
-free_sg:
-	sg_free_table(table);
-free_buffer:
-	list_for_each_entry_safe(page, tmp_page, &pages, lru)
-		__free_pages(page, compound_order(page));
+free_sys_heap_mem:
+	qcom_system_heap_free(buffer);
+	return ERR_PTR(ret);
+free_buf_struct:
 	kfree(buffer);
 
 	return ERR_PTR(ret);
-}
-
-static int system_heap_refill_worker(void *data)
-{
-	struct dynamic_page_pool **pool_list = data;
-	int i;
-
-	for (;;) {
-		for (i = 0; i < NUM_ORDERS; i++) {
-			if (dynamic_pool_count_below_lowmark(pool_list[i]))
-				dynamic_page_pool_refill(pool_list[i]);
-		}
-
-		set_current_state(TASK_INTERRUPTIBLE);
-		if (unlikely(kthread_should_stop())) {
-			set_current_state(TASK_RUNNING);
-			break;
-		}
-		schedule();
-
-		set_current_state(TASK_RUNNING);
-	}
-
-	return 0;
 }
 
 static long get_pool_size_bytes(struct dma_heap *heap)
@@ -411,10 +584,7 @@ void qcom_system_heap_create(const char *name, const char *system_alias, bool un
 	struct dma_heap_export_info exp_info;
 	struct dma_heap *heap;
 	struct qcom_system_heap *sys_heap;
-	struct task_struct *refill_worker;
-	struct sched_attr attr = { .sched_nice = DYNAMIC_POOL_KTHREAD_NICE_VAL };
 	int ret;
-	int i;
 
 	ret = dynamic_page_pool_init_shrinker();
 	if (ret)
@@ -438,26 +608,9 @@ void qcom_system_heap_create(const char *name, const char *system_alias, bool un
 		goto free_heap;
 	}
 
-	if (IS_ENABLED(CONFIG_QCOM_DMABUF_HEAPS_PAGE_POOL_REFILL)) {
-		refill_worker = kthread_run(system_heap_refill_worker, sys_heap->pool_list,
-					    "%s-pool-refill-thread", name);
-		if (IS_ERR(refill_worker)) {
-			pr_err("%s: failed to create %s-pool-refill-thread: %ld\n",
-				__func__, name, PTR_ERR(refill_worker));
-			ret = PTR_ERR(refill_worker);
-			goto free_pools;
-		}
-
-		ret = sched_setattr(refill_worker, &attr);
-		if (ret) {
-			pr_warn("%s: failed to set task priority for %s-pool-refill-thread: ret = %d\n",
-				__func__, name, ret);
-			goto stop_worker;
-		}
-
-		for (i = 0; i < NUM_ORDERS; i++)
-			sys_heap->pool_list[i]->refill_worker = refill_worker;
-	}
+	ret = system_heap_create_refill_worker(sys_heap, name);
+	if (ret)
+		goto free_pools;
 
 	heap = dma_heap_add(&exp_info);
 	if (IS_ERR(heap)) {
@@ -476,7 +629,7 @@ void qcom_system_heap_create(const char *name, const char *system_alias, bool un
 
 		heap = dma_heap_add(&exp_info);
 		if (IS_ERR(heap)) {
-			pr_err("%s: Failed to create '%s', error is %d\n", __func__,
+			pr_err("%s: Failed to create '%s', error is %ld\n", __func__,
 			       system_alias, PTR_ERR(heap));
 			return;
 		}
@@ -489,8 +642,7 @@ void qcom_system_heap_create(const char *name, const char *system_alias, bool un
 	return;
 
 stop_worker:
-	if (IS_ENABLED(CONFIG_QCOM_DMABUF_HEAPS_PAGE_POOL_REFILL))
-		kthread_stop(refill_worker);
+	system_heap_destroy_refill_worker(sys_heap);
 
 free_pools:
 	dynamic_page_pool_release_pools(sys_heap->pool_list);

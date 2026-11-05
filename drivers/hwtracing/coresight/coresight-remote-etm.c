@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2013-2019, 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/kernel.h>
@@ -16,9 +16,11 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/coresight.h>
-#include "coresight-qmi.h"
+#include <linux/suspend.h>
 
-#define REMOTE_ETM_TRACE_ID_START	192
+#include "coresight-qmi.h"
+#include "coresight-trace-id.h"
+#include "coresight-common.h"
 
 #ifdef CONFIG_CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE
 static int boot_enable = CONFIG_CORESIGHT_REMOTE_ETM_DEFAULT_ENABLE;
@@ -32,117 +34,135 @@ struct remote_etm_drvdata {
 	struct device			*dev;
 	struct coresight_device		*csdev;
 	struct mutex			mutex;
-	struct qmi_handle		handle;
-	uint32_t			inst_id;
 	bool				enable;
-	int				traceid;
-	bool service_connected;
-	struct sockaddr_qrtr s_addr;
+	u8				*traceids;
+	u32				num_trcid;
+	bool				static_atid;
 };
 
-static int service_remote_etm_new_server(struct qmi_handle *qmi,
-		struct qmi_service *svc)
+/*
+ * Remote ETM could be connected to a QMI device, which can send commmand
+ * to subsystem via QMI. This is represented by the Output port of the remote
+ * ETM connected to the input port of the QMI.
+ *
+ * Returns	: coresight_device ptr for the QMI device if a QMI is found.
+ *		: NULL otherwise.
+ */
+static struct coresight_device *
+remote_etm_get_qmi_device(struct remote_etm_drvdata *drvdata)
 {
-	struct remote_etm_drvdata *drvdata = container_of(qmi,
-					struct remote_etm_drvdata, handle);
+	int i;
+	struct coresight_device *tmp, *etm = drvdata->csdev;
 
-	drvdata->s_addr.sq_family = AF_QIPCRTR;
-	drvdata->s_addr.sq_node = svc->node;
-	drvdata->s_addr.sq_port = svc->port;
-	drvdata->service_connected = true;
-	dev_info(drvdata->dev,
-		"Connection established between QMI handle and %d service\n",
-		drvdata->inst_id);
+	if (!IS_ENABLED(CONFIG_CORESIGHT_QMI))
+		return NULL;
 
+	for (i = 0; i < etm->pdata->nr_outconns; i++) {
+		tmp = etm->pdata->out_conns[i]->dest_dev;
+		if (tmp && coresight_is_qmi_device(tmp))
+			return tmp;
+	}
+
+	return NULL;
+}
+
+static int qmi_assign_remote_etm_atid(struct remote_etm_drvdata *drvdata)
+{
+	struct coresight_device *qmi = remote_etm_get_qmi_device(drvdata);
+	struct  coresight_atid_assign_req_msg_v01 *atid_data;
+	const char *trace_name = dev_name(drvdata->dev);
+	int i, ret;
+
+	ret = of_property_read_string(drvdata->dev->of_node,
+			"trace-name", &trace_name);
+	if (ret)
+		return -EINVAL;
+
+	atid_data = devm_kzalloc(drvdata->dev, sizeof(*atid_data), GFP_KERNEL);
+	if (!atid_data)
+		return -ENOMEM;
+
+	strscpy(atid_data->name, trace_name, CORESIGHT_QMI_TRACE_NAME_MAX_LEN);
+
+	for (i = 0; i < drvdata->num_trcid; i++)
+		atid_data->atids[i] = drvdata->traceids[i];
+	atid_data->num_atids = drvdata->num_trcid;
+
+	if (qmi)
+		return coresight_qmi_assign_atid(qmi, atid_data);
 	return 0;
 }
 
-static void service_remote_etm_del_server(struct qmi_handle *qmi,
-		struct qmi_service *svc)
+static int qmi_enable_remote_etm(struct remote_etm_drvdata *drvdata)
 {
-	struct remote_etm_drvdata *drvdata = container_of(qmi,
-					struct remote_etm_drvdata, handle);
-	drvdata->service_connected = false;
-	dev_info(drvdata->dev,
-		"Connection disconnected between QMI handle and %d service\n",
-		drvdata->inst_id);
+	struct coresight_device *qmi = remote_etm_get_qmi_device(drvdata);
+
+	if (qmi)
+		return coresight_qmi_remote_etm_enable(qmi);
+	return 0;
 }
 
-static struct qmi_ops server_ops = {
-	.new_server = service_remote_etm_new_server,
-	.del_server = service_remote_etm_del_server,
-};
+static int qmi_disable_remote_etm(struct remote_etm_drvdata *drvdata)
+{
+	struct coresight_device *qmi = remote_etm_get_qmi_device(drvdata);
+
+	if (qmi)
+		coresight_qmi_remote_etm_disable(qmi);
+	return 0;
+}
 
 static int remote_etm_enable(struct coresight_device *csdev,
-			     struct perf_event *event, u32 mode)
+			     struct perf_event *event, enum cs_mode mode)
 {
 	struct remote_etm_drvdata *drvdata =
 		dev_get_drvdata(csdev->dev.parent);
-	struct coresight_set_etm_req_msg_v01 req;
-	struct coresight_set_etm_resp_msg_v01 resp = { { 0, 0 } };
-	struct qmi_txn txn;
-	int ret;
+	int i, ret;
 
 	mutex_lock(&drvdata->mutex);
 
-	if (!drvdata->service_connected) {
-		dev_err(drvdata->dev, "QMI service not connected!\n");
-		ret = EINVAL;
-		goto err;
-	}
-	/*
-	 * The QMI handle may be NULL in the following scenarios:
-	 * 1. QMI service is not present
-	 * 2. QMI service is present but attempt to enable remote ETM is earlier
-	 *    than service is ready to handle request
-	 * 3. Connection between QMI client and QMI service failed
-	 *
-	 * Enable CoreSight without processing further QMI commands which
-	 * provides the option to enable remote ETM by other means.
-	 */
-	req.state = CORESIGHT_ETM_STATE_ENABLED_V01;
-
-	ret = qmi_txn_init(&drvdata->handle, &txn,
-			coresight_set_etm_resp_msg_v01_ei,
-			&resp);
-
-	if (ret < 0) {
-		dev_err(drvdata->dev, "QMI tx init failed , ret:%d\n",
-				ret);
-		goto err;
+	if (!drvdata->static_atid) {
+		ret = qmi_assign_remote_etm_atid(drvdata);
+		if (ret) {
+			dev_err(drvdata->dev, "Assign remote etm atid fail\n");
+			goto unlock_mutex;
+		}
+	} else {
+		for (i = 0; i < drvdata->num_trcid; i++) {
+			ret = coresight_trace_id_reserve_id(drvdata->traceids[i]);
+			if (ret) {
+				dev_err(drvdata->dev, "reserve atid: %d fail\n",
+						drvdata->traceids[i]);
+				break;
+			}
+		}
+		if (i < drvdata->num_trcid) {
+			for (; i > 0; i--)
+				coresight_trace_id_free_reserved_id(drvdata->traceids[i - 1]);
+			goto unlock_mutex;
+		}
 	}
 
-	ret = qmi_send_request(&drvdata->handle, &drvdata->s_addr,
-			&txn, CORESIGHT_QMI_SET_ETM_REQ_V01,
-			CORESIGHT_QMI_SET_ETM_REQ_MAX_LEN,
-			coresight_set_etm_req_msg_v01_ei,
-			&req);
-	if (ret < 0) {
-		dev_err(drvdata->dev, "QMI send ACK failed, ret:%d\n",
-				ret);
-		qmi_txn_cancel(&txn);
-		goto err;
+	for (i = 0; i < drvdata->num_trcid; i++)
+		coresight_csr_set_etr_atid(csdev, drvdata->traceids[i], true, NULL);
+
+	ret = qmi_enable_remote_etm(drvdata);
+	if (ret) {
+		dev_err(drvdata->dev, "Enable remote etm fail\n");
+		goto error;
 	}
 
-	ret = qmi_txn_wait(&txn, msecs_to_jiffies(TIMEOUT_MS));
-	if (ret < 0) {
-		dev_err(drvdata->dev, "QMI qmi txn wait failed, ret:%d\n",
-				ret);
-		goto err;
-	}
-
-	/* Check the response */
-	if (resp.resp.result != QMI_RESULT_SUCCESS_V01)
-		dev_err(drvdata->dev, "QMI request failed 0x%x\n",
-				resp.resp.error);
-
-	drvdata->enable = true;
+	dev_info(drvdata->dev, "Enable remote etm success\n");
 	mutex_unlock(&drvdata->mutex);
-
-	dev_info(drvdata->dev, "Remote ETM tracing enabled for instance %d\n",
-				drvdata->inst_id);
 	return 0;
-err:
+
+error:
+	for (i = 0; i < drvdata->num_trcid; i++) {
+		coresight_csr_set_etr_atid(csdev, drvdata->traceids[i], false, NULL);
+		if (drvdata->static_atid)
+			coresight_trace_id_free_reserved_id(drvdata->traceids[i]);
+	}
+
+unlock_mutex:
 	mutex_unlock(&drvdata->mutex);
 	return ret;
 }
@@ -152,71 +172,26 @@ static void remote_etm_disable(struct coresight_device *csdev,
 {
 	struct remote_etm_drvdata *drvdata =
 		 dev_get_drvdata(csdev->dev.parent);
-	struct coresight_set_etm_req_msg_v01 req;
-	struct coresight_set_etm_resp_msg_v01 resp = { { 0, 0 } };
-	struct qmi_txn txn;
-	int ret;
+	int i;
 
 	mutex_lock(&drvdata->mutex);
-	if (!drvdata->service_connected) {
-		dev_err(drvdata->dev, "QMI service not connected!\n");
-		goto err;
+
+	qmi_disable_remote_etm(drvdata);
+
+	for (i = 0; i < drvdata->num_trcid; i++)
+		coresight_csr_set_etr_atid(csdev, drvdata->traceids[i], false, NULL);
+
+	for (i = 0; i < drvdata->num_trcid; i++) {
+		if (drvdata->static_atid)
+			coresight_trace_id_free_reserved_id(drvdata->traceids[i]);
+		else
+			coresight_trace_id_put_system_id(drvdata->traceids[i]);
 	}
-
-	req.state = CORESIGHT_ETM_STATE_DISABLED_V01;
-
-	ret = qmi_txn_init(&drvdata->handle, &txn,
-			coresight_set_etm_resp_msg_v01_ei,
-			&resp);
-
-	if (ret < 0) {
-		dev_err(drvdata->dev, "QMI tx init failed , ret:%d\n",
-				ret);
-		goto err;
-	}
-
-	ret = qmi_send_request(&drvdata->handle, &drvdata->s_addr,
-			&txn, CORESIGHT_QMI_SET_ETM_REQ_V01,
-			CORESIGHT_QMI_SET_ETM_REQ_MAX_LEN,
-			coresight_set_etm_req_msg_v01_ei,
-			&req);
-	if (ret < 0) {
-		dev_err(drvdata->dev, "QMI send req failed, ret:%d\n",
-				 ret);
-		qmi_txn_cancel(&txn);
-		goto err;
-	}
-
-	ret = qmi_txn_wait(&txn, msecs_to_jiffies(TIMEOUT_MS));
-	if (ret < 0) {
-		dev_err(drvdata->dev, "QMI qmi txn wait failed, ret:%d\n",
-				ret);
-		goto err;
-	}
-
-	/* Check the response */
-	if (resp.resp.result != QMI_RESULT_SUCCESS_V01) {
-		dev_err(drvdata->dev, "QMI request failed 0x%x\n",
-				resp.resp.error);
-		goto err;
-	}
-
-	drvdata->enable = false;
-	dev_info(drvdata->dev, "Remote ETM tracing disabled for instance %d\n",
-				drvdata->inst_id);
-err:
 	mutex_unlock(&drvdata->mutex);
 }
 
-static int remote_etm_trace_id(struct coresight_device *csdev)
-{
-	struct remote_etm_drvdata *drvdata = dev_get_drvdata(csdev->dev.parent);
-
-	return drvdata->traceid;
-}
 
 static const struct coresight_ops_source remote_etm_source_ops = {
-	.trace_id	= remote_etm_trace_id,
 	.enable		= remote_etm_enable,
 	.disable	= remote_etm_disable,
 };
@@ -225,6 +200,80 @@ static const struct coresight_ops remote_cs_ops = {
 	.source_ops	= &remote_etm_source_ops,
 };
 
+static ssize_t traceid_show(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	struct remote_etm_drvdata *drvdata = dev_get_drvdata(dev->parent);
+
+	if (drvdata->num_trcid == 1)
+		return scnprintf(buf, PAGE_SIZE, "%#x\n", drvdata->traceids[0]);
+	else
+		return scnprintf(buf, PAGE_SIZE, "%#x %#x\n",
+			drvdata->traceids[0], drvdata->traceids[1]);
+}
+static DEVICE_ATTR_RO(traceid);
+
+static struct attribute *remote_etm_attrs[] = {
+	&dev_attr_traceid.attr,
+	NULL,
+};
+
+static struct attribute_group remote_etm_attr_grp = {
+	.attrs = remote_etm_attrs,
+};
+
+static const struct attribute_group *remote_etm_attr_grps[] = {
+	&remote_etm_attr_grp,
+	NULL,
+};
+
+static int remote_etm_get_traceid(struct remote_etm_drvdata *drvdata)
+{
+	int ret, i, trace_id;
+	struct device *dev = drvdata->dev;
+	u32 *atid;
+
+	ret = of_property_count_u32_elems(dev->of_node, "atid");
+	if (ret < 0) {
+		ret = of_property_read_u32(dev->of_node, "qcom,atid-num",
+				&drvdata->num_trcid);
+		if (ret)
+			return -EINVAL;
+	} else {
+		drvdata->num_trcid = ret;
+		drvdata->static_atid = true;
+	}
+
+	atid = devm_kcalloc(dev, drvdata->num_trcid, sizeof(*atid), GFP_KERNEL);
+	if (!atid)
+		return -ENOMEM;
+
+	if (drvdata->static_atid) {
+		ret = of_property_read_u32_array(dev->of_node, "atid",
+			atid, drvdata->num_trcid);
+		if (ret)
+			return ret;
+	} else {
+		for (i = 0; i < drvdata->num_trcid; i++) {
+			trace_id = coresight_trace_id_get_system_id();
+			if (trace_id < 0)
+				return trace_id;
+
+			atid[i] = trace_id;
+		}
+	}
+
+	drvdata->traceids = devm_kcalloc(dev, drvdata->num_trcid,
+					sizeof(u8), GFP_KERNEL);
+	if (!drvdata->traceids)
+		return -ENOMEM;
+
+	for (i = 0; i < drvdata->num_trcid; i++)
+		drvdata->traceids[i] = (u8)atid[i];
+
+	return 0;
+}
+
 static int remote_etm_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -232,7 +281,6 @@ static int remote_etm_probe(struct platform_device *pdev)
 	struct remote_etm_drvdata *drvdata;
 	struct coresight_desc desc = {0 };
 	int ret;
-	static int traceid = REMOTE_ETM_TRACE_ID_START;
 
 	desc.name = coresight_alloc_device_name(&remote_etm_devs, dev);
 	if (!desc.name)
@@ -249,59 +297,46 @@ static int remote_etm_probe(struct platform_device *pdev)
 	drvdata->dev = &pdev->dev;
 	platform_set_drvdata(pdev, drvdata);
 
-	ret = of_property_read_u32(pdev->dev.of_node, "qcom,inst-id",
-			&drvdata->inst_id);
-	if (ret)
-		return ret;
-
 	mutex_init(&drvdata->mutex);
 
-	ret = qmi_handle_init(&drvdata->handle,
-			CORESIGHT_QMI_SET_ETM_REQ_MAX_LEN,
-			&server_ops, NULL);
-	if (ret < 0) {
-		dev_err(dev, "Remote ETM client init failed ret:%d\n", ret);
-		return ret;
-	}
-
-	qmi_add_lookup(&drvdata->handle,
-			CORESIGHT_QMI_SVC_ID,
-			CORESIGHT_QMI_VERSION,
-			drvdata->inst_id);
-
-	drvdata->traceid = traceid++;
-
 	desc.type = CORESIGHT_DEV_TYPE_SOURCE;
-	desc.subtype.source_subtype = CORESIGHT_DEV_SUBTYPE_SOURCE_PROC;
+	desc.subtype.source_subtype = CORESIGHT_DEV_SUBTYPE_SOURCE_SOFTWARE;
 	desc.ops = &remote_cs_ops;
 	desc.pdata = pdev->dev.platform_data;
 	desc.dev = &pdev->dev;
+	desc.groups = remote_etm_attr_grps;
 	drvdata->csdev = coresight_register(&desc);
 	if (IS_ERR(drvdata->csdev)) {
 		ret = PTR_ERR(drvdata->csdev);
 		goto err;
 	}
+
+	ret = remote_etm_get_traceid(drvdata);
+	if (ret) {
+		coresight_unregister(drvdata->csdev);
+		return ret;
+	}
+
 	dev_info(dev, "Remote ETM initialized\n");
 
-	pm_runtime_enable(dev);
-	if (drvdata->inst_id >= sizeof(int)*BITS_PER_BYTE)
-		dev_err(dev, "inst_id greater than boot_enable bit mask\n");
-	else if (boot_enable & BIT(drvdata->inst_id))
+	if (boot_enable)
 		coresight_enable(drvdata->csdev);
 
 	return 0;
+
 err:
-	qmi_handle_release(&drvdata->handle);
 	return ret;
 }
 
 static int remote_etm_remove(struct platform_device *pdev)
 {
 	struct remote_etm_drvdata *drvdata = platform_get_drvdata(pdev);
-	struct device *dev = &pdev->dev;
+	int i;
 
-	pm_runtime_disable(dev);
-	qmi_handle_release(&drvdata->handle);
+	if (!drvdata->static_atid)
+		for (i = 0; i < drvdata->num_trcid; i++)
+			coresight_trace_id_put_system_id(drvdata->traceids[i]);
+
 	coresight_unregister(drvdata->csdev);
 	return 0;
 }
@@ -311,12 +346,58 @@ static const struct of_device_id remote_etm_match[] = {
 	{}
 };
 
+#ifdef CONFIG_DEEPSLEEP
+static int remote_etm_suspend(struct device *dev)
+{
+	struct remote_etm_drvdata *drvdata = dev_get_drvdata(dev);
+	struct coresight_device	*csdev = drvdata->csdev;
+
+	if (pm_suspend_target_state == PM_SUSPEND_MEM) {
+		do {
+			coresight_disable(csdev);
+		} while (atomic_read(&csdev->refcnt));
+	}
+
+	return 0;
+}
+#else
+static int remote_etm_suspend(struct device *dev)
+{
+	return 0;
+}
+#endif
+
+#ifdef CONFIG_HIBERNATION
+static int remote_etm_freeze(struct device *dev)
+{
+	struct remote_etm_drvdata *drvdata = dev_get_drvdata(dev);
+	struct coresight_device	*csdev = drvdata->csdev;
+
+	do {
+		coresight_disable(csdev);
+	} while (atomic_read(&csdev->refcnt));
+
+	return 0;
+}
+#else
+static int remote_etm_freeze(struct device *dev)
+{
+	return 0;
+}
+#endif
+
+static const struct dev_pm_ops remote_etm_dev_pm_ops = {
+	.suspend = remote_etm_suspend,
+	.freeze  = remote_etm_freeze,
+};
+
 static struct platform_driver remote_etm_driver = {
 	.probe          = remote_etm_probe,
 	.remove         = remote_etm_remove,
 	.driver         = {
 		.name   = "coresight-remote-etm",
 		.of_match_table = remote_etm_match,
+		.pm = pm_ptr(&remote_etm_dev_pm_ops),
 	},
 };
 
@@ -332,5 +413,5 @@ void __exit remote_etm_exit(void)
 }
 module_exit(remote_etm_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("CoreSight Remote ETM driver");

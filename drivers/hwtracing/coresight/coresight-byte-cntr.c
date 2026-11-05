@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2017-2021, The Linux Foundation. All rights reserved.
- *
- * Description: CoreSight Trace Memory Controller driver
+/*
+ * Copyright (c) 2021, 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
+
 #include <linux/interrupt.h>
 #include <linux/dma-mapping.h>
 #include <linux/fs.h>
@@ -17,6 +17,9 @@
 #include "coresight-common.h"
 
 #define CSR_BYTECNTVAL		(0x06C)
+
+int is_etf_enabled(void);
+static struct coresight_device *etf_csdev = NULL;
 
 static void tmc_etr_read_bytes(struct byte_cntr *byte_cntr_data, long offset,
 			       size_t bytes, size_t *len, char **bufp)
@@ -57,29 +60,28 @@ static irqreturn_t etr_handler(int irq, void *data)
 
 
 static long tmc_etr_flush_remaining_bytes(struct tmc_drvdata *tmcdrvdata, long offset,
-			char **bufpp)
+			size_t len, char **bufpp)
 {
-	long rwp_offset, req_size, actual = 0;
+	long req_size, actual = 0;
 	struct etr_buf *etr_buf;
 	struct device *dev;
-	int rc = 0;
+	struct byte_cntr *byte_cntr_data;
 
 	if (!tmcdrvdata)
+		return -EINVAL;
+
+	byte_cntr_data = tmcdrvdata->byte_cntr;
+	if (!byte_cntr_data)
 		return -EINVAL;
 
 	etr_buf = tmcdrvdata->sysfs_buf;
 	dev = &tmcdrvdata->csdev->dev;
 
-	rc = pm_runtime_get_sync(dev->parent);
-	if (rc < 0) {
-		pm_runtime_put_noidle(dev->parent);
-		return rc;
-	}
+	req_size = ((byte_cntr_data->rwp_offset < offset) ? tmcdrvdata->size : 0) +
+		byte_cntr_data->rwp_offset - offset;
 
-	rwp_offset = tmc_get_rwp_offset(tmcdrvdata);
-	pm_runtime_put(dev->parent);
-	req_size = ((rwp_offset < offset) ? tmcdrvdata->size : 0) +
-		rwp_offset - offset;
+	if (req_size > len)
+		req_size = len;
 
 	if (req_size > 0)
 		actual = tmc_etr_buf_get_data(etr_buf, offset, req_size, bufpp);
@@ -94,16 +96,19 @@ static ssize_t tmc_etr_byte_cntr_read(struct file *fp, char __user *data,
 	struct byte_cntr *byte_cntr_data = fp->private_data;
 	struct tmc_drvdata *tmcdrvdata = byte_cntr_data->tmcdrvdata;
 	char *bufp = NULL;
+	long actual;
 	int ret = 0;
+	static int etf_check_count = 0;
 
 	if (!data)
 		return -EINVAL;
 
 	mutex_lock(&byte_cntr_data->byte_cntr_lock);
 	if (!byte_cntr_data->read_active) {
-		len = tmc_etr_flush_remaining_bytes(tmcdrvdata,
-					byte_cntr_data->offset, &bufp);
-		if (len > 0) {
+		actual = tmc_etr_flush_remaining_bytes(tmcdrvdata,
+				byte_cntr_data->offset, len, &bufp);
+		if (actual > 0) {
+			len = actual;
 			goto copy;
 		} else {
 			ret = -EINVAL;
@@ -114,15 +119,31 @@ static ssize_t tmc_etr_byte_cntr_read(struct file *fp, char __user *data,
 	if (byte_cntr_data->enable) {
 		if (!atomic_read(&byte_cntr_data->irq_cnt)) {
 			mutex_unlock(&byte_cntr_data->byte_cntr_lock);
-			if (wait_event_interruptible(byte_cntr_data->wq,
+			ret = wait_event_interruptible_timeout(byte_cntr_data->wq,
 				atomic_read(&byte_cntr_data->irq_cnt) > 0
-				|| !byte_cntr_data->enable))
+				|| !byte_cntr_data->enable, 5 * HZ);
+			if (ret == 0) {
+				if (is_etf_enabled())
+					etf_check_count = 0;
+				else {
+					etf_check_count++;
+					pr_err("[qdss wa] detect etf is disabled, count: %d\n", etf_check_count);
+				}
+
+				if (etf_check_count > 2) {
+					etf_check_count = 0;
+					pr_err("[qdss wa] notify userspace to reconfigure qdss\n");
+					return -EAGAIN;
+				}
+				return 0;
+			} else if (ret < 0)
 				return -ERESTARTSYS;
 			mutex_lock(&byte_cntr_data->byte_cntr_lock);
 			if (!byte_cntr_data->read_active) {
-				len = tmc_etr_flush_remaining_bytes(tmcdrvdata,
-						byte_cntr_data->offset, &bufp);
-				if (len > 0) {
+				actual = tmc_etr_flush_remaining_bytes(tmcdrvdata,
+						byte_cntr_data->offset, len, &bufp);
+				if (actual > 0) {
+					len = actual;
 					goto copy;
 				} else {
 					ret = -EINVAL;
@@ -135,9 +156,10 @@ static ssize_t tmc_etr_byte_cntr_read(struct file *fp, char __user *data,
 				   byte_cntr_data->block_size, &len, &bufp);
 
 	} else {
-		len = tmc_etr_flush_remaining_bytes(tmcdrvdata,
-					byte_cntr_data->offset, &bufp);
-		if (len > 0) {
+		actual = tmc_etr_flush_remaining_bytes(tmcdrvdata,
+				byte_cntr_data->offset, len, &bufp);
+		if (actual > 0) {
+			len = actual;
 			goto copy;
 		} else {
 			ret = -EINVAL;
@@ -148,7 +170,7 @@ static ssize_t tmc_etr_byte_cntr_read(struct file *fp, char __user *data,
 copy:
 	if (copy_to_user(data, bufp, len)) {
 		mutex_unlock(&byte_cntr_data->byte_cntr_lock);
-		dev_dbg(&tmcdrvdata->csdev->dev,
+		dev_err(&tmcdrvdata->csdev->dev,
 			"%s: copy_to_user failed\n", __func__);
 		return -EFAULT;
 	}
@@ -184,7 +206,10 @@ void tmc_etr_byte_cntr_start(struct byte_cntr *byte_cntr_data)
 	}
 
 	atomic_set(&byte_cntr_data->irq_cnt, 0);
+	coresight_csr_set_byte_cntr(byte_cntr_data->csr, byte_cntr_data->irqctrl_offset,
+				(byte_cntr_data->block_size) / 8);
 	byte_cntr_data->enable = true;
+	byte_cntr_data->read_active = true;
 	mutex_unlock(&byte_cntr_data->byte_cntr_lock);
 }
 EXPORT_SYMBOL(tmc_etr_byte_cntr_start);
@@ -195,6 +220,8 @@ void tmc_etr_byte_cntr_stop(struct byte_cntr *byte_cntr_data)
 		return;
 
 	mutex_lock(&byte_cntr_data->byte_cntr_lock);
+	byte_cntr_data->rwp_offset =
+		tmc_get_rwp_offset(byte_cntr_data->tmcdrvdata);
 	byte_cntr_data->enable = false;
 	byte_cntr_data->read_active = false;
 	atomic_set(&byte_cntr_data->irq_cnt, 0);
@@ -211,8 +238,6 @@ static int tmc_etr_byte_cntr_release(struct inode *in, struct file *fp)
 {
 	struct byte_cntr *byte_cntr_data = fp->private_data;
 	struct device *dev = &byte_cntr_data->tmcdrvdata->csdev->dev;
-	long rwp_offset = -EINVAL;
-	int rc;
 
 	mutex_lock(&byte_cntr_data->byte_cntr_lock);
 	byte_cntr_data->read_active = false;
@@ -225,18 +250,9 @@ static int tmc_etr_byte_cntr_release(struct inode *in, struct file *fp)
 
 	disable_irq_wake(byte_cntr_data->byte_cntr_irq);
 
-	rc = pm_runtime_get_sync(dev->parent);
-	if (rc < 0) {
-		pm_runtime_put_noidle(dev->parent);
-
-	} else {
-		rwp_offset = tmc_get_rwp_offset(byte_cntr_data->tmcdrvdata);
-		pm_runtime_put(dev->parent);
-	}
-
-	dev_dbg(dev, "send data total size: %lld bytes, irq_cnt: %lld, offset: %lld\n",
-		byte_cntr_data->total_size, byte_cntr_data->total_irq, rwp_offset);
-	byte_cntr_data->total_irq = 0;
+	dev_dbg(dev, "send data total size: %lld bytes, irq_cnt: %lld, offset: %lu, rwp_offset: %lu\n",
+		byte_cntr_data->total_size, byte_cntr_data->total_irq,
+		byte_cntr_data->offset,	byte_cntr_data->rwp_offset);
 	mutex_unlock(&byte_cntr_data->byte_cntr_lock);
 
 	return 0;
@@ -250,11 +266,12 @@ static int tmc_etr_byte_cntr_open(struct inode *in, struct file *fp)
 
 	mutex_lock(&byte_cntr_data->byte_cntr_lock);
 
+#if 0
 	if (byte_cntr_data->read_active) {
 		mutex_unlock(&byte_cntr_data->byte_cntr_lock);
 		return -EBUSY;
 	}
-
+#endif
 	if (tmcdrvdata->mode != CS_MODE_SYSFS ||
 			!byte_cntr_data->block_size) {
 		mutex_unlock(&byte_cntr_data->byte_cntr_lock);
@@ -275,6 +292,7 @@ static int tmc_etr_byte_cntr_open(struct inode *in, struct file *fp)
 	byte_cntr_data->read_active = true;
 	byte_cntr_data->total_size = 0;
 	byte_cntr_data->offset = tmc_get_rwp_offset(tmcdrvdata);
+	byte_cntr_data->total_irq = 0;
 	mutex_unlock(&byte_cntr_data->byte_cntr_lock);
 	return 0;
 }
@@ -309,8 +327,7 @@ static int byte_cntr_register_chardev(struct byte_cntr *byte_cntr_data)
 	if (ret)
 		goto exit_unreg_chrdev_region;
 
-	byte_cntr_data->driver_class = class_create(THIS_MODULE,
-						   byte_cntr_data->class_name);
+	byte_cntr_data->driver_class = class_create(byte_cntr_data->class_name);
 	if (IS_ERR(byte_cntr_data->driver_class)) {
 		ret = -ENOMEM;
 		pr_err("class_create failed %d\n", ret);
@@ -404,4 +421,30 @@ void byte_cntr_remove(struct byte_cntr *byte_cntr_data)
 				byte_cntr_data->dev.dev);
 	class_destroy(byte_cntr_data->driver_class);
 	unregister_chrdev_region(byte_cntr_data->dev.dev, 1);
+}
+
+void byte_cntr_attach_etf(struct coresight_device *csdev)
+{
+	etf_csdev = csdev;
+}
+
+int is_etf_enabled(void)
+{
+	int ret;
+	int val;
+
+	/* if not found bind etf, return true to keep original flow */
+	if (!etf_csdev) {
+		return 1;
+	}
+
+	ret = pm_runtime_resume_and_get(etf_csdev->dev.parent);
+	if (ret < 0)
+		return 1;
+
+	val = (int)csdev_access_relaxed_read32(&etf_csdev->access, 0x20);
+
+	pm_runtime_put_sync(etf_csdev->dev.parent);
+
+	return val;
 }

@@ -11,7 +11,6 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
 #include <linux/of_dma.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -929,8 +928,7 @@ static int sprd_spi_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	ss = spi_controller_get_devdata(sctlr);
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	ss->base = devm_ioremap_resource(&pdev->dev, res);
+	ss->base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(ss->base)) {
 		ret = PTR_ERR(ss->base);
 		goto free_controller;
@@ -980,7 +978,7 @@ static int sprd_spi_probe(struct platform_device *pdev)
 		goto err_rpm_put;
 	}
 
-	ret = devm_spi_register_controller(&pdev->dev, sctlr);
+	ret = spi_register_controller(sctlr);
 	if (ret)
 		goto err_rpm_put;
 
@@ -995,35 +993,37 @@ err_rpm_put:
 disable_clk:
 	clk_disable_unprepare(ss->clk);
 release_dma:
-	sprd_spi_dma_release(ss);
+	if (ss->dma.enable)
+		sprd_spi_dma_release(ss);
 free_controller:
 	spi_controller_put(sctlr);
 
 	return ret;
 }
 
-static int sprd_spi_remove(struct platform_device *pdev)
+static void sprd_spi_remove(struct platform_device *pdev)
 {
 	struct spi_controller *sctlr = platform_get_drvdata(pdev);
 	struct sprd_spi *ss = spi_controller_get_devdata(sctlr);
 	int ret;
 
 	ret = pm_runtime_get_sync(ss->dev);
-	if (ret < 0) {
-		pm_runtime_put_noidle(ss->dev);
+	if (ret < 0)
 		dev_err(ss->dev, "failed to resume SPI controller\n");
-		return ret;
+
+	spi_controller_get(sctlr);
+
+	spi_unregister_controller(sctlr);
+
+	if (ret >= 0) {
+		if (ss->dma.enable)
+			sprd_spi_dma_release(ss);
+		clk_disable_unprepare(ss->clk);
 	}
-
-	spi_controller_suspend(sctlr);
-
-	if (ss->dma.enable)
-		sprd_spi_dma_release(ss);
-	clk_disable_unprepare(ss->clk);
 	pm_runtime_put_noidle(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
 
-	return 0;
+	spi_controller_put(sctlr);
 }
 
 static int __maybe_unused sprd_spi_runtime_suspend(struct device *dev)
@@ -1077,7 +1077,7 @@ static struct platform_driver sprd_spi_driver = {
 		.pm = &sprd_spi_pm_ops,
 	},
 	.probe = sprd_spi_probe,
-	.remove  = sprd_spi_remove,
+	.remove_new = sprd_spi_remove,
 };
 
 module_platform_driver(sprd_spi_driver);

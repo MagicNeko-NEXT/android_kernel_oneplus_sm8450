@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "qcom-dcvs-icc: " fmt
@@ -15,6 +16,7 @@
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/interconnect.h>
+#include <dt-bindings/interconnect/qcom,icc.h>
 #include <soc/qcom/dcvs.h>
 #include "dcvs_private.h"
 
@@ -43,8 +45,8 @@ static int commit_icc_freq(struct dcvs_path *path, struct dcvs_freq *freqs,
 	return ret;
 }
 
-#define ACTIVE_ONLY_TAG	0x3
-#define PERF_MODE_TAG	0x8
+#define ACTIVE_ONLY_TAG	QCOM_ICC_TAG_ACTIVE_ONLY
+#define PERF_MODE_TAG	QCOM_ICC_TAG_PERF_MODE
 int setup_icc_sp_device(struct device *dev, struct dcvs_hw *hw,
 					struct dcvs_path *path)
 {
@@ -52,7 +54,7 @@ int setup_icc_sp_device(struct device *dev, struct dcvs_hw *hw,
 	int ret = 0;
 
 	if (hw->type != DCVS_DDR && hw->type != DCVS_LLCC
-					&& hw->type != DCVS_DDRQOS)
+			&& hw->type != DCVS_DDRQOS && hw->type != DCVS_UBWCP)
 		return -EINVAL;
 
 	sp_data = devm_kzalloc(dev, sizeof(*sp_data), GFP_KERNEL);
@@ -65,7 +67,8 @@ int setup_icc_sp_device(struct device *dev, struct dcvs_hw *hw,
 			dev_err(dev, "Unable to register icc path: %d\n", ret);
 		return ret;
 	}
-	if (hw->type == DCVS_DDR || hw->type == DCVS_LLCC)
+	if (hw->type == DCVS_DDR || hw->type == DCVS_LLCC
+				|| hw->type == DCVS_UBWCP)
 		icc_set_tag(sp_data->icc_path, ACTIVE_ONLY_TAG);
 	else if (hw->type == DCVS_DDRQOS)
 		icc_set_tag(sp_data->icc_path, ACTIVE_ONLY_TAG | PERF_MODE_TAG);

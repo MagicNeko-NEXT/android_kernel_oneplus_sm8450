@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/kernel.h>
@@ -83,7 +83,7 @@ uint32_t tme_hwkm_master_clearkey(uint32_t key_id,
 	}
 
 	if (response_len != sizeof(*response)) {
-		pr_err("HWKM response failed with invalid length: %u, %u\n",
+		pr_err("HWKM response failed with invalid length: %zu, %zu\n",
 				response_len, sizeof(response));
 		ret = -EBADMSG;
 		goto err_exit;
@@ -134,7 +134,7 @@ uint32_t tme_hwkm_master_generatekey(uint32_t key_id,
 	}
 
 	if (response_len != sizeof(*response)) {
-		pr_err("HWKM response failed with invalid length: %u, %u\n",
+		pr_err("HWKM response failed with invalid length: %zu, %zu\n",
 				response_len, sizeof(response));
 		ret = -EBADMSG;
 		goto err_exit;
@@ -185,7 +185,7 @@ uint32_t tme_hwkm_master_derivekey(uint32_t key_id,
 	}
 
 	if (response_len != sizeof(*response)) {
-		pr_err("HWKM response failed with invalid length: %u, %u\n",
+		pr_err("HWKM response failed with invalid length: %zu, %zu\n",
 				response_len, sizeof(response));
 		ret = -EBADMSG;
 		goto err_exit;
@@ -234,7 +234,7 @@ uint32_t tme_hwkm_master_wrapkey(uint32_t key_id,
 	}
 
 	if (response_len != sizeof(*wrpk_response)) {
-		pr_err("HWKM response failed with invalid length: %u, %u\n",
+		pr_err("HWKM response failed with invalid length: %zu, %zu\n",
 				response_len, sizeof(wrpk_response));
 		ret = -EBADMSG;
 		goto err_exit;
@@ -288,7 +288,7 @@ uint32_t tme_hwkm_master_unwrapkey(uint32_t key_id,
 	}
 
 	if (response_len != sizeof(*response)) {
-		pr_err("HWKM response failed with invalid length: %u, %u\n",
+		pr_err("HWKM response failed with invalid length: %zu, %zu\n",
 				response_len, sizeof(response));
 		ret = -EBADMSG;
 		goto err_exit;
@@ -341,7 +341,7 @@ uint32_t tme_hwkm_master_importkey(uint32_t key_id,
 	}
 
 	if (response_len != sizeof(*response)) {
-		pr_err("HWKM response failed with invalid length: %u, %u\n",
+		pr_err("HWKM response failed with invalid length: %zu, %zu\n",
 				response_len, sizeof(response));
 		ret = -EBADMSG;
 		goto err_exit;
@@ -387,7 +387,7 @@ uint32_t tme_hwkm_master_broadcast_transportkey(
 	}
 
 	if (response_len != sizeof(*response)) {
-		pr_err("HWKM response failed with invalid length: %u, %u\n",
+		pr_err("HWKM response failed with invalid length: %zu, %zu\n",
 				response_len, sizeof(response));
 		ret = -EBADMSG;
 		goto err_exit;

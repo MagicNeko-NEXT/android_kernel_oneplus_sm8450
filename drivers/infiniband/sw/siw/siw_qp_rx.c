@@ -139,7 +139,7 @@ static int siw_rx_pbl(struct siw_rx_stream *srx, int *pbl_idx,
 			break;
 
 		bytes = min(bytes, len);
-		if (siw_rx_kva(srx, (void *)(uintptr_t)buf_addr, bytes) ==
+		if (siw_rx_kva(srx, ib_virt_dma_to_ptr(buf_addr), bytes) ==
 		    bytes) {
 			copied += bytes;
 			offset += bytes;
@@ -487,7 +487,7 @@ int siw_proc_send(struct siw_qp *qp)
 		mem_p = *mem;
 		if (mem_p->mem_obj == NULL)
 			rv = siw_rx_kva(srx,
-				(void *)(uintptr_t)(sge->laddr + frx->sge_off),
+				ib_virt_dma_to_ptr(sge->laddr + frx->sge_off),
 				sge_bytes);
 		else if (!mem_p->is_pbl)
 			rv = siw_rx_umem(srx, mem_p->umem,
@@ -852,7 +852,7 @@ int siw_proc_rresp(struct siw_qp *qp)
 
 	if (mem_p->mem_obj == NULL)
 		rv = siw_rx_kva(srx,
-			(void *)(uintptr_t)(sge->laddr + wqe->processed),
+			ib_virt_dma_to_ptr(sge->laddr + wqe->processed),
 			bytes);
 	else if (!mem_p->is_pbl)
 		rv = siw_rx_umem(srx, mem_p->umem, sge->laddr + wqe->processed,
@@ -1099,6 +1099,21 @@ static int siw_get_hdr(struct siw_rx_stream *srx)
 
 		if (srx->fpdu_part_rcvd < hdrlen)
 			return -EAGAIN;
+	}
+
+	/*
+	 * Peer-controlled mpa_len must not underflow srx->fpdu_part_rem
+	 * in siw_tcp_rx_data(); a negative value flows as a signed copy
+	 * length into siw_check_mem() and skb_copy_bits().
+	 */
+	if (unlikely(be16_to_cpu(c_hdr->mpa_len) + MPA_HDR_SIZE <
+		     iwarp_pktinfo[opcode].hdr_len)) {
+		pr_warn_ratelimited("siw: short mpa_len %u for opcode %u (hdr_len %u)\n",
+				    be16_to_cpu(c_hdr->mpa_len), opcode,
+				    iwarp_pktinfo[opcode].hdr_len);
+		siw_init_terminate(rx_qp(srx), TERM_ERROR_LAYER_LLP,
+				   LLP_ETYPE_MPA, LLP_ECODE_FPDU_START, 0);
+		return -EINVAL;
 	}
 
 	/*
@@ -1456,7 +1471,8 @@ int siw_tcp_rx_data(read_descriptor_t *rd_desc, struct sk_buff *skb,
 		}
 		if (unlikely(rv != 0 && rv != -EAGAIN)) {
 			if ((srx->state > SIW_GET_HDR ||
-			     qp->rx_fpdu->more_ddp_segs) && run_completion)
+			     (qp->rx_fpdu && qp->rx_fpdu->more_ddp_segs)) &&
+			    run_completion)
 				siw_rdmap_complete(qp, rv);
 
 			siw_dbg_qp(qp, "rx error %d, rx state %d\n", rv,

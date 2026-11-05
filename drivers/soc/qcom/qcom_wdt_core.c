@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2012-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 #include <linux/irqdomain.h>
 #include <linux/delay.h>
@@ -17,7 +18,8 @@
 #include <linux/platform_device.h>
 #include <linux/wait.h>
 #include <linux/reboot.h>
-#include <linux/qcom_scm.h>
+#include <linux/panic_notifier.h>
+#include <linux/firmware/qcom/qcom_scm.h>
 #include <soc/qcom/minidump.h>
 #include <soc/qcom/watchdog.h>
 #include <linux/cpumask.h>
@@ -27,16 +29,14 @@
 #include <linux/irq.h>
 #include <linux/sort.h>
 #include <linux/kernel_stat.h>
-#include <linux/irq_cpustat.h>
 #include <linux/kallsyms.h>
 #include <linux/kdebug.h>
+#include <asm/hardirq.h>
 #include <linux/suspend.h>
 #include <linux/notifier.h>
 
 #define MASK_SIZE        32
-#define COMPARE_RET      -1
 
-typedef int (*compare_t) (const void *lhs, const void *rhs);
 static struct msm_watchdog_data *wdog_data;
 
 static void qcom_wdt_dump_cpu_alive_mask(struct msm_watchdog_data *wdog_dd)
@@ -50,214 +50,94 @@ static void qcom_wdt_dump_cpu_alive_mask(struct msm_watchdog_data *wdog_dd)
 }
 
 #ifdef CONFIG_QCOM_IRQ_STAT
-static int cmp_irq_info_fn(const void *a, const void *b)
+static void record_irq_count(void)
 {
-	struct qcom_irq_info *lhs = (struct qcom_irq_info *)a;
-	struct qcom_irq_info *rhs = (struct qcom_irq_info *)b;
-
-	if (lhs->total_count < rhs->total_count)
-		return 1;
-
-	if (lhs->total_count > rhs->total_count)
-		return COMPARE_RET;
-
-	return 0;
-}
-
-static void swap_irq_info_fn(void *a, void *b, int size)
-{
-	struct qcom_irq_info temp;
-	struct qcom_irq_info *lhs = (struct qcom_irq_info *)a;
-	struct qcom_irq_info *rhs = (struct qcom_irq_info *)b;
-
-	temp = *lhs;
-	*lhs = *rhs;
-	*rhs = temp;
-}
-
-static struct qcom_irq_info *search(struct qcom_irq_info *key,
-				    struct qcom_irq_info *base,
-				    size_t num, compare_t cmp)
-{
-	struct qcom_irq_info *pivot = NULL;
-	int result;
-
-	while (num > 0) {
-		pivot = base + (num >> 1);
-		result = cmp(key, pivot);
-
-		if (result == 0)
-			goto out;
-
-		if (result > 0) {
-			base = pivot + 1;
-			num--;
-		}
-
-		if (num)
-			num >>= 1;
-	}
-
-out:
-	if (pivot)
-		pr_debug("*pivot:%u key:%u\n",
-			pivot->total_count, key->total_count);
-
-	return pivot;
-}
-
-static void print_irq_stat(struct msm_watchdog_data *wdog_dd)
-{
-	int index;
-	int cpu, ipi_nr;
-	struct qcom_irq_info *info;
-
-	pr_info("(virq:irq_count)- ");
-	for (index = 0; index < NR_TOP_HITTERS; index++) {
-		info = &wdog_dd->irq_counts[index];
-		if (info->name) {
-			if (info->chipname)
-				pr_cont("%s:%s(%u):%u ", info->chipname,
-					info->name, info->irq, info->total_count);
-			else
-				pr_cont("%s(%u):%u ", info->name,
-					info->irq, info->total_count);
-		} else {
-			pr_cont("%u:%u ", info->irq, info->total_count);
-		}
-	}
-	pr_cont("\n");
-
-	pr_info("(cpu:irq_count)- ");
-	for_each_possible_cpu(cpu)
-		pr_cont("%u:%u ", cpu, wdog_dd->tot_irq_count[cpu]);
-	pr_cont("\n");
-
-	pr_info("(ipi:irq_count)- ");
-	ipi_nr = nr_ipi_get();
-	for (index = 0; index < ipi_nr; index++) {
-		info = &wdog_dd->ipi_counts[index];
-		pr_cont("%u:%u ", info->irq, info->total_count);
-	}
-	pr_cont("\n");
-}
-
-static void compute_irq_stat(struct work_struct *work)
-{
+	int irq, ipi_nr;
 	unsigned int count;
-	int index = 0, cpu, irq, ipi_nr;
-	struct irq_desc *desc, **desc_ipi_arr;
-	struct qcom_irq_info *pos;
-	struct qcom_irq_info *start;
-	struct qcom_irq_info key = {0};
-	unsigned int running;
-	struct msm_watchdog_data *wdog_dd = container_of(work,
-					    struct msm_watchdog_data,
-					    irq_counts_work);
+	struct irq_desc *desc;
 
-	size_t arr_size = ARRAY_SIZE(wdog_dd->irq_counts);
+	ipi_nr = nr_ipi_get();
 
-	/* avoid parallel execution from bark handler and queued
-	 * irq_counts_work.
-	 */
-	running = atomic_xchg(&wdog_dd->irq_counts_running, 1);
-	if (running)
-		return;
-
-	/* per irq counts */
 	rcu_read_lock();
 	for_each_irq_nr(irq) {
+		if (irq <= ipi_nr)
+			continue;
+
 		desc = irq_to_desc(irq);
 		if (!desc)
 			continue;
 
 		count = kstat_irqs_usr(irq);
-		if (!count)
+		desc->android_vendor_data1 = count;
+	}
+	rcu_read_unlock();
+}
+
+struct irq_info {
+	int irq;
+	unsigned int count;
+	struct irq_desc *desc;
+};
+
+static void compute_irq_count(void)
+{
+	int i, irq, ipi_nr;
+	unsigned int count, diff;
+	struct irq_desc *desc;
+	unsigned long time_diff;
+	struct irq_info irq_info_list[NR_TOP_HITTERS];
+	unsigned int list_min_cnt = 0, list_min_pos = 0;
+
+	ipi_nr = nr_ipi_get();
+	time_diff = (sched_clock() - wdog_data->last_pet) / 1000000;
+
+	rcu_read_lock();
+	for_each_irq_nr(irq) {
+		if (irq <= ipi_nr)
 			continue;
 
-		if (index < arr_size) {
-			wdog_dd->irq_counts[index].irq = irq;
-			wdog_dd->irq_counts[index].total_count = count;
-			wdog_dd->irq_counts[index].name = (desc->action) ?
-					desc->action->name : NULL;
-			wdog_dd->irq_counts[index].chipname = (desc->irq_data.chip) ?
-					desc->irq_data.chip->name : NULL;
-			for_each_possible_cpu(cpu)
-				wdog_dd->irq_counts[index].irq_counter[cpu] =
-					*per_cpu_ptr(desc->kstat_irqs, cpu);
-
-			index++;
-			if (index == arr_size)
-				sort(wdog_dd->irq_counts, arr_size,
-				     sizeof(*pos), cmp_irq_info_fn,
-				     swap_irq_info_fn);
-
+		desc = irq_to_desc(irq);
+		if (!desc)
 			continue;
-		}
 
-		key.total_count = count;
-		start = wdog_dd->irq_counts + (arr_size - 1);
-		pos = search(&key, wdog_dd->irq_counts,
-			     arr_size, cmp_irq_info_fn);
+		count = kstat_irqs_usr(irq);
+		diff = count - desc->android_vendor_data1;
 
-		if (pos && (pos->total_count >= key.total_count)) {
-			if (pos < start)
-				pos++;
-			else
-				pos = NULL;
-		}
+		if (diff > list_min_cnt) {
+			irq_info_list[list_min_pos].count = diff;
+			irq_info_list[list_min_pos].irq = irq;
+			irq_info_list[list_min_pos].desc = desc;
 
-		pr_debug("count :%u irq:%u\n", count, irq);
-		if (pos && pos < start) {
-			start--;
-			for (; start >= pos ; start--)
-				*(start + 1) = *start;
-		}
-
-		if (pos) {
-			pos->irq = irq;
-			pos->total_count = count;
-			pos->name = (desc->action) ?
-				desc->action->name : NULL;
-			pos->chipname = (desc->irq_data.chip) ?
-				desc->irq_data.chip->name : NULL;
-			for_each_possible_cpu(cpu)
-				pos->irq_counter[cpu] =
-					*per_cpu_ptr(desc->kstat_irqs, cpu);
+			list_min_pos = 0;
+			list_min_cnt = irq_info_list[0].count;
+			for (i = 1; i < NR_TOP_HITTERS; i++) {
+				if (irq_info_list[i].count < list_min_cnt) {
+					list_min_pos = i;
+					list_min_cnt = irq_info_list[i].count;
+				}
+			}
 		}
 	}
 	rcu_read_unlock();
 
-	/* per cpu total irq counts */
-	for_each_possible_cpu(cpu)
-		wdog_dd->tot_irq_count[cpu] = kstat_cpu_irqs_sum(cpu);
-
-	/* per IPI counts */
-	ipi_nr = nr_ipi_get();
-	desc_ipi_arr = ipi_desc_get();
-	for (index = 0; index < ipi_nr; index++) {
-		wdog_dd->ipi_counts[index].total_count = 0;
-		wdog_dd->ipi_counts[index].irq = index;
-		irq = irq_desc_get_irq(desc_ipi_arr[index]);
-		for_each_possible_cpu(cpu) {
-			wdog_dd->ipi_counts[index].irq_counter[cpu] =
-				kstat_irqs_cpu(irq, cpu);
-			wdog_dd->ipi_counts[index].total_count +=
-				wdog_dd->ipi_counts[index].irq_counter[cpu];
+	pr_emerg("Top irqs in last %lu ms:\n", time_diff);
+	for (i = 0; i < NR_TOP_HITTERS; i++) {
+		count = irq_info_list[i].count;
+		if (count != 0) {
+			irq = irq_info_list[i].irq;
+			desc = irq_info_list[i].desc;
+			pr_emerg("IRQ %d [%s:%s] - %d times\n", irq,
+				(desc->irq_data.chip) ?
+				desc->irq_data.chip->name : "UNKNOWN",
+				(desc->action) ?
+				desc->action->name : "NONAME",
+				count);
 		}
 	}
-
-	print_irq_stat(wdog_dd);
-	atomic_xchg(&wdog_dd->irq_counts_running, 0);
-}
-
-static void queue_irq_counts_work(struct work_struct *irq_counts_work)
-{
-	queue_work(system_unbound_wq, irq_counts_work);
 }
 #else
-static void queue_irq_counts_work(struct work_struct *irq_counts_work) { }
-static void compute_irq_stat(struct work_struct *work) { }
+static void record_irq_count(void) { }
+static void compute_irq_count(void) { }
 #endif
 
 static int qcom_wdt_hibernation_notifier(struct notifier_block *nb,
@@ -302,7 +182,8 @@ int qcom_wdt_pet_suspend(struct device *dev)
 	wdog_data->ops->reset_wdt(wdog_data);
 	del_timer_sync(&wdog_data->pet_timer);
 	if (wdog_data->wakeup_irq_enable) {
-		if (wdog_data->hibernate) {
+		if (wdog_data->hibernate || (pm_suspend_target_state == PM_SUSPEND_MEM) ||
+				(pm_suspend_target_state == PM_SUSPEND_TO_IDLE)) {
 			wdog_data->ops->disable_wdt(wdog_data);
 			wdog_data->enabled = false;
 		}
@@ -350,7 +231,10 @@ int qcom_wdt_pet_resume(struct device *dev)
 	wdog_data->freeze_in_progress = false;
 	spin_unlock(&wdog_data->freeze_lock);
 	if (wdog_data->wakeup_irq_enable) {
-		if (wdog_data->hibernate) {
+		if (wdog_data->hibernate || (pm_suspend_target_state == PM_SUSPEND_MEM) ||
+				(pm_suspend_target_state == PM_SUSPEND_TO_IDLE)) {
+			wdog_data->ops->set_bark_time(wdog_data->bark_time, wdog_data);
+			wdog_data->ops->set_bite_time(wdog_data->bark_time + 3 * 1000, wdog_data);
 			val |= BIT(UNMASKED_INT_EN);
 			wdog_data->ops->enable_wdt(val, wdog_data);
 			wdog_data->enabled = true;
@@ -390,11 +274,11 @@ static int qcom_wdt_panic_handler(struct notifier_block *this,
 		pr_info("Triggering early bite\n");
 		qcom_wdt_trigger_bite();
 	}
-	if (panic_timeout == 0) {
+	if (panic_timeout == 0)
 		wdog_dd->ops->disable_wdt(wdog_dd);
-	} else {
+	else
 		qcom_wdt_reset_on_oops(wdog_dd, panic_timeout);
-	}
+
 	return NOTIFY_DONE;
 }
 
@@ -433,9 +317,8 @@ static void qcom_wdt_disable(struct msm_watchdog_data *wdog_dd)
 		disable_percpu_irq(wdog_dd->bark_irq);
 		free_percpu_irq(wdog_dd->bark_irq,
 				(void __percpu *)wdog_dd->wdog_cpu_dd);
-	} else {
+	} else
 		devm_free_irq(wdog_dd->dev, wdog_dd->bark_irq, wdog_dd);
-	}
 
 	wdog_dd->enabled = false;
 	/*Ensure all cpus see update to enable*/
@@ -713,7 +596,7 @@ static __ref int qcom_wdt_kthread(void *arg)
 			spin_unlock(&wdog_dd->freeze_lock);
 		}
 
-		queue_irq_counts_work(&wdog_dd->irq_counts_work);
+		record_irq_count();
 	}
 	return 0;
 }
@@ -772,7 +655,6 @@ int qcom_wdt_remove(struct platform_device *pdev)
 	wdog_dd->timer_expired = true;
 	wdog_dd->user_pet_complete = true;
 	kthread_stop(wdog_dd->watchdog_task);
-	flush_work(&wdog_dd->irq_counts_work);
 	return 0;
 }
 EXPORT_SYMBOL(qcom_wdt_remove);
@@ -786,7 +668,7 @@ void qcom_wdt_trigger_bite(void)
 {
 	if (!wdog_data)
 		return;
-	compute_irq_stat(&wdog_data->irq_counts_work);
+	compute_irq_count();
 	dev_err(wdog_data->dev, "Causing a QCOM Apps Watchdog bite!\n");
 	wdog_data->ops->show_wdt_status(wdog_data);
 	wdog_data->ops->set_bite_time(1, wdog_data);
@@ -811,20 +693,22 @@ static irqreturn_t qcom_wdt_bark_handler(int irq, void *dev_id)
 	struct msm_watchdog_data *wdog_dd = dev_id;
 	unsigned long nanosec_rem;
 	unsigned long long t = sched_clock();
+	unsigned long long tp = wdog_dd->last_pet;
 
 	nanosec_rem = do_div(t, 1000000000);
 	dev_info(wdog_dd->dev, "QCOM Apps Watchdog bark! Now = %lu.%06lu\n",
 			(unsigned long) t, nanosec_rem / 1000);
 
-	nanosec_rem = do_div(wdog_dd->last_pet, 1000000000);
+	nanosec_rem = do_div(tp, 1000000000);
 	dev_info(wdog_dd->dev, "QCOM Apps Watchdog last pet at %lu.%06lu\n",
-			(unsigned long) wdog_dd->last_pet, nanosec_rem / 1000);
+			(unsigned long) tp, nanosec_rem / 1000);
 	if (wdog_dd->do_ipi_ping)
 		qcom_wdt_dump_cpu_alive_mask(wdog_dd);
 
 	if (wdog_dd->freeze_in_progress)
 		dev_info(wdog_dd->dev, "Suspend in progress\n");
 
+	md_dump_process();
 	qcom_wdt_trigger_bite();
 
 	return IRQ_HANDLED;
@@ -895,8 +779,6 @@ static int qcom_wdt_init(struct msm_watchdog_data *wdog_dd,
 	if (ret)
 		return ret;
 
-	INIT_WORK(&wdog_dd->irq_counts_work, compute_irq_stat);
-	atomic_set(&wdog_dd->irq_counts_running, 0);
 	delay_time = msecs_to_jiffies(wdog_dd->pet_time);
 	wdog_dd->ops->set_bark_time(wdog_dd->bark_time, wdog_dd);
 	wdog_dd->ops->set_bite_time(wdog_dd->bark_time + 3 * 1000, wdog_dd);
@@ -938,7 +820,6 @@ static int qcom_wdt_init(struct msm_watchdog_data *wdog_dd,
 		}
 
 		del_timer_sync(&wdog_dd->pet_timer);
-		flush_work(&wdog_dd->irq_counts_work);
 		dev_err(wdog_dd->dev, "Failed Initializing QCOM Apps Watchdog\n");
 		return ret;
 	}
@@ -1022,7 +903,7 @@ int qcom_wdt_register(struct platform_device *pdev,
 	}
 
 	/* Add wdog info to minidump table */
-	strlcpy(md_entry.name, "KWDOGDATA", sizeof(md_entry.name));
+	strscpy(md_entry.name, "KWDOGDATA", sizeof(md_entry.name));
 	md_entry.virt_addr = (uintptr_t)wdog_dd;
 	md_entry.phys_addr = virt_to_phys(wdog_dd);
 	md_entry.size = sizeof(*wdog_dd);
@@ -1036,4 +917,4 @@ err:
 EXPORT_SYMBOL(qcom_wdt_register);
 
 MODULE_DESCRIPTION("QCOM Watchdog Driver Core");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

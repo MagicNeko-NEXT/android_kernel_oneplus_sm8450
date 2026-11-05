@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2020-2021, The Linux Foundation. All rights reserved. */
-/* Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved. */
+/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. */
 
 #include <linux/err.h>
 #include <linux/ipc_logging.h>
@@ -123,7 +123,7 @@ static const char * const pmic_pon_fault_reason1[8] = {
 static const char * const pmic_pon_fault_reason2[8] = {
 	[0] = "UNKNOWN(0)",
 	[1] = "UNKNOWN(1)",
-	[2] = "UNKNOWN(2)",
+	[2] = "PMIC_RB",
 	[3] = "FAULT_N",
 	[4] = "FAULT_WATCHDOG",
 	[5] = "PBS_NACK",
@@ -378,7 +378,7 @@ static int pmic_pon_log_parse_entry(const struct pmic_pon_log_entry *entry,
 				entry->data0);
 		break;
 	case PMIC_PON_EVENT_WARM_RESET_COUNT:
-		scnprintf(buf, BUF_SIZE, "Warm Reset Count: %u", data);
+		scnprintf(buf, BUF_SIZE, "Warm Reset Count: %u", entry->data0);
 		break;
 	case PMIC_PON_EVENT_FAULT_REASON_1_2:
 		if (!entry->data0 && !entry->data1)
@@ -591,8 +591,7 @@ static void pmic_pon_log_fault_panic(struct pmic_pon_log_dev *pon_dev)
 			}
 		} else if (pon_dev->log[i].event ==
 			   PMIC_PON_EVENT_WARM_RESET_COUNT) {
-			warm_reset_skip_count = (pon_dev->log[i].data1 << 8) |
-						pon_dev->log[i].data0;
+			warm_reset_skip_count = pon_dev->log[i].data0;
 		}
 	}
 
@@ -752,4 +751,4 @@ static struct platform_driver pmic_pon_log_driver = {
 module_platform_driver(pmic_pon_log_driver);
 
 MODULE_DESCRIPTION("QTI PMIC PON log driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

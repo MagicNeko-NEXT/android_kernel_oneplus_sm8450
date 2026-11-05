@@ -1,34 +1,33 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2012-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
-#include <linux/types.h>
-#include <linux/msm_dsps.h>
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/slab.h>
-#include <linux/platform_device.h>
-#include <linux/cdev.h>
-#include <linux/fs.h>
-#include <linux/of_device.h>
 #include <asm/arch_timer.h>
-#include <linux/uaccess.h>
-
-#include <linux/kernel.h>
-#include <linux/err.h>
+#include <linux/cdev.h>
 #include <linux/delay.h>
+#include <linux/err.h>
+#include <linux/fs.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/msm_dsps.h>
+#include <linux/of_device.h>
+#include <linux/platform_device.h>
+#include <linux/remoteproc.h>
+#include <linux/slab.h>
 #include <linux/sysfs.h>
+#include <linux/types.h>
+#include <linux/uaccess.h>
 #include <linux/workqueue.h>
 
-#include <linux/remoteproc.h>
+#define IMAGE_LOAD_CMD		1
+#define IMAGE_UNLOAD_CMD	0
+#define SSR_RESET_CMD		1
+#define CLASS_NAME			"ssc"
+#define DRV_NAME			"sensors"
+#define DRV_VERSION			"2.00"
 
-#define IMAGE_LOAD_CMD 1
-#define IMAGE_UNLOAD_CMD 0
-#define SSR_RESET_CMD 1
-#define CLASS_NAME	"ssc"
-#define DRV_NAME	"sensors"
-#define DRV_VERSION	"2.00"
 #ifdef CONFIG_COMPAT
 #define DSPS_IOCTL_READ_SLOW_TIMER32	_IOR(DSPS_IOCTL_MAGIC, 3, compat_uint_t)
 #endif
@@ -40,16 +39,10 @@ struct sns_ssc_control_s {
 	dev_t dev_num;
 	struct device *dev;
 	struct cdev *cdev;
+	struct platform_device *slpi_private;
+	struct work_struct slpi_ldr_work;
 };
 static struct sns_ssc_control_s sns_ctl;
-
-static ssize_t slpi_boot_store(struct kobject *kobj,
-	struct kobj_attribute *attr,
-	const char *buf, size_t count);
-
-static ssize_t slpi_ssr_store(struct kobject *kobj,
-	struct kobj_attribute *attr,
-	const char *buf, size_t count);
 
 struct slpi_loader_private {
 	void *pil_h;
@@ -57,24 +50,9 @@ struct slpi_loader_private {
 	struct attribute_group *attr_group;
 };
 
-static struct kobj_attribute slpi_boot_attribute =
-	__ATTR(boot, 0220, NULL, slpi_boot_store);
-
-static struct kobj_attribute slpi_ssr_attribute =
-	__ATTR(ssr, 0220, NULL, slpi_ssr_store);
-
-static struct attribute *attrs[] = {
-	&slpi_boot_attribute.attr,
-	&slpi_ssr_attribute.attr,
-	NULL,
-};
-
-static struct platform_device *slpi_private;
-static struct work_struct slpi_ldr_work;
-
 static void slpi_load_fw(struct work_struct *slpi_ldr_work)
 {
-	struct platform_device *pdev = slpi_private;
+	struct platform_device *pdev = sns_ctl.slpi_private;
 	struct slpi_loader_private *priv = NULL;
 	int ret;
 	const char *firmware_name = NULL;
@@ -86,18 +64,18 @@ static void slpi_load_fw(struct work_struct *slpi_ldr_work)
 	}
 
 	if (!pdev->dev.of_node) {
-		dev_err(&pdev->dev,
-			"%s: Device tree information missing\n", __func__);
+		pr_err("%s: Device tree information missing\n", __func__);
 		goto fail;
 	}
 
 	ret = of_property_read_string(pdev->dev.of_node,
 		"qcom,firmware-name", &firmware_name);
 	if (ret < 0) {
-		pr_err("can't get fw name.\n");
+		dev_err(&pdev->dev, "%s:can't get fw name, err: %d\n", __func__, ret);
 		goto fail;
 	}
 
+	dev_dbg(&pdev->dev, "%s: firmware name %s\n", __func__, firmware_name);
 	priv = platform_get_drvdata(pdev);
 	if (!priv) {
 		dev_err(&pdev->dev,
@@ -117,13 +95,6 @@ static void slpi_load_fw(struct work_struct *slpi_ldr_work)
 			dev_err(&pdev->dev, "rproc not found\n");
 			goto fail;
 		}
-		if  (strcmp(firmware_name, "slpi2.mdt") == 0) {
-			ret = rproc_set_firmware(priv->pil_h, firmware_name);
-			if (ret) {
-				dev_err(&pdev->dev, "%s: rproc set firmware failed,\n", __func__);
-				goto fail;
-			}
-		}
 	}
 
 	ret = rproc_boot(priv->pil_h);
@@ -133,17 +104,17 @@ static void slpi_load_fw(struct work_struct *slpi_ldr_work)
 		goto fail;
 	}
 
-	dev_dbg(&pdev->dev, "%s: SLPI image is loaded\n", __func__);
+	dev_info(&pdev->dev, "%s: SLPI image is loaded\n", __func__);
 	return;
 
 fail:
-	pr_err("%s: SLPI image loading failed\n", __func__);
+	dev_err(&pdev->dev, "%s: SLPI image loading failed\n", __func__);
 }
 
 static void slpi_loader_do(struct platform_device *pdev)
 {
 	dev_dbg(&pdev->dev, "%s: scheduling work to load SLPI fw\n", __func__);
-	schedule_work(&slpi_ldr_work);
+	schedule_work(&sns_ctl.slpi_ldr_work);
 }
 
 static void slpi_loader_unload(struct platform_device *pdev)
@@ -163,16 +134,16 @@ static void slpi_loader_unload(struct platform_device *pdev)
 }
 
 static ssize_t slpi_ssr_store(struct kobject *kobj,
-	struct kobj_attribute *attr,
-	const char *buf,
-	size_t count)
+				struct kobj_attribute *attr,
+				const char *buf,
+				size_t count)
 {
 	int ssr_cmd = 0;
 	struct rproc *sns_dev = NULL;
-	struct platform_device *pdev = slpi_private;
+	struct platform_device *pdev = sns_ctl.slpi_private;
 	struct slpi_loader_private *priv = NULL;
 
-	pr_debug("%s: going to call slpi_ssr\n", __func__);
+	dev_dbg(&pdev->dev, "%s: going to call slpi_ssr\n", __func__);
 
 	if (kstrtoint(buf, 10, &ssr_cmd) < 0)
 		return -EINVAL;
@@ -188,7 +159,7 @@ static ssize_t slpi_ssr_store(struct kobject *kobj,
 	if (!sns_dev)
 		return -EINVAL;
 
-	dev_err(&pdev->dev, "requesting for SLPI restart\n");
+	dev_dbg(&pdev->dev, "requesting for SLPI restart\n");
 
 	rproc_shutdown(sns_dev);
 	slpi_loader_do(pdev);
@@ -198,50 +169,58 @@ static ssize_t slpi_ssr_store(struct kobject *kobj,
 }
 
 static ssize_t slpi_boot_store(struct kobject *kobj,
-	struct kobj_attribute *attr,
-	const char *buf,
-	size_t count)
+				struct kobj_attribute *attr,
+				const char *buf,
+				size_t count)
 {
 	int boot = 0;
 
-	if (sscanf(buf, "%du", &boot) != 1)
+	if (kstrtoint(buf, 10, &boot) < 0)
 		return -EINVAL;
 
 	if (boot == IMAGE_LOAD_CMD) {
 		pr_debug("%s: going to call slpi_loader_do\n", __func__);
-		slpi_loader_do(slpi_private);
+		slpi_loader_do(sns_ctl.slpi_private);
 	} else if (boot == IMAGE_UNLOAD_CMD) {
 		pr_debug("%s: going to call slpi_unloader\n", __func__);
-		slpi_loader_unload(slpi_private);
+		slpi_loader_unload(sns_ctl.slpi_private);
 	}
 	return count;
 }
 
+static struct kobj_attribute slpi_boot_attribute =
+	__ATTR(boot, 0220, NULL, slpi_boot_store);
+
+static struct kobj_attribute slpi_ssr_attribute =
+	__ATTR(ssr, 0220, NULL, slpi_ssr_store);
+
+static struct attribute *attrs[] = {
+	&slpi_boot_attribute.attr,
+	&slpi_ssr_attribute.attr,
+	NULL,
+};
+
 static int slpi_loader_init_sysfs(struct platform_device *pdev)
 {
-	int ret = -EINVAL;
 	struct slpi_loader_private *priv = NULL;
+	int ret = -EINVAL;
 
-	slpi_private = NULL;
+	sns_ctl.slpi_private = NULL;
 
 	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv) {
-		ret = -ENOMEM;
-		return ret;
+		return -ENOMEM;
 	}
 
 	platform_set_drvdata(pdev, priv);
 
-	priv->pil_h = NULL;
-	priv->boot_slpi_obj = NULL;
 	priv->attr_group = devm_kzalloc(&pdev->dev,
 				sizeof(*(priv->attr_group)),
 				GFP_KERNEL);
 	if (!priv->attr_group) {
 		dev_err(&pdev->dev, "%s: malloc attr_group failed\n",
 						__func__);
-		ret = -ENOMEM;
-		goto error_return;
+		return -ENOMEM;
 	}
 
 	priv->attr_group->attrs = attrs;
@@ -250,8 +229,7 @@ static int slpi_loader_init_sysfs(struct platform_device *pdev)
 	if (!priv->boot_slpi_obj) {
 		dev_err(&pdev->dev, "%s: sysfs create and add failed\n",
 						__func__);
-		ret = -ENOMEM;
-		goto error_return;
+		return -ENOMEM;
 	}
 
 	ret = sysfs_create_group(priv->boot_slpi_obj, priv->attr_group);
@@ -261,7 +239,7 @@ static int slpi_loader_init_sysfs(struct platform_device *pdev)
 		goto error_return;
 	}
 
-	slpi_private = pdev;
+	sns_ctl.slpi_private = pdev;
 
 	return 0;
 
@@ -371,6 +349,7 @@ static int sensors_ssc_probe(struct platform_device *pdev)
 	int size;
 	struct rproc *slpi;
 	int ret;
+	struct slpi_loader_private *priv;
 
 	prop = of_find_property(pdev->dev.of_node, "qcom,rproc-handle",
 				&size);
@@ -381,26 +360,26 @@ static int sensors_ssc_probe(struct platform_device *pdev)
 	rproc_phandle = be32_to_cpup(prop->value);
 	slpi = rproc_get_by_phandle(rproc_phandle);
 	if (!slpi) {
-		dev_err(&pdev->dev, "fail to get rproc\n", __func__);
+		dev_err(&pdev->dev, "%s: fail to get rproc\n", __func__);
 		return -EPROBE_DEFER;
 	}
 
 	ret = slpi_loader_init_sysfs(pdev);
 
-	if (ret != 0) {
-		dev_err(&pdev->dev, "%s: Error in initing sysfs\n", __func__);
+	if (ret) {
+		dev_err(&pdev->dev, "%s: Error in initing sysfs, err: %d\n", __func__, ret);
 		return ret;
 	}
 
-	sns_ctl.dev_class = class_create(THIS_MODULE, CLASS_NAME);
+	sns_ctl.dev_class = class_create(CLASS_NAME);
 	if (sns_ctl.dev_class == NULL) {
-		pr_err("%s: class_create fail.\n", __func__);
-		goto res_err;
+		dev_err(&pdev->dev, "%s: class_create fail\n", __func__);
+		goto class_create_err;
 	}
 
 	ret = alloc_chrdev_region(&sns_ctl.dev_num, 0, 1, DRV_NAME);
 	if (ret) {
-		pr_err("%s: alloc_chrdev_region fail.\n", __func__);
+		dev_err(&pdev->dev, "%s: alloc_chrdev_region fail, err: %d\n", __func__, ret);
 		goto alloc_chrdev_region_err;
 	}
 
@@ -408,13 +387,13 @@ static int sensors_ssc_probe(struct platform_device *pdev)
 				     sns_ctl.dev_num,
 				     &sns_ctl, DRV_NAME);
 	if (IS_ERR(sns_ctl.dev)) {
-		pr_err("%s: device_create fail.\n", __func__);
+		dev_err(&pdev->dev, "%s: device_create fail\n", __func__);
 		goto device_create_err;
 	}
 
 	sns_ctl.cdev = cdev_alloc();
 	if (sns_ctl.cdev == NULL) {
-		pr_err("%s: cdev_alloc fail.\n", __func__);
+		dev_err(&pdev->dev, "%s: cdev_alloc fail\n", __func__);
 		goto cdev_alloc_err;
 	}
 	cdev_init(sns_ctl.cdev, &sensors_ssc_fops);
@@ -422,11 +401,11 @@ static int sensors_ssc_probe(struct platform_device *pdev)
 
 	ret = cdev_add(sns_ctl.cdev, sns_ctl.dev_num, 1);
 	if (ret) {
-		pr_err("%s: cdev_add fail.\n", __func__);
+		dev_err(&pdev->dev, "%s: cdev_add fail\n", __func__);
 		goto cdev_add_err;
 	}
 
-	INIT_WORK(&slpi_ldr_work, slpi_load_fw);
+	INIT_WORK(&sns_ctl.slpi_ldr_work, slpi_load_fw);
 
 	return 0;
 
@@ -438,7 +417,10 @@ device_create_err:
 	unregister_chrdev_region(sns_ctl.dev_num, 1);
 alloc_chrdev_region_err:
 	class_destroy(sns_ctl.dev_class);
-res_err:
+class_create_err:
+	priv = platform_get_drvdata(pdev);
+	sysfs_remove_group(priv->boot_slpi_obj, priv->attr_group);
+	kobject_del(priv->boot_slpi_obj);
 	return -ENODEV;
 }
 
@@ -457,7 +439,7 @@ static int sensors_ssc_remove(struct platform_device *pdev)
 
 static const struct of_device_id msm_ssc_sensors_dt_match[] = {
 	{.compatible = "qcom,msm-ssc-sensors"},
-	{},
+	{}
 };
 MODULE_DEVICE_TABLE(of, msm_ssc_sensors_dt_match);
 
@@ -469,28 +451,7 @@ static struct platform_driver sensors_ssc_driver = {
 	.probe = sensors_ssc_probe,
 	.remove = sensors_ssc_remove,
 };
+module_platform_driver(sensors_ssc_driver);
 
-static int __init sensors_ssc_init(void)
-{
-	int rc;
-
-	pr_debug("%s driver version %s.\n", DRV_NAME, DRV_VERSION);
-	rc = platform_driver_register(&sensors_ssc_driver);
-	if (rc) {
-		pr_err("%s: Failed to register sensors ssc driver\n",
-			__func__);
-		return rc;
-	}
-
-	return 0;
-}
-
-static void __exit sensors_ssc_exit(void)
-{
-	platform_driver_unregister(&sensors_ssc_driver);
-}
-
-module_init(sensors_ssc_init);
-module_exit(sensors_ssc_exit);
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("Sensors SSC driver");

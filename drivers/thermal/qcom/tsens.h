@@ -1,22 +1,28 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Copyright (c) 2015, 2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2021, 2022, 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2015, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #ifndef __QCOM_TSENS_H__
 #define __QCOM_TSENS_H__
 
+#define NO_PT_CALIB		0x0
 #define ONE_PT_CALIB		0x1
 #define ONE_PT_CALIB2		0x2
 #define TWO_PT_CALIB		0x3
+#define ONE_PT_CALIB2_NO_OFFSET	0x6
+#define TWO_PT_CALIB_NO_OFFSET	0x7
 #define CAL_DEGC_PT1		30
 #define CAL_DEGC_PT2		120
 #define SLOPE_FACTOR		1000
 #define SLOPE_DEFAULT		3200
+#define TIMEOUT_US		100
 #define THRESHOLD_MAX_ADC_CODE	0x3ff
 #define THRESHOLD_MIN_ADC_CODE	0x0
 #define COLD_SENSOR_HW_ID	128
+
+#define MAX_SENSORS 16
 
 #include <linux/interrupt.h>
 #include <linux/thermal.h>
@@ -28,7 +34,8 @@ struct tsens_priv;
 
 /* IP version numbers in ascending order */
 enum tsens_ver {
-	VER_0_1 = 0,
+	VER_0 = 0,
+	VER_0_1,
 	VER_1_X,
 	VER_2_X,
 };
@@ -41,9 +48,43 @@ enum tsens_irq_type {
 };
 
 /**
+ * struct tsens_irq_data - IRQ status and temperature violations
+ * @up_viol:        upper threshold violated
+ * @up_thresh:      upper threshold temperature value
+ * @up_irq_mask:    mask register for upper threshold irqs
+ * @up_irq_clear:   clear register for uppper threshold irqs
+ * @low_viol:       lower threshold violated
+ * @low_thresh:     lower threshold temperature value
+ * @low_irq_mask:   mask register for lower threshold irqs
+ * @low_irq_clear:  clear register for lower threshold irqs
+ * @crit_viol:      critical threshold violated
+ * @crit_thresh:    critical threshold temperature value
+ * @crit_irq_mask:  mask register for critical threshold irqs
+ * @crit_irq_clear: clear register for critical threshold irqs
+ *
+ * Structure containing data about temperature threshold settings and
+ * irq status if they were violated.
+ */
+struct tsens_irq_data {
+	u32 up_viol;
+	int up_thresh;
+	u32 up_irq_mask;
+	u32 up_irq_clear;
+	u32 low_viol;
+	int low_thresh;
+	u32 low_irq_mask;
+	u32 low_irq_clear;
+	u32 crit_viol;
+	u32 crit_thresh;
+	u32 crit_irq_mask;
+	u32 crit_irq_clear;
+};
+
+/**
  * struct tsens_sensor - data for each sensor connected to the tsens device
  * @priv: tsens device instance that this sensor is connected to
  * @tzd: pointer to the thermal zone that this sensor is in
+ * @irq_d: Latest sensor irq and violation status for this sensor
  * @offset: offset of temperature adjustment curve
  * @hw_id: HW ID can be used in case of platform-specific IDs
  * @slope: slope of temperature adjustment curve
@@ -52,11 +93,13 @@ enum tsens_irq_type {
 struct tsens_sensor {
 	struct tsens_priv		*priv;
 	struct thermal_zone_device	*tzd;
+	struct tsens_irq_data		irq_d;
 	int				offset;
 	unsigned int			hw_id;
 	int				slope;
 	u32				status;
-	int				cached_temp;
+	int				p1_calib_offset;
+	int				p2_calib_offset;
 };
 
 /**
@@ -68,8 +111,6 @@ struct tsens_sensor {
  * @disable: Function to disable the tsens device
  * @suspend: Function to suspend the tsens device
  * @resume: Function to resume the tsens device
- * @get_trend: Function to get the thermal/temp trend
- * @get_cold_status: Function to get the cold interrupt status
  */
 struct tsens_ops {
 	/* mandatory callbacks */
@@ -81,7 +122,6 @@ struct tsens_ops {
 	void (*disable)(struct tsens_priv *priv);
 	int (*suspend)(struct tsens_priv *priv);
 	int (*resume)(struct tsens_priv *priv);
-	int (*get_trend)(struct tsens_sensor *s, enum thermal_trend *trend);
 	int (*get_cold_status)(const struct tsens_sensor *s, bool *cold_status);
 };
 
@@ -154,29 +194,18 @@ struct tsens_ops {
 
 #define IPC_LOGPAGES 10
 #define TSENS_DBG(dev, msg, args...) do {		\
-		pr_debug("%s:" msg, __func__, args);	\
 		if ((dev) && (dev)->ipc_log) {		\
 			ipc_log_string((dev)->ipc_log,	\
-			"%s: " msg " [%s]\n",		\
-			__func__, args, current->comm);	\
+			"" msg " [%s]\n",		\
+			args, current->comm);	        \
 		}					\
 	} while (0)
 
-#define TSENS_DBG_1(dev, msg, args...) do {		\
-		pr_debug("%s:" msg, __func__, args);	\
-		if ((dev) && (dev)->ipc_log1) {		\
-			ipc_log_string((dev)->ipc_log1,	\
-			"%s: " msg " [%s]\n",		\
-			__func__, args, current->comm);	\
-		}					\
-	} while (0)
-
-#define TSENS_DBG_2(priv, msg, args...) do {		\
-		dev_dbg((priv)->dev, "%s:" msg, __func__, args);	\
-		if ((priv) && (priv)->ipc_log2) {		\
-			ipc_log_string((priv)->ipc_log2,	\
-			"%s: " msg " [%s]\n",		\
-			__func__, args, current->comm);	\
+#define TSENS_DBG_1(priv, msg, args...) do {		\
+		if ((priv) && (priv)->ipc_log1) {		\
+			ipc_log_string((priv)->ipc_log1,	\
+			"" msg " [%s]\n",		\
+			args, current->comm);		\
 		}					\
 	} while (0)
 
@@ -219,22 +248,6 @@ enum regfield_ids {
 	LAST_TEMP_13,
 	LAST_TEMP_14,
 	LAST_TEMP_15,
-	VALID_0,		/* VALID reading or not */
-	VALID_1,
-	VALID_2,
-	VALID_3,
-	VALID_4,
-	VALID_5,
-	VALID_6,
-	VALID_7,
-	VALID_8,
-	VALID_9,
-	VALID_10,
-	VALID_11,
-	VALID_12,
-	VALID_13,
-	VALID_14,
-	VALID_15,
 	LOWER_STATUS_0,	/* LOWER threshold violated */
 	LOWER_STATUS_1,
 	LOWER_STATUS_2,
@@ -519,6 +532,16 @@ enum regfield_ids {
 	MAX_STATUS_13,
 	MAX_STATUS_14,
 	MAX_STATUS_15,
+
+	/* TEMP PERSIST MAX_MIN data */
+	TEMP_PERSIST_CTRL,
+	TEMP_PERSIST_MAX_TEMP,
+	TEMP_PERSIST_MAX_SENSOR_ID,
+	TEMP_PERSIST_MAX_VALID,
+	TEMP_PERSIST_MIN_TEMP,
+	TEMP_PERSIST_MIN_SENSOR_ID,
+	TEMP_PERSIST_MIN_VALID,
+
 	COLD_STATUS,		/* COLD interrupt status */
 	/* Keep last */
 	MAX_REGFIELDS
@@ -528,21 +551,34 @@ enum regfield_ids {
  * struct tsens_features - Features supported by the IP
  * @ver_major: Major number of IP version
  * @crit_int: does the IP support critical interrupts?
+ * @combo_int: does the IP use one IRQ for up, low and critical thresholds?
  * @adc:      do the sensors only output adc code (instead of temperature)?
  * @srot_split: does the IP neatly splits the register space into SROT and TM,
  *              with SROT only being available to secure boot firmware?
  * @has_watchdog: does this IP support watchdog functionality?
- * @cold_int: does this IP support COLD interrupt ?
  * @max_sensors: maximum sensors supported by this version of the IP
+ * @persist_max_min: does this IP support persist max-min data?
+ * @trip_min_temp: minimum trip temperature supported by this version of the IP
+ * @trip_max_temp: maximum trip temperature supported by this version of the IP
+ * @valid_bit: validate if read temperature is valid or not?
+ * @last_temp_mask: mask register for last temperature
+ * @last_temp_resolution: last temperarure sign bit resolution
  */
 struct tsens_features {
 	unsigned int ver_major;
 	unsigned int crit_int:1;
+	unsigned int combo_int:1;
 	unsigned int adc:1;
 	unsigned int srot_split:1;
 	unsigned int has_watchdog:1;
 	unsigned int cold_int:1;
 	unsigned int max_sensors;
+	unsigned int persist_max_min:1;
+	int trip_min_temp;
+	int trip_max_temp;
+	int valid_bit;
+	int last_temp_mask;
+	u32 last_temp_resolution;
 };
 
 /**
@@ -575,6 +611,7 @@ struct tsens_context {
  * struct tsens_priv - private data for each instance of the tsens IP
  * @dev: pointer to struct device
  * @num_sensors: number of sensors enabled on this device
+ * @ul_irq_cnt: upper lower irq triggered count
  * @tm_map: pointer to TM register address space
  * @srot_map: pointer to SROT register address space
  * @tm_offset: deal with old device trees that don't address TM and SROT
@@ -588,15 +625,15 @@ struct tsens_context {
  * @ops: pointer to list of callbacks supported by this device
  * @debug_root: pointer to debugfs dentry for all tsens
  * @debug: pointer to debugfs dentry for tsens controller
- * @cold_sensor: pointer to cold sensor attached to this device
  * @ipc_log: pointer for first ipc log context id
  * @ipc_log1: pointer for second ipc log context id
- * @ipc_log2: pointer for third ipc log context id
  * @sensor: list of sensors attached to this device
+ * @cold_sensor: pointer to cold sensor attached to this device
  */
 struct tsens_priv {
 	struct device			*dev;
 	u32				num_sensors;
+	u32				ul_irq_cnt;
 	struct regmap			*tm_map;
 	struct regmap			*srot_map;
 	u32				tm_offset;
@@ -610,40 +647,73 @@ struct tsens_priv {
 	const struct reg_field		*fields;
 	const struct tsens_ops		*ops;
 
-	/* add to save irq number to re-use it at runtime */
-	int				uplow_irq;
-	int				crit_irq;
-	int				cold_irq;
-
 	struct dentry			*debug_root;
 	struct dentry			*debug;
-	struct tsens_sensor		*cold_sensor;
 	void				*ipc_log;
 	void				*ipc_log1;
-	void				*ipc_log2;
 
+	struct tsens_sensor		*cold_sensor;
 	struct tsens_sensor		sensor[];
 };
 
+/**
+ * struct tsens_single_value - internal representation of a single field inside nvmem calibration data
+ * @idx: index into the u32 data array
+ * @shift: the shift of the first bit in the value
+ * @blob: index of the data blob to use for this cell
+ */
+struct tsens_single_value {
+	u8 idx;
+	u8 shift;
+	u8 blob;
+};
+
+/**
+ * struct tsens_legacy_calibration_format - description of calibration data used when parsing the legacy nvmem blob
+ * @base_len: the length of the base fields inside calibration data
+ * @base_shift: the shift to be applied to base data
+ * @sp_len: the length of the sN_pM fields inside calibration data
+ * @mode: descriptor of the calibration mode field
+ * @invalid: descriptor of the calibration mode invalid field
+ * @base: descriptors of the base0 and base1 fields
+ * @sp: descriptors of the sN_pM fields
+ */
+struct tsens_legacy_calibration_format {
+	unsigned int base_len;
+	unsigned int base_shift;
+	unsigned int sp_len;
+	/* just two bits */
+	struct tsens_single_value mode;
+	/* on all platforms except 8974 invalid is the third bit of what downstream calls 'mode' */
+	struct tsens_single_value invalid;
+	struct tsens_single_value base[2];
+	struct tsens_single_value sp[][2];
+};
+
 char *qfprom_read(struct device *dev, const char *cname);
+int tsens_read_calibration_legacy(struct tsens_priv *priv,
+				  const struct tsens_legacy_calibration_format *format,
+				  u32 *p1, u32 *p2,
+				  u32 *cdata, u32 *csel);
+int tsens_read_calibration(struct tsens_priv *priv, int shift, u32 *p1, u32 *p2, bool backup);
+int tsens_calibrate_nvmem(struct tsens_priv *priv, int shift);
+int tsens_calibrate_common(struct tsens_priv *priv);
 void compute_intercept_slope(struct tsens_priv *priv, u32 *pt1, u32 *pt2, u32 mode);
 int init_common(struct tsens_priv *priv);
 int get_temp_tsens_valid(const struct tsens_sensor *s, int *temp);
 int get_temp_common(const struct tsens_sensor *s, int *temp);
 int get_cold_int_status(const struct tsens_sensor *s, bool *cold_status);
-int tsens_v2_tsens_suspend(struct tsens_priv *priv);
-int tsens_v2_tsens_resume(struct tsens_priv *priv);
 
 /* TSENS target */
 extern struct tsens_plat_data data_8960;
 
 /* TSENS v0.1 targets */
-extern struct tsens_plat_data data_8916, data_8939, data_8974;
+extern struct tsens_plat_data data_8226, data_8909, data_8916, data_8939, data_8974, data_9607;
 
 /* TSENS v1 targets */
-extern struct tsens_plat_data data_tsens_v1, data_8976, data_8956;
+extern struct tsens_plat_data data_tsens_v1, data_8937, data_8976, data_8956;
 
 /* TSENS v2 targets */
-extern struct tsens_plat_data data_8996, data_tsens_v2;
+extern struct tsens_plat_data data_8996, data_ipq8074, data_tsens_v2;
 
 #endif /* __QCOM_TSENS_H__ */

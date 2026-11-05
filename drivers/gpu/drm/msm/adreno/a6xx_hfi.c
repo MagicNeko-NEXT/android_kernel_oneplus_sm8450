@@ -29,12 +29,14 @@ static int a6xx_hfi_queue_read(struct a6xx_gmu *gmu,
 	struct a6xx_hfi_queue_header *header = queue->header;
 	u32 i, hdr, index = header->read_index;
 
-	if (header->read_index == header->write_index) {
+	if (header->read_index == READ_ONCE(header->write_index)) {
 		header->rx_request = 1;
 		return 0;
 	}
 
 	hdr = queue->data[index];
+
+	queue->history[(queue->history_idx++) % HFI_HISTORY_SZ] = index;
 
 	/*
 	 * If we are to assume that the GMU firmware is in fact a rational actor
@@ -55,7 +57,10 @@ static int a6xx_hfi_queue_read(struct a6xx_gmu *gmu,
 	if (!gmu->legacy)
 		index = ALIGN(index, 4) % header->size;
 
-	header->read_index = index;
+	/* Ensure all memory operations are complete before updating the read index */
+	dma_mb();
+
+	WRITE_ONCE(header->read_index, index);
 	return HFI_HEADER_SIZE(hdr);
 }
 
@@ -67,13 +72,15 @@ static int a6xx_hfi_queue_write(struct a6xx_gmu *gmu,
 
 	spin_lock(&queue->lock);
 
-	space = CIRC_SPACE(header->write_index, header->read_index,
+	space = CIRC_SPACE(header->write_index, READ_ONCE(header->read_index),
 		header->size);
 	if (space < dwords) {
 		header->dropped++;
 		spin_unlock(&queue->lock);
 		return -ENOSPC;
 	}
+
+	queue->history[(queue->history_idx++) % HFI_HISTORY_SZ] = index;
 
 	for (i = 0; i < dwords; i++) {
 		queue->data[index] = data[i];
@@ -86,7 +93,10 @@ static int a6xx_hfi_queue_write(struct a6xx_gmu *gmu,
 			queue->data[index] = 0xfafafafa;
 	}
 
-	header->write_index = index;
+	/* Ensure all memory operations are complete before updating the write index */
+	dma_mb();
+
+	WRITE_ONCE(header->write_index, index);
 	spin_unlock(&queue->lock);
 
 	gmu_write(gmu, REG_A6XX_GMU_HOST2GMU_INTR_SET, 0x01);
@@ -102,7 +112,7 @@ static int a6xx_hfi_wait_for_ack(struct a6xx_gmu *gmu, u32 id, u32 seqnum,
 
 	/* Wait for a response */
 	ret = gmu_poll_timeout(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO, val,
-		val & A6XX_GMU_GMU2HOST_INTR_INFO_MSGQ, 100, 1000000);
+		val & A6XX_GMU_GMU2HOST_INTR_INFO_MSGQ, 100, 5000);
 
 	if (ret) {
 		DRM_DEV_ERROR(gmu->dev,
@@ -201,8 +211,8 @@ static int a6xx_hfi_get_fw_version(struct a6xx_gmu *gmu, u32 *version)
 {
 	struct a6xx_hfi_msg_fw_version msg = { 0 };
 
-	/* Currently supporting version 1.1 */
-	msg.supported_version = (1 << 28) | (1 << 16);
+	/* Currently supporting version 1.10 */
+	msg.supported_version = (1 << 28) | (1 << 19) | (1 << 17);
 
 	return a6xx_hfi_send_msg(gmu, HFI_H2F_MSG_FW_VERSION, &msg, sizeof(msg),
 		version, sizeof(*version));
@@ -281,6 +291,65 @@ static void a618_build_bw_table(struct a6xx_hfi_msg_bw_table *msg)
 	msg->cnoc_cmds_data[1][0] =  0x60000001;
 }
 
+static void a619_build_bw_table(struct a6xx_hfi_msg_bw_table *msg)
+{
+	msg->bw_level_num = 13;
+
+	msg->ddr_cmds_num = 3;
+	msg->ddr_wait_bitmask = 0x0;
+
+	msg->ddr_cmds_addrs[0] = 0x50000;
+	msg->ddr_cmds_addrs[1] = 0x50004;
+	msg->ddr_cmds_addrs[2] = 0x50080;
+
+	msg->ddr_cmds_data[0][0]  = 0x40000000;
+	msg->ddr_cmds_data[0][1]  = 0x40000000;
+	msg->ddr_cmds_data[0][2]  = 0x40000000;
+	msg->ddr_cmds_data[1][0]  = 0x6000030c;
+	msg->ddr_cmds_data[1][1]  = 0x600000db;
+	msg->ddr_cmds_data[1][2]  = 0x60000008;
+	msg->ddr_cmds_data[2][0]  = 0x60000618;
+	msg->ddr_cmds_data[2][1]  = 0x600001b6;
+	msg->ddr_cmds_data[2][2]  = 0x60000008;
+	msg->ddr_cmds_data[3][0]  = 0x60000925;
+	msg->ddr_cmds_data[3][1]  = 0x60000291;
+	msg->ddr_cmds_data[3][2]  = 0x60000008;
+	msg->ddr_cmds_data[4][0]  = 0x60000dc1;
+	msg->ddr_cmds_data[4][1]  = 0x600003dc;
+	msg->ddr_cmds_data[4][2]  = 0x60000008;
+	msg->ddr_cmds_data[5][0]  = 0x600010ad;
+	msg->ddr_cmds_data[5][1]  = 0x600004ae;
+	msg->ddr_cmds_data[5][2]  = 0x60000008;
+	msg->ddr_cmds_data[6][0]  = 0x600014c3;
+	msg->ddr_cmds_data[6][1]  = 0x600005d4;
+	msg->ddr_cmds_data[6][2]  = 0x60000008;
+	msg->ddr_cmds_data[7][0]  = 0x6000176a;
+	msg->ddr_cmds_data[7][1]  = 0x60000693;
+	msg->ddr_cmds_data[7][2]  = 0x60000008;
+	msg->ddr_cmds_data[8][0]  = 0x60001f01;
+	msg->ddr_cmds_data[8][1]  = 0x600008b5;
+	msg->ddr_cmds_data[8][2]  = 0x60000008;
+	msg->ddr_cmds_data[9][0]  = 0x60002940;
+	msg->ddr_cmds_data[9][1]  = 0x60000b95;
+	msg->ddr_cmds_data[9][2]  = 0x60000008;
+	msg->ddr_cmds_data[10][0] = 0x60002f68;
+	msg->ddr_cmds_data[10][1] = 0x60000d50;
+	msg->ddr_cmds_data[10][2] = 0x60000008;
+	msg->ddr_cmds_data[11][0] = 0x60003700;
+	msg->ddr_cmds_data[11][1] = 0x60000f71;
+	msg->ddr_cmds_data[11][2] = 0x60000008;
+	msg->ddr_cmds_data[12][0] = 0x60003fce;
+	msg->ddr_cmds_data[12][1] = 0x600011ea;
+	msg->ddr_cmds_data[12][2] = 0x60000008;
+
+	msg->cnoc_cmds_num = 1;
+	msg->cnoc_wait_bitmask = 0x0;
+
+	msg->cnoc_cmds_addrs[0] = 0x50054;
+
+	msg->cnoc_cmds_data[0][0] = 0x40000000;
+}
+
 static void a640_build_bw_table(struct a6xx_hfi_msg_bw_table *msg)
 {
 	/*
@@ -351,6 +420,98 @@ static void a650_build_bw_table(struct a6xx_hfi_msg_bw_table *msg)
 	msg->cnoc_cmds_data[1][0] =  0x60000001;
 }
 
+static void a690_build_bw_table(struct a6xx_hfi_msg_bw_table *msg)
+{
+	/*
+	 * Send a single "off" entry just to get things running
+	 * TODO: bus scaling
+	 */
+	msg->bw_level_num = 1;
+
+	msg->ddr_cmds_num = 3;
+	msg->ddr_wait_bitmask = 0x01;
+
+	msg->ddr_cmds_addrs[0] = 0x50004;
+	msg->ddr_cmds_addrs[1] = 0x50000;
+	msg->ddr_cmds_addrs[2] = 0x500ac;
+
+	msg->ddr_cmds_data[0][0] =  0x40000000;
+	msg->ddr_cmds_data[0][1] =  0x40000000;
+	msg->ddr_cmds_data[0][2] =  0x40000000;
+
+	/*
+	 * These are the CX (CNOC) votes - these are used by the GMU but the
+	 * votes are known and fixed for the target
+	 */
+	msg->cnoc_cmds_num = 1;
+	msg->cnoc_wait_bitmask = 0x01;
+
+	msg->cnoc_cmds_addrs[0] = 0x5003c;
+	msg->cnoc_cmds_data[0][0] =  0x40000000;
+	msg->cnoc_cmds_data[1][0] =  0x60000001;
+}
+
+static void a660_build_bw_table(struct a6xx_hfi_msg_bw_table *msg)
+{
+	/*
+	 * Send a single "off" entry just to get things running
+	 * TODO: bus scaling
+	 */
+	msg->bw_level_num = 1;
+
+	msg->ddr_cmds_num = 3;
+	msg->ddr_wait_bitmask = 0x01;
+
+	msg->ddr_cmds_addrs[0] = 0x50004;
+	msg->ddr_cmds_addrs[1] = 0x500a0;
+	msg->ddr_cmds_addrs[2] = 0x50000;
+
+	msg->ddr_cmds_data[0][0] =  0x40000000;
+	msg->ddr_cmds_data[0][1] =  0x40000000;
+	msg->ddr_cmds_data[0][2] =  0x40000000;
+
+	/*
+	 * These are the CX (CNOC) votes - these are used by the GMU but the
+	 * votes are known and fixed for the target
+	 */
+	msg->cnoc_cmds_num = 1;
+	msg->cnoc_wait_bitmask = 0x01;
+
+	msg->cnoc_cmds_addrs[0] = 0x50070;
+	msg->cnoc_cmds_data[0][0] =  0x40000000;
+	msg->cnoc_cmds_data[1][0] =  0x60000001;
+}
+
+static void adreno_7c3_build_bw_table(struct a6xx_hfi_msg_bw_table *msg)
+{
+	/*
+	 * Send a single "off" entry just to get things running
+	 * TODO: bus scaling
+	 */
+	msg->bw_level_num = 1;
+
+	msg->ddr_cmds_num = 3;
+	msg->ddr_wait_bitmask = 0x07;
+
+	msg->ddr_cmds_addrs[0] = 0x50004;
+	msg->ddr_cmds_addrs[1] = 0x50000;
+	msg->ddr_cmds_addrs[2] = 0x50088;
+
+	msg->ddr_cmds_data[0][0] =  0x40000000;
+	msg->ddr_cmds_data[0][1] =  0x40000000;
+	msg->ddr_cmds_data[0][2] =  0x40000000;
+
+	/*
+	 * These are the CX (CNOC) votes - these are used by the GMU but the
+	 * votes are known and fixed for the target
+	 */
+	msg->cnoc_cmds_num = 1;
+	msg->cnoc_wait_bitmask = 0x01;
+
+	msg->cnoc_cmds_addrs[0] = 0x5006c;
+	msg->cnoc_cmds_data[0][0] =  0x40000000;
+	msg->cnoc_cmds_data[1][0] =  0x60000001;
+}
 static void a6xx_build_bw_table(struct a6xx_hfi_msg_bw_table *msg)
 {
 	/* Send a single "off" entry since the 630 GMU doesn't do bus scaling */
@@ -397,10 +558,18 @@ static int a6xx_hfi_send_bw_table(struct a6xx_gmu *gmu)
 
 	if (adreno_is_a618(adreno_gpu))
 		a618_build_bw_table(&msg);
-	else if (adreno_is_a640(adreno_gpu))
+	else if (adreno_is_a619(adreno_gpu))
+		a619_build_bw_table(&msg);
+	else if (adreno_is_a640_family(adreno_gpu))
 		a640_build_bw_table(&msg);
 	else if (adreno_is_a650(adreno_gpu))
 		a650_build_bw_table(&msg);
+	else if (adreno_is_7c3(adreno_gpu))
+		adreno_7c3_build_bw_table(&msg);
+	else if (adreno_is_a660(adreno_gpu))
+		a660_build_bw_table(&msg);
+	else if (adreno_is_a690(adreno_gpu))
+		a690_build_bw_table(&msg);
 	else
 		a6xx_build_bw_table(&msg);
 
@@ -535,6 +704,9 @@ void a6xx_hfi_stop(struct a6xx_gmu *gmu)
 
 		queue->header->read_index = 0;
 		queue->header->write_index = 0;
+
+		memset(&queue->history, 0xff, sizeof(queue->history));
+		queue->history_idx = 0;
 	}
 }
 
@@ -546,6 +718,9 @@ static void a6xx_hfi_queue_init(struct a6xx_hfi_queue *queue,
 	queue->header = header;
 	queue->data = virt;
 	atomic_set(&queue->seqnum, 0);
+
+	memset(&queue->history, 0xff, sizeof(queue->history));
+	queue->history_idx = 0;
 
 	/* Set up the shared memory header */
 	header->iova = iova;

@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ */
 
 #include <linux/device.h>
 #include <linux/module.h>
@@ -151,4 +154,4 @@ static struct platform_driver qfprom_sys_driver = {
 
 module_platform_driver(qfprom_sys_driver);
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. QFPROM_SYS driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2022, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022, 2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/clk-provider.h>
@@ -724,4 +724,4 @@ static void __exit gpu_cc_parrot_exit(void)
 module_exit(gpu_cc_parrot_exit);
 
 MODULE_DESCRIPTION("QTI GPU_CC PARROT Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

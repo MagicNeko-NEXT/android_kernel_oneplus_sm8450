@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  */
 
@@ -25,11 +26,12 @@ int gh_arch_validate_vm_exited_notif(size_t payload_size,
 	case GH_RM_VM_EXIT_TYPE_PSCI_SYSTEM_RESET2:
 		if (payload_size !=
 		    sizeof(*vm_exited_payload) + sizeof(struct gh_vm_exit_reason_psci_sys_reset2)) {
-			pr_err("%s: Invalid size for type PSCI_SYSTEM_RESET2: %u\n",
+			pr_err("%s: Invalid size for type PSCI_SYSTEM_RESET2: %lu\n",
 			__func__, payload_size);
 			return -EINVAL;
 		}
 		vm_exited_payload->exit_type = GH_RM_VM_EXIT_TYPE_SYSTEM_RESET;
+		fallthrough;
 	case GH_RM_VM_EXIT_TYPE_PSCI_SYSTEM_RESET:
 		vm_exited_payload->exit_type = GH_RM_VM_EXIT_TYPE_SYSTEM_RESET;
 		break;
@@ -42,5 +44,5 @@ int gh_arch_validate_vm_exited_notif(size_t payload_size,
 
 	return 0;
 }
-EXPORT_SYMBOL(gh_arch_validate_vm_exited_notif);
+EXPORT_SYMBOL_GPL(gh_arch_validate_vm_exited_notif);
 

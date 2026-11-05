@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2012-2018, 2020, The Linux Foundation. All rights reserved. */
+/*
+ * Copyright (c) 2012-2018, 2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ */
 
 #include <linux/clk.h>
 #include <linux/delay.h>
@@ -274,13 +277,12 @@ static int spmi_pmic_arb_debug_probe(struct platform_device *pdev)
 			return -EINVAL;
 		}
 
-		fuse_addr = devm_ioremap(&pdev->dev, res->start,
-					 resource_size(res));
-		if (IS_ERR(fuse_addr))
-			return PTR_ERR(fuse_addr);
+		fuse_addr = ioremap(res->start, resource_size(res));
+		if (!fuse_addr)
+			return -EINVAL;
 
 		fuse_val = readl_relaxed(fuse_addr);
-		devm_iounmap(&pdev->dev, fuse_addr);
+		iounmap(fuse_addr);
 
 		if (!!(fuse_val & BIT(fuse_bit)) == is_disable_fuse) {
 			dev_err(&pdev->dev, "SPMI PMIC arbiter debug bus disabled by fuse\n");
@@ -366,5 +368,5 @@ static struct platform_driver spmi_pmic_arb_debug_driver = {
 
 module_platform_driver(spmi_pmic_arb_debug_driver);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_ALIAS("platform:spmi_pmic_arb_debug");

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Copyright (c) 2012-2015,2017,2020 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2015,2017-2021 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef _IPC_LOGGING_H
@@ -200,7 +201,7 @@ void tsv_byte_array_read(struct encode_context *ectxt,
 
 /*
  * add_deserialization_func: Register a deserialization function to
- *                           to unpack the subevents of a main event
+ *                           unpack the subevents of a main event
  *
  * @ctxt: Debug log context to which the deserialization function has
  *        to be registered

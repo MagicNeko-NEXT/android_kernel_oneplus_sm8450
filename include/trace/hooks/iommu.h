@@ -7,41 +7,57 @@
 #if !defined(_TRACE_HOOK_IOMMU_H) || defined(TRACE_HEADER_MULTI_READ)
 #define _TRACE_HOOK_IOMMU_H
 
-#include <linux/types.h>
-
-#include <linux/tracepoint.h>
 #include <trace/hooks/vendor_hooks.h>
 
-#ifdef __GENKSYMS__
-struct iova_domain;
-#else
-/* struct iova_domain */
-#include <linux/iova.h>
-#endif /* __GENKSYMS__ */
 DECLARE_RESTRICTED_HOOK(android_rvh_iommu_setup_dma_ops,
-	TP_PROTO(struct device *dev, u64 dma_base, u64 size),
-	TP_ARGS(dev, dma_base, size), 1);
+	TP_PROTO(struct device *dev, u64 dma_base, u64 dma_limit),
+	TP_ARGS(dev, dma_base, dma_limit), 1);
 
-DECLARE_HOOK(android_vh_iommu_setup_dma_ops,
-	TP_PROTO(struct device *dev, u64 dma_base, u64 size),
-	TP_ARGS(dev, dma_base, size));
+struct iova_domain;
+struct iova;
 
-DECLARE_HOOK(android_vh_iommu_alloc_iova,
-	TP_PROTO(struct device *dev, dma_addr_t iova, size_t size),
-	TP_ARGS(dev, iova, size));
+#if !IS_ENABLED(CONFIG_QTVM_IOMMU_TRACE_HOOKS)
+DECLARE_RESTRICTED_HOOK(android_rvh_iommu_alloc_insert_iova,
+	TP_PROTO(struct iova_domain *iovad, unsigned long size,
+		unsigned long limit_pfn, struct iova *new_iova,
+		bool size_aligned, int *ret),
+	TP_ARGS(iovad, size, limit_pfn, new_iova, size_aligned, ret),
+	1);
+#else
+void trace_android_rvh_iommu_alloc_insert_iova(
+		struct iova_domain *iovad, unsigned long size,
+		unsigned long limit_pfn, struct iova *new,
+		bool size_aligned, int *ret);
+#endif
 
+DECLARE_RESTRICTED_HOOK(android_rvh_iommu_dma_info_to_prot,
+	TP_PROTO(unsigned long attrs, int *prot),
+	TP_ARGS(attrs, prot), 1);
 
 DECLARE_HOOK(android_vh_iommu_iovad_alloc_iova,
 	TP_PROTO(struct device *dev, struct iova_domain *iovad, dma_addr_t iova, size_t size),
 	TP_ARGS(dev, iovad, iova, size));
 
-DECLARE_HOOK(android_vh_iommu_free_iova,
-	TP_PROTO(dma_addr_t iova, size_t size),
-	TP_ARGS(iova, size));
-
 DECLARE_HOOK(android_vh_iommu_iovad_free_iova,
 	TP_PROTO(struct iova_domain *iovad, dma_addr_t iova, size_t size),
 	TP_ARGS(iovad, iova, size));
+
+#if !IS_ENABLED(CONFIG_QTVM_IOMMU_TRACE_HOOKS)
+DECLARE_RESTRICTED_HOOK(android_rvh_iommu_iovad_init_alloc_algo,
+	TP_PROTO(struct device *dev, struct iova_domain *iovad),
+	TP_ARGS(dev, iovad), 1);
+
+DECLARE_RESTRICTED_HOOK(android_rvh_iommu_limit_align_shift,
+	TP_PROTO(struct iova_domain *iovad, unsigned long size,
+		unsigned long *shift),
+	TP_ARGS(iovad, size, shift), 1);
+#else
+void trace_android_rvh_iommu_iovad_init_alloc_algo(
+		struct device *dev, struct iova_domain *iovad);
+void trace_android_rvh_iommu_limit_align_shift(
+		struct iova_domain *iovad, unsigned long size,
+		unsigned long *shift);
+#endif
 
 DECLARE_HOOK(android_vh_adjust_alloc_flags,
 	TP_PROTO(unsigned int order, gfp_t *alloc_flags),

@@ -1,18 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2015-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  *
  */
 
+#include <linux/bitfield.h>
 #include <linux/dma-mapping.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
+#include <linux/qcom-dma-mapping.h>
 #include <linux/qcom-iommu-util.h>
 #include "qcom-iommu-debug.h"
 
+#ifdef CONFIG_64BIT
 #define kstrtoux kstrtou64
 #define kstrtox_from_user kstrtoull_from_user
 #define kstrtosize_t kstrtoul
+#else
+#define kstrtoux kstrtou32
+#define kstrtox_from_user kstrtouint_from_user
+#define kstrtosize_t kstrtouint
+#endif
 
 static void *test_virt_addr;
 static DEFINE_MUTEX(test_virt_addr_lock);
@@ -156,7 +165,7 @@ static ssize_t iommu_debug_map_write(struct file *file, const char __user *ubuf,
 		return -EINVAL;
 	}
 
-	ret = iommu_map(ddev->domain, iova, phys, size, prot);
+	ret = iommu_map(ddev->domain, iova, phys, size, prot, GFP_KERNEL);
 	if (ret) {
 		pr_err_ratelimited("iommu_map failed with %d\n", ret);
 		retval = -EIO;
@@ -328,7 +337,7 @@ static ssize_t iommu_debug_dma_map_write(struct file *file,
 	else if (attr == 2)
 		dma_attrs = DMA_ATTR_FORCE_NON_COHERENT;
 	else if (attr == 3)
-		dma_attrs = DMA_ATTR_SYS_CACHE_ONLY;
+		dma_attrs = DMA_ATTR_SYS_CACHE;
 	else
 		goto invalid_format;
 
@@ -446,7 +455,7 @@ static ssize_t iommu_debug_dma_unmap_write(struct file *file, const char __user 
 	else if (attr == 2)
 		dma_attrs = DMA_ATTR_FORCE_NON_COHERENT;
 	else if (attr == 3)
-		dma_attrs = DMA_ATTR_SYS_CACHE_ONLY;
+		dma_attrs = DMA_ATTR_SYS_CACHE;
 	else
 		goto invalid_format;
 
@@ -484,7 +493,7 @@ static int iommu_debug_build_phoney_sg_table(struct device *dev,
 	int i, j;
 	struct page *page;
 
-	if (!IS_ALIGNED(total_size, PAGE_SIZE))
+	if (!IS_ALIGNED(total_size, SZ_4K))
 		return -EINVAL;
 	if (!IS_ALIGNED(total_size, chunk_size))
 		return -EINVAL;
@@ -785,6 +794,7 @@ static int __full_va_sweep(struct device *dev, struct seq_file *s,
 			   struct iommu_domain *domain, void *priv)
 {
 	u64 iova;
+	int nr_maps = 0;
 	dma_addr_t dma_addr;
 	void *virt;
 	phys_addr_t phys;
@@ -817,8 +827,12 @@ static int __full_va_sweep(struct device *dev, struct seq_file *s,
 			dev_err_ratelimited(dev, "Unexpected iova on iter %d (expected: 0x%lx got: 0x%lx)\n",
 					    i, expected, (unsigned long)dma_addr);
 			ret = -EINVAL;
+			if (!dma_mapping_error(dev, dma_addr))
+				dma_unmap_single(dev, dma_addr, size,
+					DMA_TO_DEVICE);
 			goto out;
 		}
+		nr_maps++;
 	}
 
 	if (domain) {
@@ -859,7 +873,7 @@ static int __full_va_sweep(struct device *dev, struct seq_file *s,
 	}
 
 out:
-	for (iova = 0; iova < max; iova += size) {
+	for (iova = 0; iova < max && nr_maps--; iova += size) {
 		if (iova == MSI_IOVA_BASE) {
 			iova = MSI_IOVA_BASE + MSI_IOVA_LENGTH - size;
 			continue;
@@ -875,7 +889,9 @@ static int __tlb_stress_sweep(struct device *dev, struct seq_file *s,
 			      struct iommu_domain *domain, void *unused)
 {
 	int i, ret = 0;
+	int nr_maps = 0;
 	u64 iova;
+	u64 first_iova = 0;
 	const u64  max = SZ_1G * 4ULL - 1;
 	void *virt;
 	phys_addr_t phys;
@@ -900,7 +916,13 @@ static int __tlb_stress_sweep(struct device *dev, struct seq_file *s,
 			dev_err_ratelimited(dev, "Failed map on iter %d\n", i);
 			ret = -EINVAL;
 			goto out;
+		} else if (dma_addr != iova) {
+			dma_unmap_single(dev, dma_addr, SZ_8K, DMA_TO_DEVICE);
+			dev_err_ratelimited(dev, "Failed map on iter %d\n", i);
+			ret = -EINVAL;
+			goto out;
 		}
+		nr_maps++;
 	}
 
 	if (dma_map_single(dev, virt, SZ_4K, DMA_TO_DEVICE) != DMA_MAPPING_ERROR) {
@@ -913,6 +935,11 @@ static int __tlb_stress_sweep(struct device *dev, struct seq_file *s,
 	 * free up 4K at the very beginning, then leave one 4K mapping,
 	 * then free up 8K.  This will result in the next 8K map to skip
 	 * over the 4K hole and take the 8K one.
+	 * i.e
+	 *	 0K..4K	  Hole
+	 *	 4K..8K	  Map R1
+	 *	 8K..12K  Hole
+	 *	12K..4G   Map R2
 	 */
 	dma_unmap_single(dev, 0, SZ_4K, DMA_TO_DEVICE);
 	dma_unmap_single(dev, SZ_8K, SZ_4K, DMA_TO_DEVICE);
@@ -925,12 +952,23 @@ static int __tlb_stress_sweep(struct device *dev, struct seq_file *s,
 
 		dev_err_ratelimited(dev, "Unexpected dma_addr. got: %pa expected: %pa\n",
 				    &dma_addr, &expected);
+
+		/* To simplify error handling, unmap the 4K regions (4K..8K
+		 * and 12K..16K) here and the rest (16K..4G) in 8K increments
+		 * in the for loop.
+		 */
+		dma_unmap_single(dev, SZ_4K, SZ_4K, DMA_TO_DEVICE);
+		dma_unmap_single(dev, SZ_8K+SZ_4K, SZ_4K, DMA_TO_DEVICE);
+		nr_maps -= 2;
+		first_iova = SZ_8K + SZ_8K;
+
 		ret = -EINVAL;
 		goto out;
 	}
 
 	/*
-	 * now remap 4K.  We should get the first 4K chunk that was skipped
+	 * Now we have 0..4K hole and 4K..4G mapped.
+	 * Remap 4K.  We should get the first 4K chunk that was skipped
 	 * over during the previous 8K map.  If we missed a TLB invalidate
 	 * at that point this should explode.
 	 */
@@ -940,9 +978,17 @@ static int __tlb_stress_sweep(struct device *dev, struct seq_file *s,
 
 		dev_err_ratelimited(dev, "Unexpected dma_addr. got: %pa expected: %pa\n",
 				    &dma_addr, &expected);
+		/* To simplify error handling, unmap the 4K region (4K..8K)
+		 * here and rest (8K..4G) in 8K increments in the for loop.
+		 */
+		dma_unmap_single(dev, SZ_4K, SZ_4K, DMA_TO_DEVICE);
+		first_iova = SZ_8K;
+		nr_maps -= 1;
 		ret = -EINVAL;
 		goto out;
 	}
+
+	first_iova = 0;
 
 	if (dma_map_single(dev, virt, SZ_4K, DMA_TO_DEVICE) != DMA_MAPPING_ERROR) {
 		dev_err_ratelimited(dev, "dma_map_single unexpectedly after remaps (VA should have been exhausted)\n");
@@ -950,8 +996,9 @@ static int __tlb_stress_sweep(struct device *dev, struct seq_file *s,
 		goto out;
 	}
 
+out:
 	/* we're all full again. unmap everything. */
-	for (iova = 0; iova < max; iova += SZ_8K) {
+	for (iova = first_iova; iova < max && nr_maps--; iova += SZ_8K) {
 		if (iova == MSI_IOVA_BASE) {
 			iova = MSI_IOVA_BASE + MSI_IOVA_LENGTH - SZ_8K;
 			continue;
@@ -959,7 +1006,6 @@ static int __tlb_stress_sweep(struct device *dev, struct seq_file *s,
 		dma_unmap_single(dev, (dma_addr_t)iova, SZ_8K, DMA_TO_DEVICE);
 	}
 
-out:
 	free_pages((unsigned long)virt, get_order(SZ_8K));
 	return ret;
 }
@@ -992,6 +1038,7 @@ static int __rand_va_sweep(struct device *dev, struct seq_file *s,
 	u64 iova;
 	const u64 max = SZ_1G * 4ULL - 1;
 	int i, remapped, unmapped, ret = 0;
+	int nr_maps = 0;
 	void *virt;
 	dma_addr_t dma_addr, dma_addr2;
 	struct fib_state fib;
@@ -1019,7 +1066,14 @@ static int __rand_va_sweep(struct device *dev, struct seq_file *s,
 			dev_err_ratelimited(dev, "Failed map on iter %d\n", i);
 			ret = -EINVAL;
 			goto out;
+		} else if (dma_addr != iova) {
+			dma_unmap_single(dev, dma_addr, size, DMA_TO_DEVICE);
+			dev_err_ratelimited(dev, "Unexpected dma_addr. got: %lx, expected: %lx\n",
+				(unsigned long)dma_addr, (unsigned long)iova);
+			ret = -EINVAL;
+			goto out;
 		}
+		nr_maps++;
 	}
 
 	/* now unmap "random" iovas */
@@ -1058,7 +1112,8 @@ static int __rand_va_sweep(struct device *dev, struct seq_file *s,
 		ret = -EINVAL;
 	}
 
-	for (iova = 0; iova < max; iova += size) {
+out:
+	for (iova = 0; iova < max && nr_maps--; iova += size) {
 		if (iova == MSI_IOVA_BASE) {
 			iova = MSI_IOVA_BASE + MSI_IOVA_LENGTH - size;
 			continue;
@@ -1066,7 +1121,6 @@ static int __rand_va_sweep(struct device *dev, struct seq_file *s,
 		dma_unmap_single(dev, (dma_addr_t)iova, size, DMA_TO_DEVICE);
 	}
 
-out:
 	free_pages((unsigned long)virt, get_order(size));
 	return ret;
 }
@@ -1149,6 +1203,22 @@ static int iommu_debug_functional_fast_dma_api_show(struct seq_file *s,
 						    void *ignored)
 {
 	int ret = 0;
+	struct iommu_debug_device *ddev = s->private;
+
+	if (!ddev->test_dev) {
+		pr_err("%s:Have you selected a uscase?\n", __func__);
+		return -EINVAL;
+	}
+
+	if (!ddev->fastmap_usecase) {
+		ps_printf(dev_name(ddev->test_dev), s,
+			"Not a fastmap usecase\n");
+		return 0;
+	} else if (!IS_ENABLED(CONFIG_IOMMU_IO_PGTABLE_FAST)) {
+		ps_printf(dev_name(ddev->test_dev), s,
+			"CONFIG_IOMMU_IO_PGTABLE_FAST not enabled\n");
+		return 0;
+	}
 
 	ret |= __apply_to_new_mapping(s, __functional_dma_api_alloc_test, NULL);
 	ret |= __apply_to_new_mapping(s, __functional_dma_api_basic_test, NULL);
@@ -1200,6 +1270,25 @@ const struct file_operations iommu_debug_test_virt_addr_fops = {
 	.read	= iommu_debug_test_virt_addr_read,
 };
 
+#ifdef CONFIG_IOMMU_IOVA_ALIGNMENT
+static unsigned long iommu_debug_get_align_mask(size_t size)
+{
+	unsigned long align_mask = ~0UL;
+
+	align_mask <<= min_t(unsigned long, CONFIG_IOMMU_IOVA_ALIGNMENT + PAGE_SHIFT,
+			     fls_long(size - 1));
+	return ~align_mask;
+}
+#else
+static unsigned long iommu_debug_get_align_mask(size_t size)
+{
+	unsigned long align_mask = ~0UL;
+
+	align_mask <<= fls_long(size - 1);
+	return ~align_mask;
+}
+#endif
+
 static void iommu_debug_device_profiling(struct seq_file *s, struct iommu_debug_device *ddev,
 					 const size_t sizes[])
 {
@@ -1226,22 +1315,13 @@ static void iommu_debug_device_profiling(struct seq_file *s, struct iommu_debug_
 		u32 map_elapsed_rem = 0, unmap_elapsed_rem = 0;
 		ktime_t tbefore, tafter, diff;
 		int i;
-		unsigned long align_mask = ~0UL;
-
-		if (IS_ENABLED(CONFIG_IOMMU_LIMIT_IOVA_ALIGNMENT))
-			align_mask <<= min_t(unsigned long,
-					     CONFIG_IOMMU_IOVA_ALIGNMENT +
-					     PAGE_SHIFT, fls_long(size - 1));
-		else
-			align_mask <<= fls_long(size - 1);
-
-		align_mask = ~align_mask;
+		unsigned long align_mask = iommu_debug_get_align_mask(size);
 
 		for (i = 0; i < ddev->nr_iters; ++i) {
 			tbefore = ktime_get();
 			if (iommu_map(domain, __ALIGN_MASK(iova, align_mask),
 				      ALIGN(paddr, size), size,
-				      IOMMU_READ | IOMMU_WRITE)) {
+				      IOMMU_READ | IOMMU_WRITE, GFP_KERNEL)) {
 				seq_puts(s, "Failed to map\n");
 				continue;
 			}
@@ -1288,16 +1368,7 @@ static void iommu_debug_device_profiling(struct seq_file *s, struct iommu_debug_
 		struct sg_table table;
 		unsigned long chunk_size = SZ_4K;
 		int i;
-		unsigned long align_mask = ~0UL;
-
-		if (IS_ENABLED(CONFIG_IOMMU_LIMIT_IOVA_ALIGNMENT))
-			align_mask <<= min_t(unsigned long,
-					     CONFIG_IOMMU_IOVA_ALIGNMENT +
-					     PAGE_SHIFT, fls_long(size - 1));
-		else
-			align_mask <<= fls_long(size - 1);
-
-		align_mask = ~align_mask;
+		unsigned long align_mask = iommu_debug_get_align_mask(size);
 
 		if (iommu_debug_build_phoney_sg_table(dev, &table, size,
 						      chunk_size)) {
@@ -1307,10 +1378,8 @@ static void iommu_debug_device_profiling(struct seq_file *s, struct iommu_debug_
 
 		for (i = 0; i < ddev->nr_iters; ++i) {
 			tbefore = ktime_get();
-			if (iommu_map_sg(domain, __ALIGN_MASK(iova, align_mask),
-					 table.sgl, table.nents,
-					 IOMMU_READ | IOMMU_WRITE)
-			    != size) {
+			if (iommu_map_sgtable(domain, __ALIGN_MASK(iova, align_mask),
+					      &table, IOMMU_READ | IOMMU_WRITE) != size) {
 				seq_puts(s, "Failed to map_sg\n");
 				goto next;
 			}

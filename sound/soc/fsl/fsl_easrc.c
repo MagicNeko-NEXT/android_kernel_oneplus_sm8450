@@ -52,10 +52,16 @@ static int fsl_easrc_iec958_put_bits(struct snd_kcontrol *kcontrol,
 	struct soc_mreg_control *mc =
 		(struct soc_mreg_control *)kcontrol->private_value;
 	unsigned int regval = ucontrol->value.integer.value[0];
+	int ret;
+
+	if (regval < EASRC_WIDTH_16_BIT || regval > EASRC_WIDTH_24_BIT)
+		return -EINVAL;
+
+	ret = (easrc_priv->bps_iec958[mc->regbase] != regval);
 
 	easrc_priv->bps_iec958[mc->regbase] = regval;
 
-	return 0;
+	return ret;
 }
 
 static int fsl_easrc_iec958_get_bits(struct snd_kcontrol *kcontrol,
@@ -67,8 +73,16 @@ static int fsl_easrc_iec958_get_bits(struct snd_kcontrol *kcontrol,
 	struct soc_mreg_control *mc =
 		(struct soc_mreg_control *)kcontrol->private_value;
 
-	ucontrol->value.enumerated.item[0] = easrc_priv->bps_iec958[mc->regbase];
+	ucontrol->value.integer.value[0] = easrc_priv->bps_iec958[mc->regbase];
 
+	return 0;
+}
+
+static int fsl_easrc_iec958_info(struct snd_kcontrol *kcontrol,
+				 struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_IEC958;
+	uinfo->count = 1;
 	return 0;
 }
 
@@ -78,11 +92,33 @@ static int fsl_easrc_get_reg(struct snd_kcontrol *kcontrol,
 	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
 	struct soc_mreg_control *mc =
 		(struct soc_mreg_control *)kcontrol->private_value;
-	unsigned int regval;
+	struct fsl_asrc *easrc = snd_soc_component_get_drvdata(component);
+	unsigned int *regval = (unsigned int *)ucontrol->value.iec958.status;
+	int ret;
 
-	regval = snd_soc_component_read(component, mc->regbase);
+	ret = regmap_read(easrc->regmap, REG_EASRC_CS0(mc->regbase), &regval[0]);
+	if (ret)
+		return ret;
 
-	ucontrol->value.integer.value[0] = regval;
+	ret = regmap_read(easrc->regmap, REG_EASRC_CS1(mc->regbase), &regval[1]);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(easrc->regmap, REG_EASRC_CS2(mc->regbase), &regval[2]);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(easrc->regmap, REG_EASRC_CS3(mc->regbase), &regval[3]);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(easrc->regmap, REG_EASRC_CS4(mc->regbase), &regval[4]);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(easrc->regmap, REG_EASRC_CS5(mc->regbase), &regval[5]);
+	if (ret)
+		return ret;
 
 	return 0;
 }
@@ -93,20 +129,63 @@ static int fsl_easrc_set_reg(struct snd_kcontrol *kcontrol,
 	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
 	struct soc_mreg_control *mc =
 		(struct soc_mreg_control *)kcontrol->private_value;
-	unsigned int regval = ucontrol->value.integer.value[0];
+	struct fsl_asrc *easrc = snd_soc_component_get_drvdata(component);
+	unsigned int *regval = (unsigned int *)ucontrol->value.iec958.status;
+	bool changed, changed_all = false;
 	int ret;
 
-	ret = snd_soc_component_write(component, mc->regbase, regval);
-	if (ret < 0)
+	ret = pm_runtime_resume_and_get(component->dev);
+	if (ret)
 		return ret;
 
-	return 0;
+	ret = regmap_update_bits_check(easrc->regmap, REG_EASRC_CS0(mc->regbase),
+				       GENMASK(31, 0), regval[0], &changed);
+	if (ret != 0)
+		goto err;
+	changed_all |= changed;
+
+	ret = regmap_update_bits_check(easrc->regmap, REG_EASRC_CS1(mc->regbase),
+				       GENMASK(31, 0), regval[1], &changed);
+	if (ret != 0)
+		goto err;
+	changed_all |= changed;
+
+	ret = regmap_update_bits_check(easrc->regmap, REG_EASRC_CS2(mc->regbase),
+				       GENMASK(31, 0), regval[2], &changed);
+	if (ret != 0)
+		goto err;
+	changed_all |= changed;
+
+	ret = regmap_update_bits_check(easrc->regmap, REG_EASRC_CS3(mc->regbase),
+				       GENMASK(31, 0), regval[3], &changed);
+	if (ret != 0)
+		goto err;
+	changed_all |= changed;
+
+	ret = regmap_update_bits_check(easrc->regmap, REG_EASRC_CS4(mc->regbase),
+				       GENMASK(31, 0), regval[4], &changed);
+	if (ret != 0)
+		goto err;
+	changed_all |= changed;
+
+	ret = regmap_update_bits_check(easrc->regmap, REG_EASRC_CS5(mc->regbase),
+				       GENMASK(31, 0), regval[5], &changed);
+	if (ret != 0)
+		goto err;
+	changed_all |= changed;
+err:
+	pm_runtime_put_autosuspend(component->dev);
+
+	if (ret != 0)
+		return ret;
+	else
+		return changed_all;
 }
 
 #define SOC_SINGLE_REG_RW(xname, xreg) \
 {	.iface = SNDRV_CTL_ELEM_IFACE_PCM, .name = (xname), \
 	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE, \
-	.info = snd_soc_info_xr_sx, .get = fsl_easrc_get_reg, \
+	.info = fsl_easrc_iec958_info, .get = fsl_easrc_get_reg, \
 	.put = fsl_easrc_set_reg, \
 	.private_value = (unsigned long)&(struct soc_mreg_control) \
 		{ .regbase = xreg, .regcount = 1, .nbits = 32, \
@@ -137,30 +216,10 @@ static const struct snd_kcontrol_new fsl_easrc_snd_controls[] = {
 	SOC_SINGLE_VAL_RW("Context 2 IEC958 Bits Per Sample", 2),
 	SOC_SINGLE_VAL_RW("Context 3 IEC958 Bits Per Sample", 3),
 
-	SOC_SINGLE_REG_RW("Context 0 IEC958 CS0", REG_EASRC_CS0(0)),
-	SOC_SINGLE_REG_RW("Context 1 IEC958 CS0", REG_EASRC_CS0(1)),
-	SOC_SINGLE_REG_RW("Context 2 IEC958 CS0", REG_EASRC_CS0(2)),
-	SOC_SINGLE_REG_RW("Context 3 IEC958 CS0", REG_EASRC_CS0(3)),
-	SOC_SINGLE_REG_RW("Context 0 IEC958 CS1", REG_EASRC_CS1(0)),
-	SOC_SINGLE_REG_RW("Context 1 IEC958 CS1", REG_EASRC_CS1(1)),
-	SOC_SINGLE_REG_RW("Context 2 IEC958 CS1", REG_EASRC_CS1(2)),
-	SOC_SINGLE_REG_RW("Context 3 IEC958 CS1", REG_EASRC_CS1(3)),
-	SOC_SINGLE_REG_RW("Context 0 IEC958 CS2", REG_EASRC_CS2(0)),
-	SOC_SINGLE_REG_RW("Context 1 IEC958 CS2", REG_EASRC_CS2(1)),
-	SOC_SINGLE_REG_RW("Context 2 IEC958 CS2", REG_EASRC_CS2(2)),
-	SOC_SINGLE_REG_RW("Context 3 IEC958 CS2", REG_EASRC_CS2(3)),
-	SOC_SINGLE_REG_RW("Context 0 IEC958 CS3", REG_EASRC_CS3(0)),
-	SOC_SINGLE_REG_RW("Context 1 IEC958 CS3", REG_EASRC_CS3(1)),
-	SOC_SINGLE_REG_RW("Context 2 IEC958 CS3", REG_EASRC_CS3(2)),
-	SOC_SINGLE_REG_RW("Context 3 IEC958 CS3", REG_EASRC_CS3(3)),
-	SOC_SINGLE_REG_RW("Context 0 IEC958 CS4", REG_EASRC_CS4(0)),
-	SOC_SINGLE_REG_RW("Context 1 IEC958 CS4", REG_EASRC_CS4(1)),
-	SOC_SINGLE_REG_RW("Context 2 IEC958 CS4", REG_EASRC_CS4(2)),
-	SOC_SINGLE_REG_RW("Context 3 IEC958 CS4", REG_EASRC_CS4(3)),
-	SOC_SINGLE_REG_RW("Context 0 IEC958 CS5", REG_EASRC_CS5(0)),
-	SOC_SINGLE_REG_RW("Context 1 IEC958 CS5", REG_EASRC_CS5(1)),
-	SOC_SINGLE_REG_RW("Context 2 IEC958 CS5", REG_EASRC_CS5(2)),
-	SOC_SINGLE_REG_RW("Context 3 IEC958 CS5", REG_EASRC_CS5(3)),
+	SOC_SINGLE_REG_RW("Context 0 IEC958 CS", 0),
+	SOC_SINGLE_REG_RW("Context 1 IEC958 CS", 1),
+	SOC_SINGLE_REG_RW("Context 2 IEC958 CS", 2),
+	SOC_SINGLE_REG_RW("Context 3 IEC958 CS", 3),
 };
 
 /*
@@ -380,7 +439,7 @@ static int fsl_easrc_resampler_config(struct fsl_asrc *easrc)
 }
 
 /**
- *  Scale filter coefficients (64 bits float)
+ *  fsl_easrc_normalize_filter - Scale filter coefficients (64 bits float)
  *  For input float32 normalized range (1.0,-1.0) -> output int[16,24,32]:
  *      scale it by multiplying filter coefficients by 2^31
  *  For input int[16, 24, 32] -> output float32
@@ -749,7 +808,7 @@ static int fsl_easrc_config_one_slot(struct fsl_asrc_pair *ctx,
 {
 	struct fsl_asrc *easrc = ctx->asrc;
 	struct fsl_easrc_ctx_priv *ctx_priv = ctx->private;
-	int st1_chanxexp, st1_mem_alloc = 0, st2_mem_alloc = 0;
+	int st1_chanxexp, st1_mem_alloc = 0, st2_mem_alloc;
 	unsigned int reg0, reg1, reg2, reg3;
 	unsigned int addr;
 
@@ -1280,7 +1339,7 @@ static int fsl_easrc_request_context(int channels, struct fsl_asrc_pair *ctx)
 /*
  * Release the context
  *
- * This funciton is mainly doing the revert thing in request context
+ * This function is mainly doing the revert thing in request context
  */
 static void fsl_easrc_release_context(struct fsl_asrc_pair *ctx)
 {
@@ -1329,7 +1388,7 @@ static int fsl_easrc_stop_context(struct fsl_asrc_pair *ctx)
 {
 	struct fsl_asrc *easrc = ctx->asrc;
 	int val, i;
-	int size = 0;
+	int size;
 	int retry = 200;
 
 	regmap_read(easrc->regmap, REG_EASRC_CC(ctx->index), &val);
@@ -1531,13 +1590,6 @@ static int fsl_easrc_hw_free(struct snd_pcm_substream *substream,
 	return 0;
 }
 
-static struct snd_soc_dai_ops fsl_easrc_dai_ops = {
-	.startup = fsl_easrc_startup,
-	.trigger = fsl_easrc_trigger,
-	.hw_params = fsl_easrc_hw_params,
-	.hw_free = fsl_easrc_hw_free,
-};
-
 static int fsl_easrc_dai_probe(struct snd_soc_dai *cpu_dai)
 {
 	struct fsl_asrc *easrc = dev_get_drvdata(cpu_dai->dev);
@@ -1548,8 +1600,15 @@ static int fsl_easrc_dai_probe(struct snd_soc_dai *cpu_dai)
 	return 0;
 }
 
+static const struct snd_soc_dai_ops fsl_easrc_dai_ops = {
+	.probe		= fsl_easrc_dai_probe,
+	.startup	= fsl_easrc_startup,
+	.trigger	= fsl_easrc_trigger,
+	.hw_params	= fsl_easrc_hw_params,
+	.hw_free	= fsl_easrc_hw_free,
+};
+
 static struct snd_soc_dai_driver fsl_easrc_dai = {
-	.probe = fsl_easrc_dai_probe,
 	.playback = {
 		.stream_name = "ASRC-Playback",
 		.channels_min = 1,
@@ -1573,9 +1632,10 @@ static struct snd_soc_dai_driver fsl_easrc_dai = {
 };
 
 static const struct snd_soc_component_driver fsl_easrc_component = {
-	.name		= "fsl-easrc-dai",
-	.controls       = fsl_easrc_snd_controls,
-	.num_controls   = ARRAY_SIZE(fsl_easrc_snd_controls),
+	.name			= "fsl-easrc-dai",
+	.controls		= fsl_easrc_snd_controls,
+	.num_controls		= ARRAY_SIZE(fsl_easrc_snd_controls),
+	.legacy_dai_naming	= 1,
 };
 
 static const struct reg_default fsl_easrc_reg_defaults[] = {
@@ -1889,27 +1949,21 @@ static int fsl_easrc_probe(struct platform_device *pdev)
 	easrc->private = easrc_priv;
 	np = dev->of_node;
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	regs = devm_ioremap_resource(dev, res);
-	if (IS_ERR(regs)) {
-		dev_err(&pdev->dev, "failed ioremap\n");
+	regs = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
+	if (IS_ERR(regs))
 		return PTR_ERR(regs);
-	}
 
 	easrc->paddr = res->start;
 
-	easrc->regmap = devm_regmap_init_mmio_clk(dev, "mem", regs,
-						  &fsl_easrc_regmap_config);
+	easrc->regmap = devm_regmap_init_mmio(dev, regs, &fsl_easrc_regmap_config);
 	if (IS_ERR(easrc->regmap)) {
 		dev_err(dev, "failed to init regmap");
 		return PTR_ERR(easrc->regmap);
 	}
 
 	irq = platform_get_irq(pdev, 0);
-	if (irq < 0) {
-		dev_err(dev, "no irq for node %pOF\n", np);
+	if (irq < 0)
 		return irq;
-	}
 
 	ret = devm_request_irq(&pdev->dev, irq, fsl_easrc_isr, 0,
 			       dev_name(dev), easrc);
@@ -1988,11 +2042,9 @@ err_pm_disable:
 	return ret;
 }
 
-static int fsl_easrc_remove(struct platform_device *pdev)
+static void fsl_easrc_remove(struct platform_device *pdev)
 {
 	pm_runtime_disable(&pdev->dev);
-
-	return 0;
 }
 
 static __maybe_unused int fsl_easrc_runtime_suspend(struct device *dev)
@@ -2102,7 +2154,7 @@ static const struct dev_pm_ops fsl_easrc_pm_ops = {
 
 static struct platform_driver fsl_easrc_driver = {
 	.probe = fsl_easrc_probe,
-	.remove = fsl_easrc_remove,
+	.remove_new = fsl_easrc_remove,
 	.driver = {
 		.name = "fsl-easrc",
 		.pm = &fsl_easrc_pm_ops,

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2021-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/module.h>
@@ -11,6 +12,7 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/interrupt.h>
+#include "thermal_zone_internal.h"
 
 #define PE_SENS_DRIVER		"policy-engine-sensor"
 #define PE_INT_ENABLE_OFFSET	0x530
@@ -32,10 +34,10 @@ struct pe_sensor_data {
 	struct mutex			mutex;
 };
 
-static int pe_sensor_get_trend(void *data, int trip, enum thermal_trend *trend)
+static int pe_sensor_get_trend(struct thermal_zone_device *tz,
+					const struct thermal_trip *trip,
+					enum thermal_trend *trend)
 {
-	struct pe_sensor_data *pe_sens = (struct pe_sensor_data *)data;
-	struct thermal_zone_device *tz = pe_sens->tz_dev;
 	int value, last_value;
 
 	if (!tz)
@@ -67,16 +69,16 @@ static int fetch_mitigation_table_idx(struct pe_sensor_data *pe_sens, int *temp)
 	return 0;
 }
 
-static int pe_sensor_read(void *data, int *temp)
+static int pe_sensor_read(struct thermal_zone_device *tz, int *temp)
 {
-	struct pe_sensor_data *pe_sens = (struct pe_sensor_data *)data;
+	struct pe_sensor_data *pe_sens = (struct pe_sensor_data *)tz->devdata;
 
 	return fetch_mitigation_table_idx(pe_sens, temp);
 }
 
-static int pe_sensor_set_trips(void *data, int low, int high)
+static int pe_sensor_set_trips(struct thermal_zone_device *tz, int low, int high)
 {
-	struct pe_sensor_data *pe_sens = (struct pe_sensor_data *)data;
+	struct pe_sensor_data *pe_sens = (struct pe_sensor_data *)tz->devdata;
 
 	mutex_lock(&pe_sens->mutex);
 	if (pe_sens->high_thresh == high &&
@@ -92,10 +94,11 @@ unlock_exit:
 	return 0;
 }
 
-static struct thermal_zone_of_device_ops pe_sensor_ops = {
+static struct thermal_zone_device_ops pe_sensor_ops = {
 	.get_temp = pe_sensor_read,
 	.set_trips = pe_sensor_set_trips,
 	.get_trend = pe_sensor_get_trend,
+	.change_mode = qti_tz_change_mode,
 };
 
 static irqreturn_t pe_handle_irq(int irq, void *data)
@@ -144,7 +147,7 @@ static int pe_sens_device_probe(struct platform_device *pdev)
 		dev_err(dev, "Couldn't get MEM resource\n");
 		return -EINVAL;
 	}
-	dev_dbg(dev, "pe@0x%x size:%d\n", res->start,
+	dev_dbg(dev, "pe@0x%llx size:%lld\n", res->start,
 			resource_size(res));
 
 	pe_sens->regmap = devm_ioremap_resource(dev, res);
@@ -158,7 +161,7 @@ static int pe_sens_device_probe(struct platform_device *pdev)
 		dev_err(dev, "Couldn't get irq number\n");
 		return pe_sens->irq_num;
 	}
-	pe_sens->tz_dev = devm_thermal_zone_of_sensor_register(
+	pe_sens->tz_dev = devm_thermal_of_zone_register(
 				dev, 0, pe_sens, &pe_sensor_ops);
 	if (IS_ERR_OR_NULL(pe_sens->tz_dev)) {
 		ret = PTR_ERR(pe_sens->tz_dev);
@@ -167,6 +170,7 @@ static int pe_sens_device_probe(struct platform_device *pdev)
 		pe_sens->tz_dev = NULL;
 		return ret;
 	}
+
 	writel_relaxed(PE_INTR_CFG, pe_sens->regmap + PE_INT_ENABLE_OFFSET);
 	writel_relaxed(PE_INTR_CLEAR, pe_sens->regmap + PE_INT_STATUS_OFFSET);
 	writel_relaxed(PE_STS_CLEAR, pe_sens->regmap + PE_INT_STATUS1_OFFSET);
@@ -176,7 +180,7 @@ static int pe_sens_device_probe(struct platform_device *pdev)
 				dev_name(dev), pe_sens);
 	if (ret) {
 		dev_err(dev, "Couldn't get irq registered\n");
-		thermal_zone_of_sensor_unregister(pe_sens->dev,
+		devm_thermal_of_zone_unregister(pe_sens->dev,
 				pe_sens->tz_dev);
 		return ret;
 	}
@@ -192,7 +196,7 @@ static int pe_sens_device_remove(struct platform_device *pdev)
 	struct pe_sensor_data *pe_sens =
 		(struct pe_sensor_data *)dev_get_drvdata(&pdev->dev);
 
-	thermal_zone_of_sensor_unregister(pe_sens->dev, pe_sens->tz_dev);
+	devm_thermal_of_zone_unregister(pe_sens->dev, pe_sens->tz_dev);
 
 	return 0;
 }
@@ -212,4 +216,4 @@ static struct platform_driver pe_sens_device_driver = {
 };
 
 module_platform_driver(pe_sens_device_driver);
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/module.h>
@@ -96,7 +96,6 @@ struct nb7vpq904m_redriver {
 	struct i2c_client	*client;
 	struct regulator	*vdd;
 
-	int orientation_gpio;
 	int typec_orientation;
 	enum operation_mode op_mode;
 
@@ -466,17 +465,6 @@ err:
 	return ret;
 }
 
-static int nb7vpq904m_get_orientation(struct usb_redriver *r)
-{
-	struct nb7vpq904m_redriver *redriver =
-		container_of(r, struct nb7vpq904m_redriver, r);
-
-	dev_dbg(redriver->dev, "%s: mode %s\n", __func__,
-		OPMODESTR(redriver->op_mode));
-
-	return gpio_get_value(redriver->orientation_gpio);
-}
-
 static inline void orientation_set(struct nb7vpq904m_redriver *redriver, int ort)
 {
 	redriver->typec_orientation = ort;
@@ -514,9 +502,9 @@ static int nb7vpq904m_notify_connect(struct usb_redriver *r, int ort)
 
 static int nb7vpq904m_notify_disconnect(struct usb_redriver *r)
 {
+	int ret = 0;
 	struct nb7vpq904m_redriver *redriver =
 		container_of(r, struct nb7vpq904m_redriver, r);
-	int ret;
 
 	dev_dbg(redriver->dev, "%s: mode %s\n", __func__,
 		OPMODESTR(redriver->op_mode));
@@ -530,7 +518,7 @@ static int nb7vpq904m_notify_disconnect(struct usb_redriver *r)
 	if (!ret)
 		nb7vpq904m_vdd_enable(redriver, false);
 
-	return ret;
+	return 0;
 }
 
 static int nb7vpq904m_release_usb_lanes(struct usb_redriver *r, int ort, int num)
@@ -651,36 +639,14 @@ static int nb7vpq904m_host_powercycle(struct usb_redriver *r)
 	return 0;
 }
 
-static void nb7vpq904m_orientation_gpio_init(
-		struct nb7vpq904m_redriver *redriver)
-{
-	struct device *dev = redriver->dev;
-	int rc;
-
-	redriver->orientation_gpio = of_get_gpio(dev->of_node, 0);
-	if (!gpio_is_valid(redriver->orientation_gpio)) {
-		dev_err(dev, "Failed to get gpio\n");
-		return;
-	}
-
-	rc = devm_gpio_request(dev, redriver->orientation_gpio, "redriver");
-	if (rc < 0) {
-		dev_err(dev, "Failed to request gpio\n");
-		redriver->orientation_gpio = -EINVAL;
-		return;
-	}
-
-	redriver->r.has_orientation = true;
-}
-
 static const struct regmap_config redriver_regmap = {
+	.name = "nb7vpq904m",
 	.max_register = REDRIVER_REG_MAX,
 	.reg_bits = 8,
 	.val_bits = 8,
 };
 
-static int nb7vpq904m_probe(struct i2c_client *client,
-			       const struct i2c_device_id *dev_id)
+static int nb7vpq904m_probe(struct i2c_client *client)
 {
 	struct nb7vpq904m_redriver *redriver;
 	int ret;
@@ -733,17 +699,14 @@ static int nb7vpq904m_probe(struct i2c_client *client,
 	/* disable it at start, one i2c register write time is acceptable */
 	redriver->op_mode = OP_MODE_NONE;
 	nb7vpq904m_vdd_enable(redriver, true);
-	ret = nb7vpq904m_gen_dev_set(redriver);
+	nb7vpq904m_gen_dev_set(redriver);
 	/* when private vdd present and change to none mode, it can simply disable vdd regulator,
 	 * but to keep things simple and avoid if/else operation, keep one same rule as,
 	 * allow original register write operation then control vdd regulator.
 	 * also it will keep consistent behavior if it still need vdd control when multiple
 	 * clients share the same vdd regulator.
 	 */
-	if (!ret)
-		nb7vpq904m_vdd_enable(redriver, false);
-
-	nb7vpq904m_orientation_gpio_init(redriver);
+	nb7vpq904m_vdd_enable(redriver, false);
 
 	nb7vpq904m_debugfs_entries(redriver);
 
@@ -751,7 +714,6 @@ static int nb7vpq904m_probe(struct i2c_client *client,
 	redriver->r.release_usb_lanes = nb7vpq904m_release_usb_lanes;
 	redriver->r.notify_connect = nb7vpq904m_notify_connect;
 	redriver->r.notify_disconnect = nb7vpq904m_notify_disconnect;
-	redriver->r.get_orientation = nb7vpq904m_get_orientation;
 	redriver->r.gadget_pullup_enter = nb7vpq904m_gadget_pullup_enter;
 	redriver->r.gadget_pullup_exit = nb7vpq904m_gadget_pullup_exit;
 	redriver->r.host_powercycle = nb7vpq904m_host_powercycle;
@@ -760,12 +722,12 @@ static int nb7vpq904m_probe(struct i2c_client *client,
 	return 0;
 }
 
-static int nb7vpq904m_remove(struct i2c_client *client)
+static void nb7vpq904m_remove(struct i2c_client *client)
 {
 	struct nb7vpq904m_redriver *redriver = i2c_get_clientdata(client);
 
 	if (usb_remove_redriver(&redriver->r))
-		return -EINVAL;
+		return;
 
 	debugfs_remove_recursive(redriver->debug_root);
 	redriver->work_ongoing = false;
@@ -773,8 +735,6 @@ static int nb7vpq904m_remove(struct i2c_client *client)
 
 	if (redriver->vdd)
 		regulator_disable(redriver->vdd);
-
-	return 0;
 }
 
 static ssize_t channel_config_write(struct file *file,
@@ -1012,19 +972,6 @@ static const struct file_operations loss_match_ops = {
 	.write	= loss_match_write,
 };
 
-static int orientation_gpio_read(void *data, u64 *val)
-{
-	struct nb7vpq904m_redriver *redriver = data;
-
-	*val = nb7vpq904m_get_orientation(&redriver->r);
-
-	dev_dbg(redriver->dev, "orientation %llu\n", *val);
-
-	return 0;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(orientation_gpio_ops,
-	orientation_gpio_read, NULL, "%llu\n");
-
 static void nb7vpq904m_debugfs_entries(
 		struct nb7vpq904m_redriver *redriver)
 {
@@ -1046,59 +993,9 @@ static void nb7vpq904m_debugfs_entries(
 	debugfs_create_file("loss_match", 0600,
 			redriver->debug_root, redriver, &loss_match_ops);
 
-	debugfs_create_file("orientation-gpio", 0444,
-			redriver->debug_root, redriver, &orientation_gpio_ops);
-
 	debugfs_create_bool("lane-channel-swap", 0644,
 			redriver->debug_root,  &redriver->lane_channel_swap);
 }
-
-static int __maybe_unused nb7vpq904m_suspend(struct device *dev)
-{
-	struct i2c_client *client = to_i2c_client(dev);
-	struct nb7vpq904m_redriver *redriver = i2c_get_clientdata(client);
-
-	dev_dbg(redriver->dev, "%s: SS USB redriver suspend.\n",
-			__func__);
-
-	/*
-	 * 1. when in 4 lanes display mode, it can't disable;
-	 * 2. when in NONE mode, there is no need to re-disable;
-	 * 3. when in DEFAULT mode, there is no adsp and can't disable;
-	 */
-	if (redriver->op_mode == OP_MODE_DP ||
-	    redriver->op_mode == OP_MODE_NONE ||
-	    redriver->op_mode == OP_MODE_DEFAULT)
-		return 0;
-
-	nb7vpq904m_reg_set(redriver, GEN_DEV_SET_REG,
-				redriver->gen_dev_val & ~CHIP_EN);
-
-	return 0;
-}
-
-static int __maybe_unused nb7vpq904m_resume(struct device *dev)
-{
-	struct i2c_client *client = to_i2c_client(dev);
-	struct nb7vpq904m_redriver *redriver = i2c_get_clientdata(client);
-
-	dev_dbg(redriver->dev, "%s: SS USB redriver resume.\n",
-			__func__);
-
-	/* no suspend happen in following mode */
-	if (redriver->op_mode == OP_MODE_DP ||
-	    redriver->op_mode == OP_MODE_NONE ||
-	    redriver->op_mode == OP_MODE_DEFAULT)
-		return 0;
-
-	nb7vpq904m_reg_set(redriver, GEN_DEV_SET_REG,
-				redriver->gen_dev_val);
-
-	return 0;
-}
-
-static SIMPLE_DEV_PM_OPS(nb7vpq904m_pm, nb7vpq904m_suspend,
-			 nb7vpq904m_resume);
 
 static void nb7vpq904m_shutdown(struct i2c_client *client)
 {
@@ -1127,7 +1024,6 @@ static struct i2c_driver nb7vpq904m_driver = {
 	.driver = {
 		.name	= "ssusb-redriver",
 		.of_match_table	= nb7vpq904m_match_table,
-		.pm	= &nb7vpq904m_pm,
 	},
 
 	.probe		= nb7vpq904m_probe,
@@ -1138,4 +1034,4 @@ static struct i2c_driver nb7vpq904m_driver = {
 module_i2c_driver(nb7vpq904m_driver);
 
 MODULE_DESCRIPTION("USB Super Speed Linear Re-Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

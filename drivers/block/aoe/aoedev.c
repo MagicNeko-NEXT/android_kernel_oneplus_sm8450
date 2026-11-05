@@ -200,8 +200,11 @@ aoedev_downdev(struct aoedev *d)
 	struct list_head *head, *pos, *nx;
 	struct request *rq, *rqnext;
 	int i;
+	unsigned long flags;
 
-	d->flags &= ~DEVFL_UP;
+	spin_lock_irqsave(&d->lock, flags);
+	d->flags &= ~(DEVFL_UP | DEVFL_DEAD);
+	spin_unlock_irqrestore(&d->lock, flags);
 
 	/* clean out active and to-be-retransmitted buffers */
 	for (i = 0; i < NFACTIVE; i++) {
@@ -287,7 +290,6 @@ freedev(struct aoedev *d)
 		del_gendisk(d->gd);
 		put_disk(d->gd);
 		blk_mq_free_tag_set(&d->tag_set);
-		blk_cleanup_queue(d->blkq);
 	}
 	t = d->targets;
 	e = t + d->ntargets;
@@ -330,7 +332,7 @@ flush(const char __user *str, size_t cnt, int exiting)
 			specified = 1;
 	}
 
-	flush_scheduled_work();
+	flush_workqueue(aoe_wq);
 	/* pass one: do aoedev_downdev, which might sleep */
 restart1:
 	spin_lock_irqsave(&devlist_lock, flags);
@@ -529,7 +531,7 @@ freetgt(struct aoedev *d, struct aoetgt *t)
 void
 aoedev_exit(void)
 {
-	flush_scheduled_work();
+	flush_workqueue(aoe_wq);
 	flush(NULL, 0, EXITING);
 }
 

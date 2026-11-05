@@ -257,7 +257,7 @@ static int l2tp_eth_create(struct net *net, struct l2tp_tunnel *tunnel,
 	int rc;
 
 	if (cfg->ifname) {
-		strlcpy(name, cfg->ifname, IFNAMSIZ);
+		strscpy(name, cfg->ifname, IFNAMSIZ);
 		name_assign_type = NET_NAME_USER;
 	} else {
 		strcpy(name, L2TP_ETH_DEV_NAME);
@@ -293,7 +293,7 @@ static int l2tp_eth_create(struct net *net, struct l2tp_tunnel *tunnel,
 
 	spriv = l2tp_session_priv(session);
 
-	l2tp_session_inc_refcount(session);
+	refcount_inc(&session->ref_count);
 
 	rtnl_lock();
 
@@ -311,25 +311,25 @@ static int l2tp_eth_create(struct net *net, struct l2tp_tunnel *tunnel,
 	if (rc < 0) {
 		rtnl_unlock();
 		l2tp_session_delete(session);
-		l2tp_session_dec_refcount(session);
+		l2tp_session_put(session);
 		free_netdev(dev);
 
 		return rc;
 	}
 
-	strlcpy(session->ifname, dev->name, IFNAMSIZ);
+	strscpy(session->ifname, dev->name, IFNAMSIZ);
 	rcu_assign_pointer(spriv->dev, dev);
 
 	rtnl_unlock();
 
-	l2tp_session_dec_refcount(session);
+	l2tp_session_put(session);
 
 	__module_get(THIS_MODULE);
 
 	return 0;
 
 err_sess_dev:
-	l2tp_session_dec_refcount(session);
+	l2tp_session_put(session);
 	free_netdev(dev);
 err_sess:
 	kfree(session);

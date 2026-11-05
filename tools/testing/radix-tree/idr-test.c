@@ -57,6 +57,26 @@ void idr_alloc_test(void)
 	idr_destroy(&idr);
 }
 
+void idr_alloc2_test(void)
+{
+	int id;
+	struct idr idr = IDR_INIT_BASE(idr, 1);
+
+	id = idr_alloc(&idr, idr_alloc2_test, 0, 1, GFP_KERNEL);
+	assert(id == -ENOSPC);
+
+	id = idr_alloc(&idr, idr_alloc2_test, 1, 2, GFP_KERNEL);
+	assert(id == 1);
+
+	id = idr_alloc(&idr, idr_alloc2_test, 0, 1, GFP_KERNEL);
+	assert(id == -ENOSPC);
+
+	id = idr_alloc(&idr, idr_alloc2_test, 0, 2, GFP_KERNEL);
+	assert(id == -ENOSPC);
+
+	idr_destroy(&idr);
+}
+
 void idr_replace_test(void)
 {
 	DEFINE_IDR(idr);
@@ -296,6 +316,10 @@ static void *idr_throbber(void *arg)
 	return NULL;
 }
 
+/*
+ * There are always either 1 or 2 objects in the IDR.  If we find nothing,
+ * or we find something at an ID we didn't expect, that's a bug.
+ */
 void idr_find_test_1(int anchor_id, int throbber_id)
 {
 	pthread_t throbber;
@@ -311,7 +335,12 @@ void idr_find_test_1(int anchor_id, int throbber_id)
 		int id = 0;
 		void *entry = idr_get_next(&find_idr, &id);
 		rcu_read_unlock();
-		BUG_ON(entry != xa_mk_value(id));
+		if ((id != anchor_id && id != throbber_id) ||
+		    entry != xa_mk_value(id)) {
+			printf("%s(%d, %d): %p at %d\n", __func__, anchor_id,
+				throbber_id, entry, id);
+			abort();
+		}
 		rcu_read_lock();
 	} while (time(NULL) < start + 11);
 	rcu_read_unlock();
@@ -400,6 +429,7 @@ void idr_checks(void)
 
 	idr_replace_test();
 	idr_alloc_test();
+	idr_alloc2_test();
 	idr_null_test();
 	idr_nowait_test();
 	idr_get_next_test(0);

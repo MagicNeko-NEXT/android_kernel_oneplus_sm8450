@@ -29,7 +29,6 @@ enum qrtr_pkt_type {
 };
 #define QRTR_TYPE_DEL_PROC	13
 
-
 struct qrtr_ctrl_pkt {
 	__le32 cmd;
 

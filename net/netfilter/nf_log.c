@@ -89,7 +89,7 @@ int nf_log_register(u_int8_t pf, struct nf_logger *logger)
 	if (pf == NFPROTO_UNSPEC) {
 		for (i = NFPROTO_UNSPEC; i < NFPROTO_NUMPROTO; i++) {
 			if (rcu_access_pointer(loggers[i][logger->type])) {
-				ret = -EEXIST;
+				ret = -EBUSY;
 				goto unlock;
 			}
 		}
@@ -97,7 +97,7 @@ int nf_log_register(u_int8_t pf, struct nf_logger *logger)
 			rcu_assign_pointer(loggers[i][logger->type], logger);
 	} else {
 		if (rcu_access_pointer(loggers[pf][logger->type])) {
-			ret = -EEXIST;
+			ret = -EBUSY;
 			goto unlock;
 		}
 		rcu_assign_pointer(loggers[pf][logger->type], logger);
@@ -151,13 +151,6 @@ void nf_log_unbind_pf(struct net *net, u_int8_t pf)
 }
 EXPORT_SYMBOL(nf_log_unbind_pf);
 
-void nf_logger_request_module(int pf, enum nf_log_type type)
-{
-	if (loggers[pf][type] == NULL)
-		request_module("nf-logger-%u-%u", pf, type);
-}
-EXPORT_SYMBOL_GPL(nf_logger_request_module);
-
 int nf_logger_find_get(int pf, enum nf_log_type type)
 {
 	struct nf_logger *logger;
@@ -176,9 +169,6 @@ int nf_logger_find_get(int pf, enum nf_log_type type)
 
 		return 0;
 	}
-
-	if (rcu_access_pointer(loggers[pf][type]) == NULL)
-		request_module("nf-logger-%u-%u", pf, type);
 
 	rcu_read_lock();
 	logger = rcu_dereference(loggers[pf][type]);
@@ -454,9 +444,9 @@ static int nf_log_proc_dostring(struct ctl_table *table, int write,
 		mutex_lock(&nf_log_mutex);
 		logger = nft_log_dereference(net->nf.nf_loggers[tindex]);
 		if (!logger)
-			strlcpy(buf, "NONE", sizeof(buf));
+			strscpy(buf, "NONE", sizeof(buf));
 		else
-			strlcpy(buf, logger->name, sizeof(buf));
+			strscpy(buf, logger->name, sizeof(buf));
 		mutex_unlock(&nf_log_mutex);
 		r = proc_dostring(&tmp, write, buffer, lenp, ppos);
 	}
@@ -498,9 +488,10 @@ static int netfilter_log_sysctl_init(struct net *net)
 	for (i = NFPROTO_UNSPEC; i < NFPROTO_NUMPROTO; i++)
 		table[i].extra2 = net;
 
-	net->nf.nf_log_dir_header = register_net_sysctl(net,
-						"net/netfilter/nf_log",
-						table);
+	net->nf.nf_log_dir_header = register_net_sysctl_sz(net,
+							   "net/netfilter/nf_log",
+							   table,
+							   ARRAY_SIZE(nf_log_sysctl_table));
 	if (!net->nf.nf_log_dir_header)
 		goto err_reg;
 

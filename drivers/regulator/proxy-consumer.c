@@ -396,4 +396,4 @@ late_initcall_sync(regulator_proxy_consumer_remove_all);
 #endif
 
 MODULE_DESCRIPTION("Regulator proxy consumer library");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

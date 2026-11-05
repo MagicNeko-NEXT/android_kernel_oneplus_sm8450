@@ -184,7 +184,7 @@ static int bcm_ns_usb3_mdio_phy_write(struct bcm_ns_usb3 *usb3, u16 reg,
 {
 	struct mdio_device *mdiodev = usb3->mdiodev;
 
-	return mdiobus_write(mdiodev->bus, mdiodev->addr, reg, value);
+	return mdiodev_write(mdiodev, reg, value);
 }
 
 static int bcm_ns_usb3_mdio_probe(struct mdio_device *mdiodev)
@@ -203,7 +203,7 @@ static int bcm_ns_usb3_mdio_probe(struct mdio_device *mdiodev)
 	usb3->dev = dev;
 	usb3->mdiodev = mdiodev;
 
-	usb3->family = (enum bcm_ns_family)device_get_match_data(dev);
+	usb3->family = (unsigned long)device_get_match_data(dev);
 
 	syscon_np = of_parse_phandle(dev->of_node, "usb3-dmp-syscon", 0);
 	err = of_address_to_resource(syscon_np, 0, &res);
@@ -212,10 +212,8 @@ static int bcm_ns_usb3_mdio_probe(struct mdio_device *mdiodev)
 		return err;
 
 	usb3->dmp = devm_ioremap_resource(dev, &res);
-	if (IS_ERR(usb3->dmp)) {
-		dev_err(dev, "Failed to map DMP regs\n");
+	if (IS_ERR(usb3->dmp))
 		return PTR_ERR(usb3->dmp);
-	}
 
 	usb3->phy = devm_phy_create(dev, NULL, &ops);
 	if (IS_ERR(usb3->phy)) {

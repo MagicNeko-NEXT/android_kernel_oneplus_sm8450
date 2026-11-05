@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2018-2020 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2025, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt)	"QG-K: %s: " fmt, __func__
@@ -408,7 +409,7 @@ int qg_adjust_sys_soc(struct qpnp_qg *chip)
 		rc = qg_get_vbat_avg(chip, &vbat_uv);
 		if (!rc && (vbat_uv >= (vcutoff_uv + VBAT_LOW_HYST_UV))) {
 			soc = 1;
-			qg_dbg(chip, QG_DEBUG_SOC, "vbat_uv=%duV holding SOC to 1%\n",
+			qg_dbg(chip, QG_DEBUG_SOC, "vbat_uv=%duV holding 1%% SOC\n",
 						vbat_uv);
 		}
 	}

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (c) 2014, 2019-2020 The Linux Foundation. All rights reserved.
- * Copyright (c) 2022, 2024, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2014, 2019-2021 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/device.h>
@@ -133,7 +133,7 @@ int clk_pre_change_regmap(struct clk_hw *hw, unsigned long cur_rate,
 
 	return 0;
 }
-EXPORT_SYMBOL(clk_pre_change_regmap);
+EXPORT_SYMBOL_GPL(clk_pre_change_regmap);
 
 /**
  * clk_post_change_regmap() - standard post_change call back for regmap clks
@@ -178,7 +178,7 @@ int clk_post_change_regmap(struct clk_hw *hw, unsigned long old_rate,
 
 	return 0;
 }
-EXPORT_SYMBOL(clk_post_change_regmap);
+EXPORT_SYMBOL_GPL(clk_post_change_regmap);
 
 /**
  * clk_prepare_regmap() - standard prepare call back for regmap clks
@@ -196,7 +196,7 @@ EXPORT_SYMBOL(clk_post_change_regmap);
 int clk_prepare_regmap(struct clk_hw *hw)
 {
 	struct clk_regmap *rclk = to_clk_regmap(hw);
-	int rate = clk_hw_get_rate(hw);
+	unsigned long rate = clk_hw_get_rate(hw);
 	int vdd_level;
 
 	if (!rclk->vdd_data.rate_max)
@@ -215,7 +215,7 @@ int clk_prepare_regmap(struct clk_hw *hw)
 
 	return clk_vote_vdd_level(&rclk->vdd_data, rclk->vdd_data.vdd_level);
 }
-EXPORT_SYMBOL(clk_prepare_regmap);
+EXPORT_SYMBOL_GPL(clk_prepare_regmap);
 
 /**
  * clk_prepare_regmap() - standard prepare call back for regmap clks
@@ -234,7 +234,7 @@ void clk_unprepare_regmap(struct clk_hw *hw)
 
 	clk_unvote_vdd_level(&rclk->vdd_data, rclk->vdd_data.vdd_level);
 }
-EXPORT_SYMBOL(clk_unprepare_regmap);
+EXPORT_SYMBOL_GPL(clk_unprepare_regmap);
 
 /**
  * clk_is_regmap_clk - Checks if clk is a regmap clk
@@ -264,11 +264,12 @@ bool clk_is_regmap_clk(struct clk_hw *hw)
 
 	return is_regmap_clk;
 }
-EXPORT_SYMBOL(clk_is_regmap_clk);
+EXPORT_SYMBOL_GPL(clk_is_regmap_clk);
 
 /**
  * devm_clk_register_regmap - register a clk_regmap clock
  *
+ * @dev: reference to the caller's device
  * @rclk: clk to operate on
  *
  * Clocks that use regmap for their register I/O should register their
@@ -310,9 +311,29 @@ int devm_clk_register_regmap(struct device *dev, struct clk_regmap *rclk)
 }
 EXPORT_SYMBOL_GPL(devm_clk_register_regmap);
 
+/**
+ * devm_clk_regmap_list_node - Add a clk-regmap clock list for providers
+ *
+ * @rclk: clk to operate on
+ *
+ * Maintain clk-regmap clks list for providers use.
+ */
+void devm_clk_regmap_list_node(struct device *dev, struct clk_regmap *rclk)
+{
+	list_add(&rclk->list_node, &clk_regmap_list);
+}
+EXPORT_SYMBOL_GPL(devm_clk_regmap_list_node);
+
 int clk_runtime_get_regmap(struct clk_regmap *rclk)
 {
 	int ret;
+	struct device *parent_dev = rclk->dev->parent;
+
+	if (parent_dev && pm_runtime_enabled(parent_dev)) {
+		ret = pm_runtime_get_sync(parent_dev);
+		if (ret < 0)
+			return ret;
+	}
 
 	if (pm_runtime_enabled(rclk->dev)) {
 		ret = pm_runtime_get_sync(rclk->dev);
@@ -322,14 +343,19 @@ int clk_runtime_get_regmap(struct clk_regmap *rclk)
 
 	return 0;
 }
-EXPORT_SYMBOL(clk_runtime_get_regmap);
+EXPORT_SYMBOL_GPL(clk_runtime_get_regmap);
 
 void clk_runtime_put_regmap(struct clk_regmap *rclk)
 {
+	struct device *parent_dev = rclk->dev->parent;
+
 	if (pm_runtime_enabled(rclk->dev))
 		pm_runtime_put_sync(rclk->dev);
+
+	if (parent_dev && pm_runtime_enabled(parent_dev))
+		pm_runtime_put_sync(parent_dev);
 }
-EXPORT_SYMBOL(clk_runtime_put_regmap);
+EXPORT_SYMBOL_GPL(clk_runtime_put_regmap);
 
 void clk_restore_critical_clocks(struct device *dev)
 {
@@ -337,6 +363,9 @@ void clk_restore_critical_clocks(struct device *dev)
 	struct regmap *regmap = dev_get_regmap(dev, NULL);
 	struct critical_clk_offset *cclks = desc->critical_clk_en;
 	int i;
+
+	if (!regmap)
+		return;
 
 	for (i = 0; i < desc->num_critical_clk; i++)
 		regmap_update_bits(regmap, cclks[i].offset, cclks[i].mask,

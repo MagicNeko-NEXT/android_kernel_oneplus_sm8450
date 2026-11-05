@@ -137,7 +137,8 @@ static void fjes_hw_free_epbuf(struct epbuf_handler *epbh)
 	epbh->ring = NULL;
 }
 
-void fjes_hw_setup_epbuf(struct epbuf_handler *epbh, u8 *mac_addr, u32 mtu)
+void fjes_hw_setup_epbuf(struct epbuf_handler *epbh, const u8 *mac_addr,
+			 u32 mtu)
 {
 	union ep_buffer_info *info = epbh->info;
 	u16 vlan_id[EP_BUFFER_SUPPORT_VLAN_MAX];
@@ -333,7 +334,7 @@ int fjes_hw_init(struct fjes_hw *hw)
 
 	ret = fjes_hw_reset(hw);
 	if (ret)
-		return ret;
+		goto err_iounmap;
 
 	fjes_hw_set_irqmask(hw, REG_ICTL_MASK_ALL, true);
 
@@ -346,14 +347,20 @@ int fjes_hw_init(struct fjes_hw *hw)
 	hw->max_epid = fjes_hw_get_max_epid(hw);
 	hw->my_epid = fjes_hw_get_my_epid(hw);
 
-	if ((hw->max_epid == 0) || (hw->my_epid >= hw->max_epid))
-		return -ENXIO;
+	if ((hw->max_epid == 0) || (hw->my_epid >= hw->max_epid)) {
+		ret = -ENXIO;
+		goto err_iounmap;
+	}
 
 	ret = fjes_hw_setup(hw);
 
 	hw->hw_info.trace = vzalloc(FJES_DEBUG_BUFFER_SIZE);
 	hw->hw_info.trace_size = FJES_DEBUG_BUFFER_SIZE;
 
+	return ret;
+
+err_iounmap:
+	fjes_hw_iounmap(hw);
 	return ret;
 }
 

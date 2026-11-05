@@ -17,6 +17,8 @@
 #include <linux/devcoredump.h>
 #include <linux/soc/qcom/mdt_loader.h>
 
+#define RAMDUMP_TIMEOUT 120000
+
 #define SIZEOF_ELF_STRUCT(__xhdr) \
 static inline size_t sizeof_elf_##__xhdr(unsigned char class) \
 { \
@@ -113,7 +115,7 @@ int qcom_dump(struct list_head *segs, struct device *dev)
 		return -EINVAL;
 
 	list_for_each_entry(segment, segs, node) {
-		pr_info("Got segment size %d\n", segment->size);
+		pr_info("Got segment size %zd\n", segment->size);
 		data_size += segment->size;
 	}
 
@@ -179,7 +181,7 @@ int qcom_elf_dump(struct list_head *segs, struct device *dev, unsigned char clas
 	if (!data)
 		return -ENOMEM;
 
-	pr_debug("Creating elf with size %d\n", data_size);
+	pr_debug("Creating elf with size %zd\n", data_size);
 	ehdr = data;
 
 	memset(ehdr, 0, sizeof_elf_hdr(class));
@@ -270,7 +272,7 @@ static int ramdump_devnode_init(void)
 {
 	int ret;
 
-	ramdump_class = class_create(THIS_MODULE, RAMDUMP_NAME);
+	ramdump_class = class_create(RAMDUMP_NAME);
 	ret = alloc_chrdev_region(&ramdump_dev, 0, RAMDUMP_NUM_DEVICES,
 				  RAMDUMP_NAME);
 	if (ret) {
@@ -367,5 +369,5 @@ void qcom_destroy_ramdump_device(void *dev)
 EXPORT_SYMBOL(qcom_destroy_ramdump_device);
 
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. Ramdump driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 

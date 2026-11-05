@@ -7,7 +7,6 @@
 #include <linux/device.h>
 
 #include "vdd-class.h"
-#include "clk-regmap.h"
 
 static DEFINE_MUTEX(vdd_lock);
 
@@ -253,23 +252,6 @@ int clk_find_vdd_level(struct clk_hw *hw,
 	return level;
 }
 EXPORT_SYMBOL(clk_find_vdd_level);
-
-int clk_list_rate_vdd_level(struct clk_hw *hw, unsigned int rate)
-{
-	struct clk_regmap *rclk;
-	struct clk_vdd_class_data *vdd_data;
-
-	if (!clk_is_regmap_clk(hw))
-		return 0;
-
-	rclk = to_clk_regmap(hw);
-	vdd_data = &rclk->vdd_data;
-
-	if (!vdd_data->vdd_class)
-		return 0;
-
-	return clk_find_vdd_level(hw, vdd_data, rate);
-}
 
 int clk_regulator_init(struct device *dev, const struct qcom_cc_desc *desc)
 {

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
-#include "common.h"
 #include <linux/scmi_c1dcvs.h>
+#include "common.h"
 
 #define SCMI_MAX_RX_SIZE	128
 
@@ -142,13 +143,10 @@ static struct scmi_c1dcvs_vendor_ops c1dcvs_config_ops = {
 static int scmi_c1dcvs_protocol_init(const struct scmi_protocol_handle *ph)
 {
 	u32 version;
-	int ret;
 
-	ret = ph->xops->version_get(ph, &version);
-	if (ret)
-		return ret;
+	ph->xops->version_get(ph, &version);
 
-	dev_err(ph->dev, "version %d.%d\n",
+	dev_dbg(ph->dev, "version %d.%d\n",
 		PROTOCOL_REV_MAJOR(version), PROTOCOL_REV_MINOR(version));
 
 	return 0;
@@ -157,10 +155,10 @@ static int scmi_c1dcvs_protocol_init(const struct scmi_protocol_handle *ph)
 static const struct scmi_protocol scmi_c1dcvs = {
 	.id = SCMI_C1DCVS_PROTOCOL,
 	.owner = THIS_MODULE,
-	.init_instance = &scmi_c1dcvs_protocol_init,
+	.instance_init = &scmi_c1dcvs_protocol_init,
 	.ops = &c1dcvs_config_ops,
 };
 module_scmi_protocol(scmi_c1dcvs);
 
 MODULE_DESCRIPTION("SCMI C1DCVS vendor Protocol");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

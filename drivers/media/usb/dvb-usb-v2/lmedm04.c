@@ -336,6 +336,7 @@ static void lme2510_int_response(struct urb *lme_urb)
 				st->signal_level = ibuf[5];
 				st->signal_sn = ibuf[4];
 				st->time_key = ibuf[7];
+				break;
 			default:
 				break;
 			}
@@ -431,6 +432,9 @@ static int lme2510_pid_filter_ctrl(struct dvb_usb_adapter *adap, int onoff)
 	st->pid_size = 0;
 
 	mutex_unlock(&d->i2c_mutex);
+
+	if (ret)
+		return -EREMOTEIO;
 
 	return 0;
 }
@@ -759,20 +763,6 @@ static const char *lme_firmware_switch(struct dvb_usb_device *d, int cold)
 	}
 
 	return fw_lme;
-}
-
-static int lme2510_kill_urb(struct usb_data_stream *stream)
-{
-	int i;
-
-	for (i = 0; i < stream->urbs_submitted; i++) {
-		deb_info(3, "killing URB no. %d.", i);
-		/* stop the URB */
-		usb_kill_urb(stream->urb_list[i]);
-	}
-	stream->urbs_submitted = 0;
-
-	return 0;
 }
 
 static struct tda10086_config tda10086_config = {
@@ -1145,11 +1135,6 @@ static int lme2510_powerup(struct dvb_usb_device *d, int onoff)
 	return ret;
 }
 
-static int lme2510_get_adapter_count(struct dvb_usb_device *d)
-{
-	return 1;
-}
-
 static int lme2510_identify_state(struct dvb_usb_device *d, const char **name)
 {
 	struct lme2510_state *st = d->priv;
@@ -1208,11 +1193,6 @@ static int lme2510_get_rc_config(struct dvb_usb_device *d,
 static void lme2510_exit(struct dvb_usb_device *d)
 {
 	struct lme2510_state *st = d->priv;
-	struct dvb_usb_adapter *adap = &d->adapter[0];
-
-	if (adap != NULL) {
-		lme2510_kill_urb(&adap->stream);
-	}
 
 	if (st->lme_urb) {
 		usb_kill_urb(st->lme_urb);
@@ -1239,12 +1219,12 @@ static struct dvb_usb_device_properties lme2510_props = {
 	.frontend_attach  = dm04_lme2510_frontend_attach,
 	.tuner_attach = dm04_lme2510_tuner,
 	.get_stream_config = lme2510_get_stream_config,
-	.get_adapter_count = lme2510_get_adapter_count,
 	.streaming_ctrl   = lme2510_streaming_ctrl,
 
 	.get_rc_config = lme2510_get_rc_config,
 
 	.exit = lme2510_exit,
+	.num_adapters = 1,
 	.adapter = {
 		{
 			.caps = DVB_USB_ADAP_HAS_PID_FILTER|
@@ -1255,8 +1235,6 @@ static struct dvb_usb_device_properties lme2510_props = {
 			.stream =
 			DVB_USB_STREAM_BULK(0x86, 10, 4096),
 		},
-		{
-		}
 	},
 };
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (c) 2017-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/err.h>
@@ -14,27 +15,35 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
-#include <linux/of_device.h>
 #include <linux/of_irq.h>
 #include <linux/soc/qcom/irq.h>
 #include <linux/spinlock.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 
-#include <linux/qcom_scm.h>
+#include <linux/firmware/qcom/qcom_scm.h>
+#if IS_ENABLED(CONFIG_IPC_LOGGING)
 #include <linux/ipc_logging.h>
+#endif
 
-#define PDC_MAX_IRQS		168
+#if IS_ENABLED(CONFIG_IPC_LOGGING)
 #define PDC_IPC_LOG_SZ		2
+#endif
 #define PDC_MAX_GPIO_IRQS	256
 
-#define CLEAR_INTR(reg, intr)	(reg & ~(1 << intr))
-#define ENABLE_INTR(reg, intr)	(reg | (1 << intr))
-
+/* Valid only on HW version < 3.2 */
 #define IRQ_ENABLE_BANK		0x10
 #define IRQ_i_CFG		0x110
 
-#define PDC_NO_PARENT_IRQ	~0UL
+/* Valid only on HW version >= 3.2 */
+#define IRQ_i_CFG_IRQ_ENABLE	3
+
+#define IRQ_i_CFG_TYPE_MASK	GENMASK(2, 0)
+
+#define PDC_VERSION_REG		0x1000
+
+/* Notable PDC versions */
+#define PDC_VERSION_3_2		0x30200
 
 struct pdc_pin_region {
 	u32 pin_base;
@@ -51,52 +60,17 @@ struct spi_cfg_regs {
 	bool scm_io;
 };
 
+#define pin_to_hwirq(r, p)	((r)->parent_base + (p) - (r)->pin_base)
+
 static DEFINE_RAW_SPINLOCK(pdc_lock);
 static void __iomem *pdc_base;
 static struct pdc_pin_region *pdc_region;
 static int pdc_region_cnt;
+static unsigned int pdc_version;
 static struct spi_cfg_regs *spi_cfg;
+#if IS_ENABLED(CONFIG_IPC_LOGGING)
 static void *pdc_ipc_log;
-
-static void pdc_reg_write(int reg, u32 i, u32 val)
-{
-	writel_relaxed(val, pdc_base + reg + i * sizeof(u32));
-}
-
-static u32 pdc_reg_read(int reg, u32 i)
-{
-	return readl_relaxed(pdc_base + reg + i * sizeof(u32));
-}
-
-static void pdc_enable_intr(struct irq_data *d, bool on)
-{
-	int pin_out = d->hwirq;
-	unsigned long flags;
-	u32 index, mask;
-	u32 enable;
-
-	index = pin_out / 32;
-	mask = pin_out % 32;
-
-	raw_spin_lock_irqsave(&pdc_lock, flags);
-	enable = pdc_reg_read(IRQ_ENABLE_BANK, index);
-	enable = on ? ENABLE_INTR(enable, mask) : CLEAR_INTR(enable, mask);
-	pdc_reg_write(IRQ_ENABLE_BANK, index, enable);
-	ipc_log_string(pdc_ipc_log, "PIN=%d enable=%d", d->hwirq, on);
-	raw_spin_unlock_irqrestore(&pdc_lock, flags);
-}
-
-static void qcom_pdc_gic_disable(struct irq_data *d)
-{
-	pdc_enable_intr(d, false);
-	irq_chip_disable_parent(d);
-}
-
-static void qcom_pdc_gic_enable(struct irq_data *d)
-{
-	pdc_enable_intr(d, true);
-	irq_chip_enable_parent(d);
-}
+#endif
 
 static u32 __spi_pin_read(unsigned int pin)
 {
@@ -144,12 +118,68 @@ static int spi_configure_type(irq_hw_number_t hwirq, unsigned int type)
 	if (type & IRQ_TYPE_LEVEL_MASK)
 		val |= mask;
 	__spi_pin_write(pin, val);
+#if IS_ENABLED(CONFIG_IPC_LOGGING)
 	ipc_log_string(pdc_ipc_log,
 		       "SPI config: GIC-SPI=%d (reg=%d,bit=%d) val=%d",
 		       spi, pin, spi % 32, type & IRQ_TYPE_LEVEL_MASK);
+#endif
 	raw_spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return 0;
+}
+
+static void pdc_reg_write(int reg, u32 i, u32 val)
+{
+	writel_relaxed(val, pdc_base + reg + i * sizeof(u32));
+}
+
+static u32 pdc_reg_read(int reg, u32 i)
+{
+	return readl_relaxed(pdc_base + reg + i * sizeof(u32));
+}
+
+static void __pdc_enable_intr(int pin_out, bool on)
+{
+	unsigned long enable;
+
+	if (pdc_version < PDC_VERSION_3_2) {
+		u32 index, mask;
+
+		index = pin_out / 32;
+		mask = pin_out % 32;
+
+		enable = pdc_reg_read(IRQ_ENABLE_BANK, index);
+		__assign_bit(mask, &enable, on);
+		pdc_reg_write(IRQ_ENABLE_BANK, index, enable);
+	} else {
+		enable = pdc_reg_read(IRQ_i_CFG, pin_out);
+		__assign_bit(IRQ_i_CFG_IRQ_ENABLE, &enable, on);
+		pdc_reg_write(IRQ_i_CFG, pin_out, enable);
+	}
+}
+
+static void pdc_enable_intr(struct irq_data *d, bool on)
+{
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&pdc_lock, flags);
+	__pdc_enable_intr(d->hwirq, on);
+	raw_spin_unlock_irqrestore(&pdc_lock, flags);
+#if IS_ENABLED(CONFIG_IPC_LOGGING)
+	ipc_log_string(pdc_ipc_log, "PIN=%lu enable=%d", d->hwirq, on);
+#endif
+}
+
+static void qcom_pdc_gic_disable(struct irq_data *d)
+{
+	pdc_enable_intr(d, false);
+	irq_chip_disable_parent(d);
+}
+
+static void qcom_pdc_gic_enable(struct irq_data *d)
+{
+	pdc_enable_intr(d, true);
+	irq_chip_enable_parent(d);
 }
 
 /*
@@ -218,9 +248,12 @@ static int qcom_pdc_gic_set_type(struct irq_data *d, unsigned int type)
 	}
 
 	old_pdc_type = pdc_reg_read(IRQ_i_CFG, d->hwirq);
+	pdc_type |= (old_pdc_type & ~IRQ_i_CFG_TYPE_MASK);
 	pdc_reg_write(IRQ_i_CFG, d->hwirq, pdc_type);
-	ipc_log_string(pdc_ipc_log, "Set type: PIN=%d pdc_type=%d gic_type=%d",
+#if IS_ENABLED(CONFIG_IPC_LOGGING)
+	ipc_log_string(pdc_ipc_log, "Set type: PIN=%lu pdc_type=%d gic_type=%d",
 		       d->hwirq, pdc_type, type);
+#endif
 
 	/* Additionally, configure (only) the GPIO in the f/w */
 	ret = spi_configure_type(parent_hwirq, type);
@@ -265,34 +298,17 @@ static struct irq_chip qcom_pdc_gic_chip = {
 	.irq_set_affinity	= irq_chip_set_affinity_parent,
 };
 
-static irq_hw_number_t get_parent_hwirq(int pin)
+static struct pdc_pin_region *get_pin_region(int pin)
 {
 	int i;
-	struct pdc_pin_region *region;
 
 	for (i = 0; i < pdc_region_cnt; i++) {
-		region = &pdc_region[i];
-		if (pin >= region->pin_base &&
-		    pin < region->pin_base + region->cnt)
-			return (region->parent_base + pin - region->pin_base);
+		if (pin >= pdc_region[i].pin_base &&
+		    pin < pdc_region[i].pin_base + pdc_region[i].cnt)
+			return &pdc_region[i];
 	}
 
-	return PDC_NO_PARENT_IRQ;
-}
-
-static int qcom_pdc_translate(struct irq_domain *d, struct irq_fwspec *fwspec,
-			      unsigned long *hwirq, unsigned int *type)
-{
-	if (is_of_node(fwspec->fwnode)) {
-		if (fwspec->param_count != 2)
-			return -EINVAL;
-
-		*hwirq = fwspec->param[0];
-		*type = fwspec->param[1] & IRQ_TYPE_SENSE_MASK;
-		return 0;
-	}
-
-	return -EINVAL;
+	return NULL;
 }
 
 static int qcom_pdc_alloc(struct irq_domain *domain, unsigned int virq,
@@ -300,57 +316,12 @@ static int qcom_pdc_alloc(struct irq_domain *domain, unsigned int virq,
 {
 	struct irq_fwspec *fwspec = data;
 	struct irq_fwspec parent_fwspec;
-	irq_hw_number_t hwirq, parent_hwirq;
+	struct pdc_pin_region *region;
+	irq_hw_number_t hwirq;
 	unsigned int type;
 	int ret;
 
-	ret = qcom_pdc_translate(domain, fwspec, &hwirq, &type);
-	if (ret)
-		return ret;
-
-	ret  = irq_domain_set_hwirq_and_chip(domain, virq, hwirq,
-					     &qcom_pdc_gic_chip, NULL);
-	if (ret)
-		return ret;
-
-	parent_hwirq = get_parent_hwirq(hwirq);
-	if (parent_hwirq == PDC_NO_PARENT_IRQ)
-		return irq_domain_disconnect_hierarchy(domain->parent, virq);
-
-	if (type & IRQ_TYPE_EDGE_BOTH)
-		type = IRQ_TYPE_EDGE_RISING;
-
-	if (type & IRQ_TYPE_LEVEL_MASK)
-		type = IRQ_TYPE_LEVEL_HIGH;
-
-	parent_fwspec.fwnode      = domain->parent->fwnode;
-	parent_fwspec.param_count = 3;
-	parent_fwspec.param[0]    = 0;
-	parent_fwspec.param[1]    = parent_hwirq;
-	parent_fwspec.param[2]    = type;
-
-	ipc_log_string(pdc_ipc_log, "Alloc: PIN=%d GIC-SPI=%d",
-		       hwirq, parent_hwirq);
-	return irq_domain_alloc_irqs_parent(domain, virq, nr_irqs,
-					    &parent_fwspec);
-}
-
-static const struct irq_domain_ops qcom_pdc_ops = {
-	.translate	= qcom_pdc_translate,
-	.alloc		= qcom_pdc_alloc,
-	.free		= irq_domain_free_irqs_common,
-};
-
-static int qcom_pdc_gpio_alloc(struct irq_domain *domain, unsigned int virq,
-			       unsigned int nr_irqs, void *data)
-{
-	struct irq_fwspec *fwspec = data;
-	struct irq_fwspec parent_fwspec;
-	irq_hw_number_t hwirq, parent_hwirq;
-	unsigned int type;
-	int ret;
-
-	ret = qcom_pdc_translate(domain, fwspec, &hwirq, &type);
+	ret = irq_domain_translate_twocell(domain, fwspec, &hwirq, &type);
 	if (ret)
 		return ret;
 
@@ -362,8 +333,8 @@ static int qcom_pdc_gpio_alloc(struct irq_domain *domain, unsigned int virq,
 	if (ret)
 		return ret;
 
-	parent_hwirq = get_parent_hwirq(hwirq);
-	if (parent_hwirq == PDC_NO_PARENT_IRQ)
+	region = get_pin_region(hwirq);
+	if (!region)
 		return irq_domain_disconnect_hierarchy(domain->parent, virq);
 
 	if (type & IRQ_TYPE_EDGE_BOTH)
@@ -375,32 +346,25 @@ static int qcom_pdc_gpio_alloc(struct irq_domain *domain, unsigned int virq,
 	parent_fwspec.fwnode      = domain->parent->fwnode;
 	parent_fwspec.param_count = 3;
 	parent_fwspec.param[0]    = 0;
-	parent_fwspec.param[1]    = parent_hwirq;
+	parent_fwspec.param[1]    = pin_to_hwirq(region, hwirq);
 	parent_fwspec.param[2]    = type;
 
-	ipc_log_string(pdc_ipc_log, "GPIO alloc: PIN=%d GIC-SPI=%d",
-		       hwirq, parent_hwirq);
+#if IS_ENABLED(CONFIG_IPC_LOGGING)
+	ipc_log_string(pdc_ipc_log, "Alloc: PIN=%lu", hwirq);
+#endif
 	return irq_domain_alloc_irqs_parent(domain, virq, nr_irqs,
 					    &parent_fwspec);
 }
 
-static int qcom_pdc_gpio_domain_select(struct irq_domain *d,
-				       struct irq_fwspec *fwspec,
-				       enum irq_domain_bus_token bus_token)
-{
-	return bus_token == DOMAIN_BUS_WAKEUP;
-}
-
-static const struct irq_domain_ops qcom_pdc_gpio_ops = {
-	.select		= qcom_pdc_gpio_domain_select,
-	.alloc		= qcom_pdc_gpio_alloc,
+static const struct irq_domain_ops qcom_pdc_ops = {
+	.translate	= irq_domain_translate_twocell,
+	.alloc		= qcom_pdc_alloc,
 	.free		= irq_domain_free_irqs_common,
 };
 
 static int pdc_setup_pin_mapping(struct device_node *np)
 {
 	int ret, n, i;
-	u32 irq_index, reg_index, val;
 
 	n = of_property_count_elems_of_size(np, "qcom,pdc-ranges", sizeof(u32));
 	if (n <= 0 || n % 3)
@@ -430,29 +394,37 @@ static int pdc_setup_pin_mapping(struct device_node *np)
 		if (ret)
 			return ret;
 
-		for (i = 0; i < pdc_region[n].cnt; i++) {
-			reg_index = (i + pdc_region[n].pin_base) >> 5;
-			irq_index = (i + pdc_region[n].pin_base) & 0x1f;
-			val = pdc_reg_read(IRQ_ENABLE_BANK, reg_index);
-			val &= ~BIT(irq_index);
-			pdc_reg_write(IRQ_ENABLE_BANK, reg_index, val);
-		}
+		for (i = 0; i < pdc_region[n].cnt; i++)
+			__pdc_enable_intr(i + pdc_region[n].pin_base, 0);
 	}
 
 	return 0;
 }
 
+#define QCOM_PDC_SIZE 0x10000
+
 static int qcom_pdc_init(struct device_node *node, struct device_node *parent)
 {
-	struct irq_domain *parent_domain, *pdc_domain, *pdc_gpio_domain;
+	struct irq_domain *parent_domain, *pdc_domain;
+	resource_size_t res_size;
 	struct resource res;
 	int ret;
 
-	pdc_base = of_iomap(node, 0);
+	/* compat with old sm8150 DT which had very small region for PDC */
+	if (of_address_to_resource(node, 0, &res))
+		return -EINVAL;
+
+	res_size = max_t(resource_size_t, resource_size(&res), QCOM_PDC_SIZE);
+	if (res_size > resource_size(&res))
+		pr_warn("%pOF: invalid reg size, please fix DT\n", node);
+
+	pdc_base = ioremap(res.start, res_size);
 	if (!pdc_base) {
 		pr_err("%pOF: unable to map PDC registers\n", node);
 		return -ENXIO;
 	}
+
+	pdc_version = pdc_reg_read(PDC_VERSION_REG, 0);
 
 	parent_domain = irq_find_host(parent);
 	if (!parent_domain) {
@@ -467,21 +439,12 @@ static int qcom_pdc_init(struct device_node *node, struct device_node *parent)
 		goto fail;
 	}
 
-	pdc_domain = irq_domain_create_hierarchy(parent_domain, 0, PDC_MAX_IRQS,
-						 of_fwnode_handle(node),
-						 &qcom_pdc_ops, NULL);
-	if (!pdc_domain) {
-		pr_err("%pOF: GIC domain add failed\n", node);
-		ret = -ENOMEM;
-		goto fail;
-	}
-
 	ret = of_address_to_resource(node, 1, &res);
 	if (!ret) {
 		spi_cfg = kcalloc(1, sizeof(*spi_cfg), GFP_KERNEL);
 		if (!spi_cfg) {
 			ret = -ENOMEM;
-			goto remove;
+			goto fail;
 		}
 		spi_cfg->scm_io = of_find_property(node,
 						   "qcom,scm-spi-cfg", NULL);
@@ -492,58 +455,40 @@ static int qcom_pdc_init(struct device_node *node, struct device_node *parent)
 			spi_cfg->base = ioremap(res.start, spi_cfg->size);
 			if (!spi_cfg->base) {
 				ret = -ENOMEM;
-				goto remove;
+				goto fail;
 			}
 		}
 	}
 
-	pdc_gpio_domain = irq_domain_create_hierarchy(parent_domain,
+	pdc_domain = irq_domain_create_hierarchy(parent_domain,
 					IRQ_DOMAIN_FLAG_QCOM_PDC_WAKEUP,
 					PDC_MAX_GPIO_IRQS,
 					of_fwnode_handle(node),
-					&qcom_pdc_gpio_ops, NULL);
-	if (!pdc_gpio_domain) {
-		pr_err("%pOF: PDC domain add failed for GPIO domain\n", node);
+					&qcom_pdc_ops, NULL);
+	if (!pdc_domain) {
+		pr_err("%pOF: PDC domain add failed\n", node);
 		ret = -ENOMEM;
-		goto remove;
+		if (spi_cfg && spi_cfg->base)
+			iounmap(spi_cfg->base);
+		goto fail;
 	}
 
-	irq_domain_update_bus_token(pdc_gpio_domain, DOMAIN_BUS_WAKEUP);
+	irq_domain_update_bus_token(pdc_domain, DOMAIN_BUS_WAKEUP);
 
+#if IS_ENABLED(CONFIG_IPC_LOGGING)
 	pdc_ipc_log = ipc_log_context_create(PDC_IPC_LOG_SZ, "pdc", 0);
+#endif
 	return 0;
 
-remove:
-	irq_domain_remove(pdc_domain);
-	kfree(spi_cfg);
 fail:
+	kfree(spi_cfg);
 	kfree(pdc_region);
 	iounmap(pdc_base);
 	return ret;
 }
 
-static int qcom_pdc_probe(struct platform_device *pdev)
-{
-	struct device_node *np = pdev->dev.of_node;
-	struct device_node *parent = of_irq_find_parent(np);
-
-	return qcom_pdc_init(np, parent);
-}
-
-static const struct of_device_id qcom_pdc_match_table[] = {
-	{ .compatible = "qcom,pdc" },
-	{}
-};
-MODULE_DEVICE_TABLE(of, qcom_pdc_match_table);
-
-static struct platform_driver qcom_pdc_driver = {
-	.probe = qcom_pdc_probe,
-	.driver = {
-		.name = "qcom-pdc",
-		.of_match_table = qcom_pdc_match_table,
-		.suppress_bind_attrs = true,
-	},
-};
-module_platform_driver(qcom_pdc_driver);
+IRQCHIP_PLATFORM_DRIVER_BEGIN(qcom_pdc)
+IRQCHIP_MATCH("qcom,pdc", qcom_pdc_init)
+IRQCHIP_PLATFORM_DRIVER_END(qcom_pdc)
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. Power Domain Controller");
 MODULE_LICENSE("GPL v2");

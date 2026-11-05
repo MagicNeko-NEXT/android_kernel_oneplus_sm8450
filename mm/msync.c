@@ -14,6 +14,7 @@
 #include <linux/file.h>
 #include <linux/syscalls.h>
 #include <linux/sched.h>
+#include <linux/page_size_compat.h>
 
 /*
  * MS_SYNC syncs the entire file - including mappings.
@@ -41,12 +42,12 @@ SYSCALL_DEFINE3(msync, unsigned long, start, size_t, len, int, flags)
 
 	if (flags & ~(MS_ASYNC | MS_INVALIDATE | MS_SYNC))
 		goto out;
-	if (offset_in_page(start))
+	if (__offset_in_page_log(start))
 		goto out;
 	if ((flags & MS_ASYNC) && (flags & MS_SYNC))
 		goto out;
 	error = -ENOMEM;
-	len = (len + ~PAGE_MASK) & PAGE_MASK;
+	len = (len + ~__PAGE_MASK) & __PAGE_MASK;
 	end = start + len;
 	if (end < start)
 		goto out;
@@ -55,7 +56,9 @@ SYSCALL_DEFINE3(msync, unsigned long, start, size_t, len, int, flags)
 		goto out;
 	/*
 	 * If the interval [start,end) covers some unmapped address ranges,
-	 * just ignore them, but return -ENOMEM at the end.
+	 * just ignore them, but return -ENOMEM at the end. Besides, if the
+	 * flag is MS_ASYNC (w/o MS_INVALIDATE) the result would be -ENOMEM
+	 * anyway and there is nothing left to do, so return immediately.
 	 */
 	mmap_read_lock(mm);
 	vma = find_vma(mm, start);
@@ -69,6 +72,8 @@ SYSCALL_DEFINE3(msync, unsigned long, start, size_t, len, int, flags)
 			goto out_unlock;
 		/* Here start < vma->vm_end. */
 		if (start < vma->vm_start) {
+			if (flags == MS_ASYNC)
+				goto out_unlock;
 			start = vma->vm_start;
 			if (start >= end)
 				goto out_unlock;
@@ -100,7 +105,7 @@ SYSCALL_DEFINE3(msync, unsigned long, start, size_t, len, int, flags)
 				error = 0;
 				goto out_unlock;
 			}
-			vma = vma->vm_next;
+			vma = find_vma(mm, vma->vm_end);
 		}
 	}
 out_unlock:

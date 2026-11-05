@@ -5,21 +5,14 @@
 
 #if !defined(_TRACE_HOOK_FIPS140_H) || defined(TRACE_HEADER_MULTI_READ)
 #define _TRACE_HOOK_FIPS140_H
-#include <linux/tracepoint.h>
 #include <trace/hooks/vendor_hooks.h>
 
-#ifdef __GENKSYMS__
 struct crypto_aes_ctx;
-#else
-/* struct crypto_aes_ctx */
-#include <crypto/aes.h>
-#endif /* __GENKSYMS__ */
 
 /*
  * These hooks exist only for the benefit of the FIPS140 crypto module, which
  * uses them to swap out the underlying implementation with one that is integrity
- * checked as per FIPS 140 requirements. No other uses are allowed or
- * supported.
+ * checked as per FIPS 140 requirements. No other uses are allowed or supported.
  */
 
 DECLARE_HOOK(android_vh_sha256,

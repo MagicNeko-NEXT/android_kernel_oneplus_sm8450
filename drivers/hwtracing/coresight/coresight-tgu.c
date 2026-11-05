@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2017, 2019 The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/kernel.h>
@@ -117,11 +117,9 @@ static ssize_t enable_tgu_store(struct device *dev,
 		return -EINVAL;
 
 	/* Enable clock */
-	ret = pm_runtime_get_sync(drvdata->dev);
-	if (ret < 0) {
-		pm_runtime_put(drvdata->dev);
+	ret = pm_runtime_resume_and_get(drvdata->dev);
+	if (ret < 0)
 		return ret;
-	}
 
 	spin_lock(&drvdata->spinlock);
 	/* Unlock the TGU LAR */
@@ -173,7 +171,7 @@ static ssize_t enable_tgu_store(struct device *dev,
 		/* Disable TGU to program the triggers */
 		tgu_writel(drvdata, 0, TGU_CONTROL);
 
-		pm_runtime_put(drvdata->dev);
+		pm_runtime_put_sync(drvdata->dev);
 		dev_dbg(dev, "Coresight-TGU disabled\n");
 	}
 
@@ -196,11 +194,9 @@ static ssize_t reset_tgu_store(struct device *dev,
 
 	if (!drvdata->enable) {
 		/* Enable clock */
-		ret = pm_runtime_get_sync(drvdata->dev);
-		if (ret < 0) {
-			pm_runtime_put(drvdata->dev);
+		ret = pm_runtime_resume_and_get(drvdata->dev);
+		if (ret < 0)
 			return ret;
-		}
 	}
 
 	spin_lock(&drvdata->spinlock);
@@ -224,7 +220,7 @@ static ssize_t reset_tgu_store(struct device *dev,
 
 	TGU_LOCK(drvdata);
 	spin_unlock(&drvdata->spinlock);
-	pm_runtime_put(drvdata->dev);
+	pm_runtime_put_sync(drvdata->dev);
 	return size;
 }
 static DEVICE_ATTR_WO(reset_tgu);
@@ -486,7 +482,7 @@ static int tgu_probe(struct amba_device *adev, const struct amba_id *id)
 
 	drvdata->enable = false;
 
-	desc.type = CORESIGHT_DEV_TYPE_NONE;
+	desc.type = CORESIGHT_DEV_TYPE_HELPER;
 	desc.pdata = adev->dev.platform_data;
 	desc.dev = &adev->dev;
 	desc.groups = tgu_attr_grps;
@@ -496,12 +492,18 @@ static int tgu_probe(struct amba_device *adev, const struct amba_id *id)
 		goto err;
 	}
 
-	pm_runtime_put(&adev->dev);
+	pm_runtime_put_sync(&adev->dev);
 	dev_dbg(dev, "TGU initialized\n");
 	return 0;
 err:
-	pm_runtime_put(&adev->dev);
 	return ret;
+}
+
+static void __exit tgu_remove(struct amba_device *adev)
+{
+	struct tgu_drvdata *drvdata = dev_get_drvdata(&adev->dev);
+
+	coresight_unregister(drvdata->csdev);
 }
 
 static struct amba_id tgu_ids[] = {
@@ -521,9 +523,10 @@ static struct amba_driver tgu_driver = {
 	},
 	.probe		=	tgu_probe,
 	.id_table	=	tgu_ids,
+	.remove		=	tgu_remove,
 };
 
-builtin_amba_driver(tgu_driver);
+module_amba_driver(tgu_driver);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("CoreSight TGU driver");

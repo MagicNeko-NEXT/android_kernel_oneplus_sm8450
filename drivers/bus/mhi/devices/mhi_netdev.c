@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.*/
+// Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
 
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -49,7 +49,7 @@
 				"", __func__, ##__VA_ARGS__); \
 } while (0)
 
-const char * const mhi_log_level_str[MHI_MSG_LVL_MAX] = {
+static const char * const mhi_log_level_str[MHI_MSG_LVL_MAX] = {
 	[MHI_MSG_LVL_VERBOSE] = "Verbose",
 	[MHI_MSG_LVL_INFO] = "Info",
 	[MHI_MSG_LVL_ERROR] = "Error",
@@ -584,7 +584,7 @@ static int mhi_netdev_ioctl_extended(struct net_device *dev, struct ifreq *ifr)
 		ext_cmd.u.data = 0;
 		break;
 	case RMNET_IOCTL_GET_DRIVER_NAME:
-		strlcpy(ext_cmd.u.if_name, mhi_netdev->interface_name,
+		strscpy(ext_cmd.u.if_name, mhi_netdev->interface_name,
 			sizeof(ext_cmd.u.if_name));
 		break;
 	case RMNET_IOCTL_SET_SLEEP_STATE:
@@ -695,7 +695,8 @@ static int mhi_netdev_enable_iface(struct mhi_netdev *mhi_netdev)
 		return -ENOMEM;
 	}
 
-	mhi_netdev->ndev->mtu = MHI_MAX_MTU;
+	mhi_netdev->ndev->mtu = mhi_dev->mhi_cntrl->buffer_len;
+
 	SET_NETDEV_DEV(mhi_netdev->ndev, &mhi_dev->dev);
 	mhi_netdev_priv = netdev_priv(mhi_netdev->ndev);
 	mhi_netdev_priv->mhi_netdev = mhi_netdev;
@@ -994,10 +995,8 @@ static void mhi_netdev_remove(struct mhi_device *mhi_dev)
 	free_netdev(mhi_netdev->ndev);
 	mhi_netdev->ndev = NULL;
 
-#ifdef CONFIG_DEBUG_FS
 	if (!IS_ERR_OR_NULL(mhi_netdev->dentry))
 		debugfs_remove_recursive(mhi_netdev->dentry);
-#endif
 
 	if (!mhi_netdev->rsc_parent)
 		mhi_netdev_free_pool(mhi_netdev);
@@ -1135,7 +1134,7 @@ static int mhi_netdev_probe(struct mhi_device *mhi_dev,
 	return 0;
 }
 
-const static struct mhi_netdev_driver_data hw0_308_data = {
+static const struct mhi_netdev_driver_data hw0_308_data = {
 	.mru = 0x8000,
 	.chain_skb = true,
 	.is_rsc_chan = false,
@@ -1172,13 +1171,11 @@ module_init(mhi_netdev_init);
 
 static void __exit mhi_netdev_exit(void)
 {
-#ifdef CONFIG_DEBUG_FS
 	debugfs_remove_recursive(dentry);
-#endif
 
 	mhi_driver_unregister(&mhi_netdev_driver);
 }
 module_exit(mhi_netdev_exit);
 
 MODULE_DESCRIPTION("MHI NETDEV Network Interface");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

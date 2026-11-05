@@ -3,6 +3,7 @@
  * f_ccid.c -- CCID function Driver
  *
  * Copyright (c) 2011, 2013, 2017, 2019 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/slab.h>
@@ -14,6 +15,7 @@
 #include <linux/usb/composite.h>
 #include <linux/cdev.h>
 #include <linux/uaccess.h>
+#include <linux/compat.h>
 
 #include "f_ccid.h"
 
@@ -663,7 +665,6 @@ static int ccid_bulk_open(struct inode *inode, struct file *fp)
 	struct f_ccid *ccid_dev = bulk_dev_to_ccid(bulk_dev);
 	unsigned long flags;
 
-	pr_debug("%s\n", __func__);
 	if (!atomic_read(&ccid_dev->online)) {
 		pr_debug("%s: USB cable not connected\n", __func__);
 		return -ENODEV;
@@ -688,7 +689,6 @@ static int ccid_bulk_release(struct inode *ip, struct file *fp)
 	struct f_ccid *ccid_dev =  fp->private_data;
 	struct ccid_bulk_dev *bulk_dev = &ccid_dev->bulk_dev;
 
-	pr_debug("%s\n", __func__);
 	atomic_set(&bulk_dev->opened, 0);
 	return 0;
 }
@@ -979,12 +979,22 @@ ccid_ctrl_ioctl(struct file *fp, unsigned int cmd, u_long arg)
 	return 0;
 }
 
+#ifdef CONFIG_COMPAT
+static long ccid_ctrl_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	return ccid_ctrl_ioctl(file, cmd, (unsigned long)compat_ptr(arg));
+}
+#endif
+
 static const struct file_operations ccid_ctrl_fops = {
 	.owner		= THIS_MODULE,
 	.open		= ccid_ctrl_open,
 	.release	= ccid_ctrl_release,
 	.read		= ccid_ctrl_read,
 	.unlocked_ioctl	= ccid_ctrl_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl   = ccid_ctrl_compat_ioctl,
+#endif
 };
 
 static int ccid_cdev_init(struct cdev *cdev, const struct file_operations *fops,
@@ -1032,14 +1042,10 @@ static void ccid_cdev_free(struct cdev *cdev)
 }
 
 static void ccid_free_func(struct usb_function *f)
-{
-	pr_debug("%s\n", __func__);
-}
+{ }
 
 static int ccid_bind_config(struct f_ccid *ccid_dev)
 {
-	pr_debug("%s\n", __func__);
-
 	ccid_dev->function.name = FUNCTION_NAME;
 	ccid_dev->function.bind = ccid_function_bind;
 	ccid_dev->function.unbind = ccid_function_unbind;
@@ -1056,7 +1062,7 @@ static int ccid_alloc_chrdev_region(void)
 	int ret;
 	dev_t dev;
 
-	ccid_class = class_create(THIS_MODULE, "ccid_usb");
+	ccid_class = class_create("ccid_usb");
 	if (IS_ERR(ccid_class)) {
 		ret = PTR_ERR(ccid_class);
 		ccid_class = NULL;
@@ -1241,4 +1247,4 @@ static struct usb_function *ccid_alloc(struct usb_function_instance *fi)
 
 DECLARE_USB_FUNCTION_INIT(ccid, ccid_alloc_inst, ccid_alloc);
 MODULE_DESCRIPTION("USB CCID function Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

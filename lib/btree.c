@@ -237,7 +237,7 @@ static int keyzero(struct btree_geo *geo, unsigned long *key)
 	return 1;
 }
 
-void *btree_lookup(struct btree_head *head, struct btree_geo *geo,
+static void *btree_lookup_node(struct btree_head *head, struct btree_geo *geo,
 		unsigned long *key)
 {
 	int i, height = head->height;
@@ -256,7 +256,16 @@ void *btree_lookup(struct btree_head *head, struct btree_geo *geo,
 		if (!node)
 			return NULL;
 	}
+	return node;
+}
 
+void *btree_lookup(struct btree_head *head, struct btree_geo *geo,
+		unsigned long *key)
+{
+	int i;
+	unsigned long *node;
+
+	node = btree_lookup_node(head, geo, key);
 	if (!node)
 		return NULL;
 
@@ -270,23 +279,10 @@ EXPORT_SYMBOL_GPL(btree_lookup);
 int btree_update(struct btree_head *head, struct btree_geo *geo,
 		 unsigned long *key, void *val)
 {
-	int i, height = head->height;
-	unsigned long *node = head->node;
+	int i;
+	unsigned long *node;
 
-	if (height == 0)
-		return -ENOENT;
-
-	for ( ; height > 1; height--) {
-		for (i = 0; i < geo->no_pairs; i++)
-			if (keycmp(geo, node, i, key) <= 0)
-				break;
-		if (i == geo->no_pairs)
-			return -ENOENT;
-		node = bval(geo, node, i);
-		if (!node)
-			return -ENOENT;
-	}
-
+	node = btree_lookup_node(head, geo, key);
 	if (!node)
 		return -ENOENT;
 
@@ -797,4 +793,3 @@ module_exit(btree_module_exit);
 
 MODULE_AUTHOR("Joern Engel <joern@logfs.org>");
 MODULE_AUTHOR("Johannes Berg <johannes@sipsolutions.net>");
-MODULE_LICENSE("GPL");

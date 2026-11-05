@@ -76,6 +76,7 @@ static const struct cpg_core_clk r8a77970_core_clks[] __initconst = {
 	DEF_FIXED(".pll1_div4",	CLK_PLL1_DIV4,	CLK_PLL1_DIV2,	2, 1),
 
 	/* Core Clock Outputs */
+	DEF_FIXED("z2",		R8A77970_CLK_Z2,    CLK_PLL1_DIV4,  1, 1),
 	DEF_FIXED("ztr",	R8A77970_CLK_ZTR,   CLK_PLL1_DIV2,  6, 1),
 	DEF_FIXED("ztrd2",	R8A77970_CLK_ZTRD2, CLK_PLL1_DIV2, 12, 1),
 	DEF_FIXED("zt",		R8A77970_CLK_ZT,    CLK_PLL1_DIV2,  4, 1),
@@ -221,10 +222,11 @@ static int __init r8a77970_cpg_mssr_init(struct device *dev)
 
 static struct clk * __init r8a77970_cpg_clk_register(struct device *dev,
 	const struct cpg_core_clk *core, const struct cpg_mssr_info *info,
-	struct clk **clks, void __iomem *base,
-	struct raw_notifier_head *notifiers)
+	struct cpg_mssr_pub *pub)
 {
 	const struct clk_div_table *table;
+	void __iomem *base = pub->base0;
+	struct clk **clks = pub->clks;
 	const struct clk *parent;
 	unsigned int shift;
 
@@ -238,8 +240,7 @@ static struct clk * __init r8a77970_cpg_clk_register(struct device *dev,
 		shift = 4;
 		break;
 	default:
-		return rcar_gen3_cpg_clk_register(dev, core, info, clks, base,
-						  notifiers);
+		return rcar_gen3_cpg_clk_register(dev, core, info, pub);
 	}
 
 	parent = clks[core->parent];

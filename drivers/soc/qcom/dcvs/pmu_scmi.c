@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/scmi_protocol.h>
@@ -18,7 +19,7 @@ static int scmi_pmu_probe(struct scmi_device *sdev)
 	if (!sdev)
 		return -ENODEV;
 
-	return rimps_pmu_init(sdev);
+	return cpucp_pmu_init(sdev);
 }
 
 static const struct scmi_device_id scmi_id_table[] = {
@@ -36,4 +37,4 @@ module_scmi_driver(scmi_pmu_drv);
 
 MODULE_SOFTDEP("pre: pmu_vendor");
 MODULE_DESCRIPTION("ARM SCMI PMU driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

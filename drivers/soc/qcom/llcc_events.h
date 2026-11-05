@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Copyright (c) 2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2017, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef _SOC_QCOM_LLCC_EVENTS_H_
@@ -11,13 +12,15 @@ enum event_port_select {
 	EVENT_PORT_FERC,
 	EVENT_PORT_FEWC,
 	EVENT_PORT_BEAC,
+	EVENT_PORT_EWB = 3,
 	EVENT_PORT_BERC,
 	EVENT_PORT_TRP,
 	EVENT_PORT_DRP,
 	EVENT_PORT_PMGR,
 	EVENT_PORT_BEAC1,
-	EVENT_PORT_TENURE,
+	EVENT_PORT_LCP = 8,
 	EVENT_PORT_TLAT,
+	EVENT_PORT_TENURE,
 };
 
 enum feac_events {

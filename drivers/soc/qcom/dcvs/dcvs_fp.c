@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "qcom-dcvs-fp: " fmt
@@ -113,13 +114,13 @@ static int populate_bcm_data(struct device *dev, struct bcm_data *bcm,
 		return ret;
 	}
 	if (data_len != sizeof(*data)) {
-		dev_err(dev, "Bad data len for %s: %d\n", bcm_name, data_len);
+		dev_err(dev, "Bad data len for %s: %lu\n", bcm_name, data_len);
 		return -EINVAL;
 	}
 	bcm->unit = le32_to_cpu(data->unit) / 1000UL;
 	bcm->width = le16_to_cpu(data->width);
 	bcm->vcd = data->vcd;
-	dev_dbg(dev, "Got BCM %s: addr=%lu, unit=%lu, width=%lu, vcd=%lu\n",
+	dev_dbg(dev, "Got BCM %s: addr=%d, unit=%d, width=%d, vcd=%d\n",
 			bcm_name, bcm->addr, bcm->unit, bcm->width, bcm->vcd);
 
 	return 0;
@@ -149,7 +150,7 @@ int setup_ddrllcc_fp_device(struct device *dev, struct dcvs_hw *hw,
 
 	return ret;
 }
-EXPORT_SYMBOL(setup_ddrllcc_fp_device);
+EXPORT_SYMBOL_GPL(setup_ddrllcc_fp_device);
 
 #define DDR_BCM_PROP	"qcom,ddr-bcm-name"
 #define LLCC_BCM_PROP	"qcom,llcc-bcm-name"
@@ -230,22 +231,7 @@ static struct platform_driver qcom_dcvs_fp_driver = {
 		.suppress_bind_attrs = true,
 	},
 };
-
-static int __init qcom_dcvs_fp_init(void)
-{
-	return platform_driver_register(&qcom_dcvs_fp_driver);
-}
-
-#if IS_MODULE(CONFIG_QCOM_DCVS_FP)
-module_init(qcom_dcvs_fp_init);
-#else
-arch_initcall(qcom_dcvs_fp_init);
-#endif
-static __exit void qcom_dcvs_fp_exit(void)
-{
-	platform_driver_unregister(&qcom_dcvs_fp_driver);
-}
-module_exit(qcom_dcvs_fp_exit);
+module_platform_driver(qcom_dcvs_fp_driver);
 
 MODULE_DESCRIPTION("QCOM DCVS FP Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

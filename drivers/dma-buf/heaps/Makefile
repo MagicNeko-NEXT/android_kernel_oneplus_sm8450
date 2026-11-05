@@ -14,3 +14,6 @@ qcom_dma_heaps-$(CONFIG_QCOM_DMABUF_HEAPS_CMA)	+= qcom_cma_heap.o
 qcom_dma_heaps-$(CONFIG_QCOM_DMABUF_HEAPS_CARVEOUT) += qcom_carveout_heap.o \
 						       qcom_dma_heap_secure_utils.o
 qcom_dma_heaps-$(CONFIG_QCOM_DMABUF_HEAPS_BITSTREAM_CONTIG) += qcom_bitstream_contig_heap.o
+qcom_dma_heaps-$(CONFIG_QCOM_DMABUF_HEAPS_UBWCP) += qcom_ubwcp_heap.o
+qcom_dma_heaps-$(CONFIG_QCOM_DMABUF_HEAPS_TVM_CARVEOUT) += qcom_tvm_carveout_heap.o
+qcom_dma_heaps-$(CONFIG_QCOM_DMABUF_HEAPS_SYSTEM_MOVABLE) += qcom_system_movable_heap.o

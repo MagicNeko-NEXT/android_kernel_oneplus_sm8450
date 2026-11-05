@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #include <linux/clk.h>
 #include <linux/regulator/consumer.h>
@@ -255,7 +256,7 @@ static int arm_smmu_init_regulators(struct arm_smmu_power_resources *pwr)
 {
 	const char *cname;
 	struct property *prop;
-	int i, ret = 0;
+	int i;
 	struct device *dev = pwr->dev;
 
 	pwr->num_gdscs =
@@ -277,8 +278,7 @@ static int arm_smmu_init_regulators(struct arm_smmu_power_resources *pwr)
 				prop, cname)
 		pwr->gdscs[i++].supply = cname;
 
-	ret = devm_regulator_bulk_get(dev, pwr->num_gdscs, pwr->gdscs);
-	return ret;
+	return devm_regulator_bulk_get(dev, pwr->num_gdscs, pwr->gdscs);
 }
 
 static int arm_smmu_init_interconnect(struct arm_smmu_power_resources *pwr)

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (c) 2011-2017, The Linux Foundation
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022, 2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/slab.h>
 #include <linux/pm_runtime.h>
 #include "slimbus.h"
+#include <linux/io.h>
 
 /**
  * slim_msg_response() - Deliver Message response received from a device to the
@@ -43,7 +44,7 @@ void slim_msg_response(struct slim_controller *ctrl, u8 *reply, u8 tid, u8 len)
 	}
 
 	slim_free_txn_tid(ctrl, txn);
-	memcpy(msg->rbuf, reply, len);
+	memcpy_fromio(msg->rbuf, reply, len);
 	if (txn->comp)
 		complete(txn->comp);
 
@@ -80,7 +81,7 @@ int slim_alloc_txn_tid(struct slim_controller *ctrl, struct slim_msg_txn *txn)
 EXPORT_SYMBOL_GPL(slim_alloc_txn_tid);
 
 /**
- * slim_free_txn_tid() - Freee tid of txn
+ * slim_free_txn_tid() - Free tid of txn
  *
  * @ctrl: Controller handle
  * @txn: transaction whose tid should be freed
@@ -102,7 +103,7 @@ EXPORT_SYMBOL_GPL(slim_free_txn_tid);
  * @txn: Transaction to be sent over SLIMbus
  *
  * Called by controller to transmit messaging transactions not dealing with
- * Interface/Value elements. (e.g. transmittting a message to assign logical
+ * Interface/Value elements. (e.g. transmitting a message to assign logical
  * address to a slave device
  *
  * Return: -ETIMEDOUT: If transmission of this message timed out
@@ -125,7 +126,7 @@ int slim_do_transfer(struct slim_controller *ctrl, struct slim_msg_txn *txn)
 		 txn->mc <= SLIM_MSG_MC_RECONFIGURE_NOW))
 		clk_pause_msg = true;
 
-	/* Initialize tid to invalid value as zero*/
+	/* Initialize tid to invalid value */
 	txn->tid = 0;
 	need_tid = slim_tid_txn(txn->mt, txn->mc);
 
@@ -163,7 +164,6 @@ int slim_do_transfer(struct slim_controller *ctrl, struct slim_msg_txn *txn)
 		}
 	}
 
-
 	ret = ctrl->xfer_msg(ctrl, txn);
 	if (ret == -ETIMEDOUT) {
 		slim_free_txn_tid(ctrl, txn);
@@ -174,6 +174,7 @@ int slim_do_transfer(struct slim_controller *ctrl, struct slim_msg_txn *txn)
 						      msecs_to_jiffies(ms));
 		if (!timeout) {
 			ret = -ETIMEDOUT;
+			txn->comp = NULL;
 			slim_free_txn_tid(ctrl, txn);
 		}
 	}
@@ -183,7 +184,7 @@ int slim_do_transfer(struct slim_controller *ctrl, struct slim_msg_txn *txn)
 			txn->mt, txn->mc, txn->la, ret);
 
 slim_xfer_err:
-	if (!clk_pause_msg && (txn->tid == 0 || ret == -ETIMEDOUT)) {
+	if (!clk_pause_msg && (txn->tid == 0  || ret == -ETIMEDOUT)) {
 		/*
 		 * remove runtime-pm vote if this was TX only, or
 		 * if there was error during this transaction

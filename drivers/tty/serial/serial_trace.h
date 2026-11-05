@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  *
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2021-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #undef TRACE_SYSTEM
@@ -37,3 +38,4 @@ TRACE_EVENT(serial_info,
 #define TRACE_INCLUDE_PATH .
 #define TRACE_INCLUDE_FILE serial_trace
 #include <trace/define_trace.h>
+

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2013-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2019, 2021 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/kernel.h>
@@ -19,9 +20,13 @@
 struct boot_stats {
 	uint32_t bootloader_start;
 	uint32_t bootloader_end;
-	uint32_t bootloader_display;
-	uint32_t bootloader_load_kernel;
-};
+	uint32_t bootloader_load_boot_start;
+	uint32_t bootloader_load_boot_end;
+	uint32_t bootloader_load_vendor_boot_start;
+	uint32_t bootloader_load_vendor_boot_end;
+	uint32_t bootloader_load_init_boot_start;
+	uint32_t bootloader_load_init_boot_end;
+} __packed;
 
 static void __iomem *mpm_counter_base;
 static uint32_t mpm_counter_freq;
@@ -56,7 +61,7 @@ static int mpm_parse_dt(void)
 	if (of_get_address(np_mpm2, 0, NULL, NULL)) {
 		mpm_counter_base = of_iomap(np_mpm2, 0);
 		if (!mpm_counter_base) {
-			pr_err("mpm_counter: cant map counter base\n");
+			pr_err("mpm_counter: can't map counter base\n");
 			goto err2;
 		}
 	} else
@@ -77,10 +82,9 @@ static void print_boot_stats(void)
 		readl_relaxed(&boot_stats->bootloader_start));
 	pr_info("KPI: Bootloader end count = %u\n",
 		readl_relaxed(&boot_stats->bootloader_end));
-	pr_info("KPI: Bootloader display count = %u\n",
-		readl_relaxed(&boot_stats->bootloader_display));
 	pr_info("KPI: Bootloader load kernel count = %u\n",
-		readl_relaxed(&boot_stats->bootloader_load_kernel));
+		readl_relaxed(&boot_stats->bootloader_load_boot_end) -
+		readl_relaxed(&boot_stats->bootloader_load_boot_start));
 	pr_info("KPI: Kernel MPM timestamp = %u\n",
 		readl_relaxed(mpm_counter_base));
 	pr_info("KPI: Kernel MPM Clock frequency = %u\n",
@@ -96,7 +100,6 @@ static int __init boot_stats_init(void)
 		return -ENODEV;
 
 	print_boot_stats();
-
 	iounmap(boot_stats);
 	iounmap(mpm_counter_base);
 
@@ -110,4 +113,4 @@ static void __exit boot_stats_exit(void)
 module_exit(boot_stats_exit)
 
 MODULE_DESCRIPTION("MSM boot stats info driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

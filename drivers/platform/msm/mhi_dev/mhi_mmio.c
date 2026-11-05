@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2015,2017-2021, The Linux Foundation. All rights reserved.*/
-/* Copyright (c) 2024-2025 Qualcomm Innovation Center, Inc. All rights reserved.*/
+//Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
 
 #include <linux/kernel.h>
 #include <linux/of.h>
@@ -36,7 +35,7 @@ int mhi_dev_mmio_read(struct mhi_dev *dev, uint32_t offset,
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_read);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_read);
 
 int mhi_dev_mmio_write(struct mhi_dev *dev, uint32_t offset,
 				uint32_t val)
@@ -54,7 +53,7 @@ int mhi_dev_mmio_write(struct mhi_dev *dev, uint32_t offset,
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_write);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_write);
 
 int mhi_dev_mmio_masked_write(struct mhi_dev *dev, uint32_t offset,
 						uint32_t mask, uint32_t shift,
@@ -74,7 +73,7 @@ int mhi_dev_mmio_masked_write(struct mhi_dev *dev, uint32_t offset,
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_masked_write);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_masked_write);
 
 int mhi_dev_mmio_masked_read(struct mhi_dev *dev, uint32_t offset,
 						uint32_t mask, uint32_t shift,
@@ -90,7 +89,7 @@ int mhi_dev_mmio_masked_read(struct mhi_dev *dev, uint32_t offset,
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_masked_read);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_masked_read);
 
 static int mhi_dev_mmio_mask_set_chdb_int_a7(struct mhi_dev *dev,
 						uint32_t chdb_id, bool enable)
@@ -102,7 +101,7 @@ static int mhi_dev_mmio_mask_set_chdb_int_a7(struct mhi_dev *dev,
 	chid_idx = chdb_id/32;
 
 	if (chid_idx >= MHI_MASK_ROWS_CH_EV_DB) {
-		pr_err("Invalid channel id:%d\n", chid_idx);
+		mhi_log(dev->vf_id, MHI_MSG_ERROR, "Invalid ch_id:%d\n", chid_idx);
 		return -EINVAL;
 	}
 
@@ -127,7 +126,7 @@ int mhi_dev_mmio_enable_chdb_a7(struct mhi_dev *dev, uint32_t chdb_id)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_enable_chdb_a7);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_enable_chdb_a7);
 
 int mhi_dev_mmio_disable_chdb_a7(struct mhi_dev *dev, uint32_t chdb_id)
 {
@@ -138,7 +137,7 @@ int mhi_dev_mmio_disable_chdb_a7(struct mhi_dev *dev, uint32_t chdb_id)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_disable_chdb_a7);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_disable_chdb_a7);
 
 static int mhi_dev_mmio_set_erdb_int_a7(struct mhi_dev *dev,
 					uint32_t erdb_ch_id, bool enable)
@@ -168,7 +167,7 @@ int mhi_dev_mmio_enable_erdb_a7(struct mhi_dev *dev, uint32_t erdb_id)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_enable_erdb_a7);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_enable_erdb_a7);
 
 int mhi_dev_mmio_disable_erdb_a7(struct mhi_dev *dev, uint32_t erdb_id)
 {
@@ -179,7 +178,7 @@ int mhi_dev_mmio_disable_erdb_a7(struct mhi_dev *dev, uint32_t erdb_id)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_disable_erdb_a7);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_disable_erdb_a7);
 
 int mhi_dev_mmio_get_mhi_state(struct mhi_dev *dev, enum mhi_dev_state *state,
 						u32 *mhi_reset)
@@ -199,12 +198,12 @@ int mhi_dev_mmio_get_mhi_state(struct mhi_dev *dev, enum mhi_dev_state *state,
 	else
 		*mhi_reset = 0;
 
-	mhi_log(MHI_MSG_VERBOSE, "MHICTRL is 0x%x, reset:%d\n",
+	mhi_log(dev->vf_id, MHI_MSG_VERBOSE, "MHICTRL is 0x%x, reset:%d\n",
 			reg_value, *mhi_reset);
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_get_mhi_state);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_get_mhi_state);
 
 static int mhi_dev_mmio_set_chdb_interrupts(struct mhi_dev *dev, bool enable)
 {
@@ -231,7 +230,7 @@ int mhi_dev_mmio_enable_chdb_interrupts(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_enable_chdb_interrupts);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_enable_chdb_interrupts);
 
 int mhi_dev_mmio_mask_chdb_interrupts(struct mhi_dev *dev)
 {
@@ -242,7 +241,7 @@ int mhi_dev_mmio_mask_chdb_interrupts(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_mask_chdb_interrupts);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_mask_chdb_interrupts);
 
 int mhi_dev_mmio_read_chdb_status_interrupts(struct mhi_dev *dev)
 {
@@ -257,7 +256,7 @@ int mhi_dev_mmio_read_chdb_status_interrupts(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_read_chdb_status_interrupts);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_read_chdb_status_interrupts);
 
 static int mhi_dev_mmio_set_erdb_interrupts(struct mhi_dev *dev, bool enable)
 {
@@ -282,7 +281,7 @@ int mhi_dev_mmio_enable_erdb_interrupts(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_enable_erdb_interrupts);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_enable_erdb_interrupts);
 
 int mhi_dev_mmio_mask_erdb_interrupts(struct mhi_dev *dev)
 {
@@ -293,7 +292,7 @@ int mhi_dev_mmio_mask_erdb_interrupts(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_mask_erdb_interrupts);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_mask_erdb_interrupts);
 
 int mhi_dev_mmio_read_erdb_status_interrupts(struct mhi_dev *dev)
 {
@@ -308,7 +307,7 @@ int mhi_dev_mmio_read_erdb_status_interrupts(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_read_erdb_status_interrupts);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_read_erdb_status_interrupts);
 
 int mhi_dev_mmio_enable_ctrl_interrupt(struct mhi_dev *dev)
 {
@@ -320,7 +319,7 @@ int mhi_dev_mmio_enable_ctrl_interrupt(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_enable_ctrl_interrupt);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_enable_ctrl_interrupt);
 
 int mhi_dev_mmio_disable_ctrl_interrupt(struct mhi_dev *dev)
 {
@@ -332,7 +331,7 @@ int mhi_dev_mmio_disable_ctrl_interrupt(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_disable_ctrl_interrupt);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_disable_ctrl_interrupt);
 
 int mhi_dev_mmio_read_ctrl_status_interrupt(struct mhi_dev *dev)
 {
@@ -345,7 +344,7 @@ int mhi_dev_mmio_read_ctrl_status_interrupt(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_read_ctrl_status_interrupt);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_read_ctrl_status_interrupt);
 
 int mhi_dev_mmio_read_cmdb_status_interrupt(struct mhi_dev *dev)
 {
@@ -358,7 +357,7 @@ int mhi_dev_mmio_read_cmdb_status_interrupt(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_read_cmdb_status_interrupt);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_read_cmdb_status_interrupt);
 
 int mhi_dev_mmio_enable_cmdb_interrupt(struct mhi_dev *dev)
 {
@@ -370,7 +369,7 @@ int mhi_dev_mmio_enable_cmdb_interrupt(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_enable_cmdb_interrupt);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_enable_cmdb_interrupt);
 
 int mhi_dev_mmio_disable_cmdb_interrupt(struct mhi_dev *dev)
 {
@@ -382,7 +381,7 @@ int mhi_dev_mmio_disable_cmdb_interrupt(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_disable_cmdb_interrupt);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_disable_cmdb_interrupt);
 
 void mhi_dev_mmio_mask_interrupts(struct mhi_dev *dev)
 {
@@ -394,7 +393,7 @@ void mhi_dev_mmio_mask_interrupts(struct mhi_dev *dev)
 
 	mhi_dev_mmio_mask_erdb_interrupts(dev);
 }
-EXPORT_SYMBOL(mhi_dev_mmio_mask_interrupts);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_mask_interrupts);
 
 int mhi_dev_mmio_clear_interrupts(struct mhi_dev *dev)
 {
@@ -417,7 +416,7 @@ int mhi_dev_mmio_clear_interrupts(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_clear_interrupts);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_clear_interrupts);
 
 int mhi_dev_mmio_get_chc_base(struct mhi_dev *dev)
 {
@@ -443,7 +442,7 @@ int mhi_dev_mmio_get_chc_base(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_get_chc_base);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_get_chc_base);
 
 int mhi_dev_mmio_get_erc_base(struct mhi_dev *dev)
 {
@@ -469,7 +468,7 @@ int mhi_dev_mmio_get_erc_base(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_get_erc_base);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_get_erc_base);
 
 int mhi_dev_mmio_get_crc_base(struct mhi_dev *dev)
 {
@@ -495,7 +494,7 @@ int mhi_dev_mmio_get_crc_base(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_get_crc_base);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_get_crc_base);
 
 int mhi_dev_mmio_get_ch_db(struct mhi_dev_ring *ring, uint64_t *wr_offset)
 {
@@ -519,7 +518,7 @@ int mhi_dev_mmio_get_ch_db(struct mhi_dev_ring *ring, uint64_t *wr_offset)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_get_ch_db);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_get_ch_db);
 
 int mhi_dev_mmio_get_erc_db(struct mhi_dev_ring *ring, uint64_t *wr_offset)
 {
@@ -542,7 +541,7 @@ int mhi_dev_mmio_get_erc_db(struct mhi_dev_ring *ring, uint64_t *wr_offset)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_get_erc_db);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_get_erc_db);
 
 int mhi_dev_mmio_get_cmd_db(struct mhi_dev_ring *ring, uint64_t *wr_offset)
 {
@@ -562,7 +561,7 @@ int mhi_dev_mmio_get_cmd_db(struct mhi_dev_ring *ring, uint64_t *wr_offset)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_get_cmd_db);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_get_cmd_db);
 
 int mhi_dev_mmio_set_env(struct mhi_dev *dev, uint32_t value)
 {
@@ -573,7 +572,7 @@ int mhi_dev_mmio_set_env(struct mhi_dev *dev, uint32_t value)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_set_env);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_set_env);
 
 int mhi_dev_mmio_clear_reset(struct mhi_dev *dev)
 {
@@ -585,7 +584,7 @@ int mhi_dev_mmio_clear_reset(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_clear_reset);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_clear_reset);
 
 int mhi_dev_mmio_reset(struct mhi_dev *dev)
 {
@@ -598,7 +597,7 @@ int mhi_dev_mmio_reset(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_reset);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_reset);
 
 int mhi_dev_restore_mmio(struct mhi_dev *dev)
 {
@@ -627,14 +626,14 @@ int mhi_dev_restore_mmio(struct mhi_dev *dev)
 	for (i = 0; i < MHI_MASK_ROWS_CH_EV_DB; i++) {
 		/* Enable channel interrupt whose mask is enabled */
 		if (dev->chdb[i].mask) {
-			mhi_log(MHI_MSG_VERBOSE,
+			mhi_log(dev->vf_id, MHI_MSG_VERBOSE,
 				"Enabling id: %d, chdb mask  0x%x\n",
 							i, dev->chdb[i].mask);
 
 			rc = mhi_dev_mmio_write(dev, MHI_CHDB_INT_MASK_A7_n(i),
 							dev->chdb[i].mask);
 			if (rc) {
-				mhi_log(MHI_MSG_VERBOSE,
+				mhi_log(dev->vf_id, MHI_MSG_ERROR,
 					"Error writing enable for A7\n");
 				return rc;
 			}
@@ -647,114 +646,12 @@ int mhi_dev_restore_mmio(struct mhi_dev *dev)
 	/*Enable cmdb interrupt*/
 	mhi_dev_mmio_enable_cmdb_interrupt(dev);
 
+	/*Mem barrier to ensure write is visible*/
 	mb();
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_restore_mmio);
-
-/**
- * mhi_dev_add_cap - Add next capability at the end of the list
- * This implementation assumes QTimer is the first capability and since the registers
- * are located in the RAM, by default they contain garbage values. Make sure capability
- * is programmed properly before fetching next capability offset from register value.
- *
- * @dev:	MHI Dev structure.
- * @first_cap_offs: First capability offset
- * @cap_id:	Capability ID.
- */
-static u32 mhi_dev_add_cap(struct mhi_dev *dev, u32 first_cap_offs, enum mhi_dev_cap_id cap_id)
-{
-	u32 val, next_cap_offs = 0;
-
-	if (cap_id == MHI_DEV_QTIMER_TIME_SYNC_CAP_ID) {
-		mhi_dev_mmio_write(dev, MISCOFF, MHI_BAR_OFFSET(first_cap_offs));
-		mhi_dev_mmio_write(dev, first_cap_offs, FIELD_PREP(MHI_CAP_ID_MASK, cap_id));
-		return first_cap_offs;
-	}
-
-	mhi_dev_mmio_read(dev, first_cap_offs, &val);
-	next_cap_offs = FIELD_GET(MHI_NEXT_PTR_MASK, val);
-	while (next_cap_offs != 0) {
-		/*
-		 * Next cap offset programmed in capability register is what Host is expecting.
-		 * For device, the offset will be 0x100 ahead of what Host sees.
-		 */
-		first_cap_offs = MHI_ABS_OFFSET(next_cap_offs);
-		mhi_dev_mmio_read(dev, first_cap_offs, &val);
-		next_cap_offs = FIELD_GET(MHI_NEXT_PTR_MASK, val);
-	}
-
-	/*
-	 * Keeping capabilities at an offset of 0x10, which is the generalized approach followed
-	 * on all the previous targets.
-	 */
-	next_cap_offs = first_cap_offs + PER_CAPABILITY_OFFSET;
-
-	/* Program offset of next capability in previous capability node */
-	mhi_dev_mmio_write(dev, first_cap_offs, val |
-			FIELD_PREP(MHI_NEXT_PTR_MASK, (MHI_BAR_OFFSET(next_cap_offs))));
-
-	/* Program capability ID of current node, next_ptr = 0 */
-	mhi_dev_mmio_write(dev, next_cap_offs, FIELD_PREP(MHI_CAP_ID_MASK, cap_id));
-	return next_cap_offs;
-}
-
-/**
- * mhi_dev_is_cap_populated - If MISCOFF register contains expected value, capabilities are
- * already exposed by the PBL. Otherwise, HLOS should program the needed capabilities.
- * This implementation is based on the fact that Qtimer capability is present on all the
- * targets as the first capability.
- *
- * @dev:	MHI Dev structure.
- * @mhi_first_cap_offs: Qtimer capability offset
- * @cap_id:	Capability ID.
- */
-bool mhi_dev_is_cap_populated(struct mhi_dev *dev, u32  mhi_first_cap_offs,
-			      enum mhi_dev_cap_id cap_id)
-{
-	u32 next_ptr = 0, curr_cap_id = 0;
-	u32 val, mhi_miscoff;
-
-	mhi_dev_mmio_read(dev, MISCOFF, &mhi_miscoff);
-	if (mhi_miscoff != MHI_BAR_OFFSET(mhi_first_cap_offs))
-		return false;
-
-	mhi_dev_mmio_read(dev, mhi_first_cap_offs, &val);
-	next_ptr = FIELD_GET(MHI_NEXT_PTR_MASK, val);
-	curr_cap_id = FIELD_GET(MHI_CAP_ID_MASK, val);
-
-	/* Loop until capability ID matches or we reach end of list */
-	while (curr_cap_id != cap_id) {
-		if (next_ptr == 0)
-			return false;
-
-		mhi_dev_mmio_read(dev, next_ptr, &val);
-		next_ptr = FIELD_GET(MHI_NEXT_PTR_MASK, val);
-		curr_cap_id = FIELD_GET(MHI_CAP_ID_MASK, val);
-	}
-
-	return true;
-}
-EXPORT_SYMBOL_GPL(mhi_dev_is_cap_populated);
-
-void mhi_dev_configure_time_sync_cap(struct mhi_dev *dev, u32 mhi_first_cap_offs)
-{
-	/* Programming TIME_CFG register to 0 for non-posted mode */
-	mhi_dev_mmio_write(dev, mhi_dev_add_cap(dev, mhi_first_cap_offs,
-				MHI_DEV_QTIMER_TIME_SYNC_CAP_ID) + TIME_CFG_OFFSET, 0);
-}
-EXPORT_SYMBOL_GPL(mhi_dev_configure_time_sync_cap);
-
-void mhi_dev_configure_max_trb_len(struct mhi_dev *dev)
-{
-	u32 mhi_first_cap_offs;
-
-	mhi_dev_mmio_read(dev, MISCOFF, &mhi_first_cap_offs);
-	mhi_dev_mmio_write(dev, mhi_dev_add_cap(dev, MHI_ABS_OFFSET(mhi_first_cap_offs),
-			   MHI_DEV_MAX_TRB_LEN_CAP_ID) + MAX_TRB_LEN_CFG_OFFS, MAX_TRB_LEN);
-}
-EXPORT_SYMBOL_GPL(mhi_dev_configure_max_trb_len);
+EXPORT_SYMBOL_GPL(mhi_dev_restore_mmio);
 
 int mhi_dev_backup_mmio(struct mhi_dev *dev)
 {
@@ -772,7 +669,7 @@ int mhi_dev_backup_mmio(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_backup_mmio);
+EXPORT_SYMBOL_GPL(mhi_dev_backup_mmio);
 
 int mhi_dev_get_mhi_addr(struct mhi_dev *dev)
 {
@@ -807,7 +704,7 @@ int mhi_dev_get_mhi_addr(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_get_mhi_addr);
+EXPORT_SYMBOL_GPL(mhi_dev_get_mhi_addr);
 
 int mhi_dev_mmio_init(struct mhi_dev *dev)
 {
@@ -832,14 +729,14 @@ int mhi_dev_mmio_init(struct mhi_dev *dev)
 
 	mhi_dev_mmio_read(dev, ERDBOFF, &dev->cfg.erdb_offset);
 
-	dev->cfg.channels = NUM_CHANNELS;
-
-	if (!dev->mmio_initialized)
+	if (!dev->is_flashless)
 		mhi_dev_mmio_reset(dev);
+
+	dev->cfg.channels = NUM_CHANNELS;
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_mmio_init);
+EXPORT_SYMBOL_GPL(mhi_dev_mmio_init);
 
 int mhi_dev_update_ner(struct mhi_dev *dev)
 {
@@ -861,7 +758,7 @@ int mhi_dev_update_ner(struct mhi_dev *dev)
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_update_ner);
+EXPORT_SYMBOL_GPL(mhi_dev_update_ner);
 
 int mhi_dev_dump_mmio(struct mhi_dev *dev)
 {
@@ -879,11 +776,11 @@ int mhi_dev_dump_mmio(struct mhi_dev *dev)
 
 		mhi_dev_mmio_read(dev, offset+0xC, &r4);
 
-		offset += 0x10;
-		pr_debug("0x%08x 0x%08x 0x%08x 0x%08x 0x%08x\n",
+		mhi_log(dev->vf_id, MHI_MSG_ERROR, "0x%08x 0x%08x 0x%08x 0x%08x 0x%08x\n",
 				offset, r1, r2, r3, r4);
+		offset += 0x10;
 	}
 
 	return 0;
 }
-EXPORT_SYMBOL(mhi_dev_dump_mmio);
+EXPORT_SYMBOL_GPL(mhi_dev_dump_mmio);

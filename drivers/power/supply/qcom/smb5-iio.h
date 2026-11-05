@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Copyright (c) 2020 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2020-2021 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef __SMB5_IIO_H
@@ -32,6 +33,11 @@ enum qg_chg_iio_channels {
 	SMB5_QG_CYCLE_COUNT,
 	SMB5_QG_CHARGE_FULL_DESIGN,
 	SMB5_QG_TIME_TO_FULL_NOW,
+	SMB5_QG_TIME_TO_EMPTY_NOW,
+	SMB5_QG_NOMINAL_CAPACITY,
+	SMB5_QG_LEARNED_CAPACITY,
+	SMB5_QG_SOH,
+	SMB5_QG_MAX,
 };
 
 enum cp_iio_channels {
@@ -144,6 +150,8 @@ static const struct smb5_iio_prop_channels smb5_chans_pmic[] = {
 	SMB5_CHAN_INDEX("usb_real_type", USB_REAL_TYPE)
 	SMB5_CHAN_VOLT("usb_pd_voltage_max", PD_VOLTAGE_MAX)
 	SMB5_CHAN_VOLT("usb_pd_voltage_min", PD_VOLTAGE_MIN)
+	SMB5_CHAN_VOLT("voltage_qnovo", VOLTAGE_QNOVO)
+	SMB5_CHAN_CUR("current_qnovo", CURRENT_QNOVO)
 	SMB5_CHAN_INDEX("usb_connector_type", CONNECTOR_TYPE)
 	SMB5_CHAN_INDEX("usb_connector_health", CONNECTOR_HEALTH)
 	SMB5_CHAN_VOLT("usb_voltage_max_limit", VOLTAGE_MAX_LIMIT)
@@ -151,6 +159,7 @@ static const struct smb5_iio_prop_channels smb5_chans_pmic[] = {
 	SMB5_CHAN_INDEX("usb_smb_en_reason", SMB_EN_REASON)
 	SMB5_CHAN_INDEX("usb_adapter_cc_mode", ADAPTER_CC_MODE)
 	SMB5_CHAN_INDEX("usb_moisture_detected", MOISTURE_DETECTED)
+	SMB5_CHAN_INDEX("usb_moisture_detection_en", MOISTURE_DETECTION_EN)
 	SMB5_CHAN_INDEX("usb_hvdcp_opti_allowed", HVDCP_OPTI_ALLOWED)
 	SMB5_CHAN_ACTIVITY("usb_qc_opti_disable", QC_OPTI_DISABLE)
 	SMB5_CHAN_VOLT("usb_voltage_vph", VOLTAGE_VPH)
@@ -200,6 +209,7 @@ static const struct smb5_iio_prop_channels smb5_chans_pmic[] = {
 	SMB5_CHAN_ACTIVITY("battery_force_recharge", FORCE_RECHARGE)
 	SMB5_CHAN_ACTIVITY("battery_fcc_stepper_enable", FCC_STEPPER_ENABLE)
 	SMB5_CHAN_INDEX("usb_typec_accessory_mode", TYPEC_ACCESSORY_MODE)
+	SMB5_CHAN_ACTIVITY("battery_sys_soc", SYS_SOC)
 };
 
 struct iio_channel **get_ext_channels(struct device *dev,

@@ -41,6 +41,7 @@
  *	Andrew F. Davis <afd@ti.com>
  *
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/dma-buf.h>
@@ -128,10 +129,11 @@ static struct sg_table *get_pages(u64 size, struct dma_heap *heap)
 	while (size_remaining > 0) {
 		page = qcom_sys_heap_alloc_largest_available(qcom_sys_heap_pools,
 							     size_remaining,
-							     max_order);
+							     max_order,
+							     false);
 
 		if (!page) {
-			pr_err("%s: Failed to get pages from the system heap: %d, %d!\n",
+			pr_err("%s: Failed to get pages from the system heap: %lu, %llu!\n",
 			       __func__, size_remaining, size);
 			ret = -ENOMEM;
 			goto err;
@@ -432,7 +434,6 @@ static void system_heap_free(struct qcom_sg_buffer *buffer)
 		}
 		dynamic_page_pool_free(sys_heap->pool_list[j], page);
 	}
-	atomic_long_sub(buffer->len, &sys_heap->total_allocated);
 	sg_free_table(table);
 	kfree(buffer);
 }
@@ -477,13 +478,14 @@ static struct page *alloc_largest_available(struct dynamic_page_pool **pools,
 
 	return qcom_sys_heap_alloc_largest_available(qcom_sys_heap_pools,
 						     size,
-						     max_order);
+						     max_order,
+						     false);
 }
 
 static struct dma_buf *system_heap_allocate(struct dma_heap *heap,
 					       unsigned long len,
-					       unsigned long fd_flags,
-					       unsigned long heap_flags)
+					       u32 fd_flags,
+					       u64 heap_flags)
 {
 	struct qcom_secure_system_heap *sys_heap;
 	struct qcom_sg_buffer *buffer;
@@ -560,8 +562,13 @@ static struct dma_buf *system_heap_allocate(struct dma_heap *heap,
 		dma_unmap_sgtable(dma_heap_get_dev(heap), &non_secure_table, DMA_BIDIRECTIONAL, 0);
 
 		hyp_ret = hyp_assign_sg_from_flags(&non_secure_table, sys_heap->vmid, true);
-		if (hyp_ret)
+		if (hyp_ret) {
+			if (hyp_ret != -EADDRNOTAVAIL)
+				/* Set hyp_ret = 0 so that we free the non-secure pages */
+				hyp_ret = 0;
+
 			goto free_non_secure_sg;
+		}
 	}
 
 	perms = msm_secure_get_vmid_perms(sys_heap->vmid);
@@ -580,7 +587,7 @@ static struct dma_buf *system_heap_allocate(struct dma_heap *heap,
 	exp_info.size = buffer->len;
 	exp_info.flags = fd_flags;
 	exp_info.priv = buffer;
-	dmabuf = mem_buf_dma_buf_export(&exp_info, &qcom_sg_buf_ops);
+	dmabuf = qcom_dma_buf_export(&exp_info, &qcom_sg_buf_ops);
 	if (IS_ERR(dmabuf)) {
 		ret = PTR_ERR(dmabuf);
 		goto vmperm_release;
@@ -588,7 +595,7 @@ static struct dma_buf *system_heap_allocate(struct dma_heap *heap,
 
 	if (num_non_secure_pages)
 		sg_free_table(&non_secure_table);
-	atomic_long_add(len, &sys_heap->total_allocated);
+
 	return dmabuf;
 
 vmperm_release:
@@ -625,42 +632,6 @@ static long get_pool_size_bytes(struct dma_heap *heap)
 		total_size += dynamic_page_pool_total(sys_heap->pool_list[i], true);
 
 	return total_size << PAGE_SHIFT;
-}
-
-int qcom_secure_system_freeze(void)
-{
-	struct qcom_secure_system_heap *sys_heap;
-	long sz;
-
-	cancel_delayed_work_sync(&prefetch_work);
-	list_for_each_entry(sys_heap, &secure_heaps, list) {
-		sz = atomic_long_read(&sys_heap->total_allocated);
-		if (sz) {
-			pr_err("%s: Allocations not freed for VMID: %d %lx bytes won't be saved across hibernation. Aborting freeze.\n",
-				__func__, sys_heap->vmid, sz);
-			return -EINVAL;
-		}
-
-		dynamic_page_pool_release_pools(sys_heap->pool_list);
-	}
-	return 0;
-}
-
-int qcom_secure_system_restore(void)
-{
-	struct qcom_secure_system_heap *sys_heap;
-
-	list_for_each_entry(sys_heap, &secure_heaps, list) {
-		sys_heap->pool_list = dynamic_page_pool_create_pools(sys_heap->vmid,
-					free_secure_pages);
-		if (IS_ERR(sys_heap->pool_list)) {
-			pr_err("%s: Pool creation failed for VMID: %d, err: %d\n",
-				__func__, sys_heap->vmid,
-				PTR_ERR(sys_heap->pool_list));
-			sys_heap->pool_list = NULL;
-		}
-	}
-	return 0;
 }
 
 static const struct dma_heap_ops system_heap_ops = {
@@ -744,7 +715,7 @@ void qcom_secure_system_heap_create(const char *name, const char *secure_system_
 
 		heap = dma_heap_add(&exp_info);
 		if (IS_ERR(heap)) {
-			pr_err("%s: Failed to create '%s', error is %d\n", __func__,
+			pr_err("%s: Failed to create '%s', error is %ld\n", __func__,
 			       secure_system_alias, PTR_ERR(heap));
 			return;
 		}

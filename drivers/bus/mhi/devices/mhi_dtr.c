@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.*/
+// Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
 
 #include <linux/device.h>
 #include <linux/dma-direction.h>
@@ -272,6 +272,6 @@ static void __exit mhi_dtr_exit(void)
 }
 module_exit(mhi_dtr_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_ALIAS("MHI_DTR");
 MODULE_DESCRIPTION("MHI DTR Driver");

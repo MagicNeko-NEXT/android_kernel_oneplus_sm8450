@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2021-2023, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "%s:%s " fmt, KBUILD_MODNAME, __func__
@@ -21,9 +22,6 @@ struct userspace_cdev {
 	unsigned int			cur_level;
 	unsigned int			max_level;
 };
-
-static struct userspace_cdev *cdev_instances;
-static int inst_cnt;
 
 static int userspace_get_max_state(struct thermal_cooling_device *cdev,
 				 unsigned long *state)
@@ -73,25 +71,12 @@ static struct thermal_cooling_device_ops userspace_cdev_ops = {
 	.set_cur_state = userspace_set_cur_state,
 };
 
-static void userspace_cdev_cleanup(void)
-{
-	int idx = 0;
-	struct userspace_cdev *usr_cdev = cdev_instances;
-
-	for (; idx < inst_cnt; idx++) {
-		if (usr_cdev[idx].cdev)
-			thermal_cooling_device_unregister(
-					usr_cdev[idx].cdev);
-		usr_cdev[idx].cdev = NULL;
-	}
-	inst_cnt = 0;
-}
-
 static int userspace_device_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	int ret = 0, idx = 0, subsys_cnt = 0;
 	struct device_node *np = dev->of_node, *subsys_np = NULL;
+	struct userspace_cdev *cdev_instances;
 
 	subsys_cnt = of_get_available_child_count(np);
 	if (!subsys_cnt) {
@@ -103,7 +88,6 @@ static int userspace_device_probe(struct platform_device *pdev)
 	if (!cdev_instances)
 		return -ENOMEM;
 
-	inst_cnt = subsys_cnt;
 	for_each_available_child_of_node(np, subsys_np) {
 		if (idx >= subsys_cnt) {
 			of_node_put(subsys_np);
@@ -119,16 +103,17 @@ static int userspace_device_probe(struct platform_device *pdev)
 		}
 
 		cdev_instances[idx].np = subsys_np;
-		strlcpy(cdev_instances[idx].cdev_name, subsys_np->name,
+		strscpy(cdev_instances[idx].cdev_name, subsys_np->name,
 				THERMAL_NAME_LENGTH);
 
-		cdev_instances[idx].cdev = thermal_of_cooling_device_register(
+		cdev_instances[idx].cdev = devm_thermal_of_cooling_device_register(
+						dev,
 						subsys_np,
 						cdev_instances[idx].cdev_name,
 						&cdev_instances[idx],
 						&userspace_cdev_ops);
 		if (IS_ERR(cdev_instances[idx].cdev)) {
-			dev_err(dev, "Error registering cdev:%s err:%d\n",
+			dev_err(dev, "Error registering cdev:%s err:%ld\n",
 					cdev_instances[idx].cdev_name,
 					PTR_ERR(cdev_instances[idx].cdev));
 			cdev_instances[idx].cdev = NULL;
@@ -145,16 +130,7 @@ static int userspace_device_probe(struct platform_device *pdev)
 probe_error:
 	of_node_put(subsys_np);
 	of_node_put(np);
-	inst_cnt = idx;
-	userspace_cdev_cleanup();
 	return ret;
-}
-
-static int userspace_device_remove(struct platform_device *pdev)
-{
-	userspace_cdev_cleanup();
-
-	return 0;
 }
 
 static const struct of_device_id userspace_device_match[] = {
@@ -164,7 +140,6 @@ static const struct of_device_id userspace_device_match[] = {
 
 static struct platform_driver userspace_cdev_driver = {
 	.probe          = userspace_device_probe,
-	.remove         = userspace_device_remove,
 	.driver         = {
 		.name   = USERSPACE_CDEV_DRIVER,
 		.of_match_table = userspace_device_match,
@@ -183,5 +158,5 @@ static void __exit userspace_cdev_exit(void)
 }
 module_exit(userspace_cdev_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Userspace cooling device driver");

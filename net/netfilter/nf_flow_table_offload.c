@@ -13,12 +13,15 @@
 #include <net/netfilter/nf_conntrack_core.h>
 #include <net/netfilter/nf_conntrack_tuple.h>
 
-static struct workqueue_struct *nf_flow_offload_wq;
+#define NF_FLOW_RULE_ACTION_MAX	24
+
+static struct workqueue_struct *nf_flow_offload_add_wq;
+static struct workqueue_struct *nf_flow_offload_del_wq;
+static struct workqueue_struct *nf_flow_offload_stats_wq;
 
 struct flow_offload_work {
 	struct list_head	list;
 	enum flow_cls_command	cmd;
-	int			priority;
 	struct nf_flowtable	*flowtable;
 	struct flow_offload	*flow;
 	struct work_struct	work;
@@ -33,7 +36,7 @@ static void nf_flow_rule_lwt_match(struct nf_flow_match *match,
 {
 	struct nf_flow_key *mask = &match->mask;
 	struct nf_flow_key *key = &match->key;
-	unsigned int enc_keys;
+	unsigned long long enc_keys;
 
 	if (!tun_info || !(tun_info->mode & IP_TUNNEL_INFO_TX))
 		return;
@@ -42,8 +45,8 @@ static void nf_flow_rule_lwt_match(struct nf_flow_match *match,
 	NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_ENC_KEYID, enc_key_id);
 	key->enc_key_id.keyid = tunnel_id_to_key32(tun_info->key.tun_id);
 	mask->enc_key_id.keyid = 0xffffffff;
-	enc_keys = BIT(FLOW_DISSECTOR_KEY_ENC_KEYID) |
-		   BIT(FLOW_DISSECTOR_KEY_ENC_CONTROL);
+	enc_keys = BIT_ULL(FLOW_DISSECTOR_KEY_ENC_KEYID) |
+		   BIT_ULL(FLOW_DISSECTOR_KEY_ENC_CONTROL);
 
 	if (ip_tunnel_info_af(tun_info) == AF_INET) {
 		NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_ENC_IPV4_ADDRS,
@@ -54,7 +57,7 @@ static void nf_flow_rule_lwt_match(struct nf_flow_match *match,
 			mask->enc_ipv4.src = 0xffffffff;
 		if (key->enc_ipv4.dst)
 			mask->enc_ipv4.dst = 0xffffffff;
-		enc_keys |= BIT(FLOW_DISSECTOR_KEY_ENC_IPV4_ADDRS);
+		enc_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_ENC_IPV4_ADDRS);
 		key->enc_control.addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS;
 	} else {
 		memcpy(&key->enc_ipv6.src, &tun_info->key.u.ipv6.dst,
@@ -69,11 +72,21 @@ static void nf_flow_rule_lwt_match(struct nf_flow_match *match,
 			   sizeof(struct in6_addr)))
 			memset(&mask->enc_ipv6.dst, 0xff,
 			       sizeof(struct in6_addr));
-		enc_keys |= BIT(FLOW_DISSECTOR_KEY_ENC_IPV6_ADDRS);
+		enc_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_ENC_IPV6_ADDRS);
 		key->enc_control.addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
 	}
 
 	match->dissector.used_keys |= enc_keys;
+}
+
+static void nf_flow_rule_vlan_match(struct flow_dissector_key_vlan *key,
+				    struct flow_dissector_key_vlan *mask,
+				    u16 vlan_id, __be16 proto)
+{
+	key->vlan_id = vlan_id;
+	mask->vlan_id = VLAN_VID_MASK;
+	key->vlan_tpid = proto;
+	mask->vlan_tpid = 0xffff;
 }
 
 static int nf_flow_rule_match(struct nf_flow_match *match,
@@ -83,6 +96,7 @@ static int nf_flow_rule_match(struct nf_flow_match *match,
 	struct nf_flow_key *mask = &match->mask;
 	struct nf_flow_key *key = &match->key;
 	struct ip_tunnel_info *tun_info;
+	bool vlan_encap = false;
 
 	NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_META, meta);
 	NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_CONTROL, control);
@@ -97,8 +111,38 @@ static int nf_flow_rule_match(struct nf_flow_match *match,
 		nf_flow_rule_lwt_match(match, tun_info);
 	}
 
-	key->meta.ingress_ifindex = tuple->iifidx;
+	if (tuple->xmit_type == FLOW_OFFLOAD_XMIT_TC)
+		key->meta.ingress_ifindex = tuple->tc.iifidx;
+	else
+		key->meta.ingress_ifindex = tuple->iifidx;
+
 	mask->meta.ingress_ifindex = 0xffffffff;
+
+	if (tuple->encap_num > 0 && !(tuple->in_vlan_ingress & BIT(0)) &&
+	    tuple->encap[0].proto == htons(ETH_P_8021Q)) {
+		NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_VLAN, vlan);
+		nf_flow_rule_vlan_match(&key->vlan, &mask->vlan,
+					tuple->encap[0].id,
+					tuple->encap[0].proto);
+		vlan_encap = true;
+	}
+
+	if (tuple->encap_num > 1 && !(tuple->in_vlan_ingress & BIT(1)) &&
+	    tuple->encap[1].proto == htons(ETH_P_8021Q)) {
+		if (vlan_encap) {
+			NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_CVLAN,
+					  cvlan);
+			nf_flow_rule_vlan_match(&key->cvlan, &mask->cvlan,
+						tuple->encap[1].id,
+						tuple->encap[1].proto);
+		} else {
+			NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_VLAN,
+					  vlan);
+			nf_flow_rule_vlan_match(&key->vlan, &mask->vlan,
+						tuple->encap[1].id,
+						tuple->encap[1].proto);
+		}
+	}
 
 	switch (tuple->l3proto) {
 	case AF_INET:
@@ -121,16 +165,17 @@ static int nf_flow_rule_match(struct nf_flow_match *match,
 		return -EOPNOTSUPP;
 	}
 	mask->control.addr_type = 0xffff;
-	match->dissector.used_keys |= BIT(key->control.addr_type);
+	match->dissector.used_keys |= BIT_ULL(key->control.addr_type);
 	mask->basic.n_proto = 0xffff;
 
 	switch (tuple->l4proto) {
 	case IPPROTO_TCP:
 		key->tcp.flags = 0;
 		mask->tcp.flags = cpu_to_be16(be32_to_cpu(TCP_FLAG_RST | TCP_FLAG_FIN) >> 16);
-		match->dissector.used_keys |= BIT(FLOW_DISSECTOR_KEY_TCP);
+		match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_TCP);
 		break;
 	case IPPROTO_UDP:
+	case IPPROTO_GRE:
 		break;
 	default:
 		return -EOPNOTSUPP;
@@ -139,15 +184,22 @@ static int nf_flow_rule_match(struct nf_flow_match *match,
 	key->basic.ip_proto = tuple->l4proto;
 	mask->basic.ip_proto = 0xff;
 
-	key->tp.src = tuple->src_port;
-	mask->tp.src = 0xffff;
-	key->tp.dst = tuple->dst_port;
-	mask->tp.dst = 0xffff;
+	match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_META) |
+				      BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) |
+				      BIT_ULL(FLOW_DISSECTOR_KEY_BASIC);
 
-	match->dissector.used_keys |= BIT(FLOW_DISSECTOR_KEY_META) |
-				      BIT(FLOW_DISSECTOR_KEY_CONTROL) |
-				      BIT(FLOW_DISSECTOR_KEY_BASIC) |
-				      BIT(FLOW_DISSECTOR_KEY_PORTS);
+	switch (tuple->l4proto) {
+	case IPPROTO_TCP:
+	case IPPROTO_UDP:
+		key->tp.src = tuple->src_port;
+		mask->tp.src = 0xffff;
+		key->tp.dst = tuple->dst_port;
+		mask->tp.dst = 0xffff;
+
+		match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_PORTS);
+		break;
+	}
+
 	return 0;
 }
 
@@ -165,7 +217,12 @@ static void flow_offload_mangle(struct flow_action_entry *entry,
 static inline struct flow_action_entry *
 flow_action_entry_next(struct nf_flow_rule *flow_rule)
 {
-	int i = flow_rule->rule->action.num_entries++;
+	int i;
+
+	if (unlikely(flow_rule->rule->action.num_entries >= NF_FLOW_RULE_ACTION_MAX))
+		return NULL;
+
+	i = flow_rule->rule->action.num_entries++;
 
 	return &flow_rule->rule->action.entries[i];
 }
@@ -175,27 +232,46 @@ static int flow_offload_eth_src(struct net *net,
 				enum flow_offload_tuple_dir dir,
 				struct nf_flow_rule *flow_rule)
 {
-	const struct flow_offload_tuple *tuple = &flow->tuplehash[!dir].tuple;
 	struct flow_action_entry *entry0 = flow_action_entry_next(flow_rule);
 	struct flow_action_entry *entry1 = flow_action_entry_next(flow_rule);
-	struct net_device *dev;
+	const struct flow_offload_tuple *other_tuple, *this_tuple;
+	struct net_device *dev = NULL;
+	const unsigned char *addr;
 	u32 mask, val;
 	u16 val16;
 
-	dev = dev_get_by_index(net, tuple->iifidx);
-	if (!dev)
-		return -ENOENT;
+	if (!entry0 || !entry1)
+		return -E2BIG;
+
+	this_tuple = &flow->tuplehash[dir].tuple;
+
+	switch (this_tuple->xmit_type) {
+	case FLOW_OFFLOAD_XMIT_DIRECT:
+		addr = this_tuple->out.h_source;
+		break;
+	case FLOW_OFFLOAD_XMIT_NEIGH:
+		other_tuple = &flow->tuplehash[!dir].tuple;
+		dev = dev_get_by_index(net, other_tuple->iifidx);
+		if (!dev)
+			return -ENOENT;
+
+		addr = dev->dev_addr;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
 
 	mask = ~0xffff0000;
-	memcpy(&val16, dev->dev_addr, 2);
+	memcpy(&val16, addr, 2);
 	val = val16 << 16;
 	flow_offload_mangle(entry0, FLOW_ACT_MANGLE_HDR_TYPE_ETH, 4,
 			    &val, &mask);
 
 	mask = ~0xffffffff;
-	memcpy(&val, dev->dev_addr + 2, 4);
+	memcpy(&val, addr + 2, 4);
 	flow_offload_mangle(entry1, FLOW_ACT_MANGLE_HDR_TYPE_ETH, 8,
 			    &val, &mask);
+
 	dev_put(dev);
 
 	return 0;
@@ -208,27 +284,43 @@ static int flow_offload_eth_dst(struct net *net,
 {
 	struct flow_action_entry *entry0 = flow_action_entry_next(flow_rule);
 	struct flow_action_entry *entry1 = flow_action_entry_next(flow_rule);
-	const void *daddr = &flow->tuplehash[!dir].tuple.src_v4;
+	const struct flow_offload_tuple *other_tuple, *this_tuple;
 	const struct dst_entry *dst_cache;
 	unsigned char ha[ETH_ALEN];
 	struct neighbour *n;
+	const void *daddr;
 	u32 mask, val;
 	u8 nud_state;
 	u16 val16;
 
-	dst_cache = flow->tuplehash[dir].tuple.dst_cache;
-	n = dst_neigh_lookup(dst_cache, daddr);
-	if (!n)
-		return -ENOENT;
+	if (!entry0 || !entry1)
+		return -E2BIG;
 
-	read_lock_bh(&n->lock);
-	nud_state = n->nud_state;
-	ether_addr_copy(ha, n->ha);
-	read_unlock_bh(&n->lock);
+	this_tuple = &flow->tuplehash[dir].tuple;
 
-	if (!(nud_state & NUD_VALID)) {
+	switch (this_tuple->xmit_type) {
+	case FLOW_OFFLOAD_XMIT_DIRECT:
+		ether_addr_copy(ha, this_tuple->out.h_dest);
+		break;
+	case FLOW_OFFLOAD_XMIT_NEIGH:
+		other_tuple = &flow->tuplehash[!dir].tuple;
+		daddr = &other_tuple->src_v4;
+		dst_cache = this_tuple->dst_cache;
+		n = dst_neigh_lookup(dst_cache, daddr);
+		if (!n)
+			return -ENOENT;
+
+		read_lock_bh(&n->lock);
+		nud_state = n->nud_state;
+		ether_addr_copy(ha, n->ha);
+		read_unlock_bh(&n->lock);
 		neigh_release(n);
-		return -ENOENT;
+
+		if (!(nud_state & NUD_VALID))
+			return -ENOENT;
+		break;
+	default:
+		return -EOPNOTSUPP;
 	}
 
 	mask = ~0xffffffff;
@@ -241,20 +333,22 @@ static int flow_offload_eth_dst(struct net *net,
 	val = val16;
 	flow_offload_mangle(entry1, FLOW_ACT_MANGLE_HDR_TYPE_ETH, 4,
 			    &val, &mask);
-	neigh_release(n);
 
 	return 0;
 }
 
-static void flow_offload_ipv4_snat(struct net *net,
-				   const struct flow_offload *flow,
-				   enum flow_offload_tuple_dir dir,
-				   struct nf_flow_rule *flow_rule)
+static int flow_offload_ipv4_snat(struct net *net,
+				  const struct flow_offload *flow,
+				  enum flow_offload_tuple_dir dir,
+				  struct nf_flow_rule *flow_rule)
 {
 	struct flow_action_entry *entry = flow_action_entry_next(flow_rule);
 	u32 mask = ~htonl(0xffffffff);
 	__be32 addr;
 	u32 offset;
+
+	if (!entry)
+		return -E2BIG;
 
 	switch (dir) {
 	case FLOW_OFFLOAD_DIR_ORIGINAL:
@@ -266,22 +360,26 @@ static void flow_offload_ipv4_snat(struct net *net,
 		offset = offsetof(struct iphdr, daddr);
 		break;
 	default:
-		return;
+		return -EOPNOTSUPP;
 	}
 
 	flow_offload_mangle(entry, FLOW_ACT_MANGLE_HDR_TYPE_IP4, offset,
 			    &addr, &mask);
+	return 0;
 }
 
-static void flow_offload_ipv4_dnat(struct net *net,
-				   const struct flow_offload *flow,
-				   enum flow_offload_tuple_dir dir,
-				   struct nf_flow_rule *flow_rule)
+static int flow_offload_ipv4_dnat(struct net *net,
+				  const struct flow_offload *flow,
+				  enum flow_offload_tuple_dir dir,
+				  struct nf_flow_rule *flow_rule)
 {
 	struct flow_action_entry *entry = flow_action_entry_next(flow_rule);
 	u32 mask = ~htonl(0xffffffff);
 	__be32 addr;
 	u32 offset;
+
+	if (!entry)
+		return -E2BIG;
 
 	switch (dir) {
 	case FLOW_OFFLOAD_DIR_ORIGINAL:
@@ -293,14 +391,15 @@ static void flow_offload_ipv4_dnat(struct net *net,
 		offset = offsetof(struct iphdr, saddr);
 		break;
 	default:
-		return;
+		return -EOPNOTSUPP;
 	}
 
 	flow_offload_mangle(entry, FLOW_ACT_MANGLE_HDR_TYPE_IP4, offset,
 			    &addr, &mask);
+	return 0;
 }
 
-static void flow_offload_ipv6_mangle(struct nf_flow_rule *flow_rule,
+static int flow_offload_ipv6_mangle(struct nf_flow_rule *flow_rule,
 				     unsigned int offset,
 				     const __be32 *addr, const __be32 *mask)
 {
@@ -309,15 +408,20 @@ static void flow_offload_ipv6_mangle(struct nf_flow_rule *flow_rule,
 
 	for (i = 0; i < sizeof(struct in6_addr) / sizeof(u32); i++) {
 		entry = flow_action_entry_next(flow_rule);
+		if (!entry)
+			return -E2BIG;
+
 		flow_offload_mangle(entry, FLOW_ACT_MANGLE_HDR_TYPE_IP6,
 				    offset + i * sizeof(u32), &addr[i], mask);
 	}
+
+	return 0;
 }
 
-static void flow_offload_ipv6_snat(struct net *net,
-				   const struct flow_offload *flow,
-				   enum flow_offload_tuple_dir dir,
-				   struct nf_flow_rule *flow_rule)
+static int flow_offload_ipv6_snat(struct net *net,
+				  const struct flow_offload *flow,
+				  enum flow_offload_tuple_dir dir,
+				  struct nf_flow_rule *flow_rule)
 {
 	u32 mask = ~htonl(0xffffffff);
 	const __be32 *addr;
@@ -333,16 +437,16 @@ static void flow_offload_ipv6_snat(struct net *net,
 		offset = offsetof(struct ipv6hdr, daddr);
 		break;
 	default:
-		return;
+		return -EOPNOTSUPP;
 	}
 
-	flow_offload_ipv6_mangle(flow_rule, offset, addr, &mask);
+	return flow_offload_ipv6_mangle(flow_rule, offset, addr, &mask);
 }
 
-static void flow_offload_ipv6_dnat(struct net *net,
-				   const struct flow_offload *flow,
-				   enum flow_offload_tuple_dir dir,
-				   struct nf_flow_rule *flow_rule)
+static int flow_offload_ipv6_dnat(struct net *net,
+				  const struct flow_offload *flow,
+				  enum flow_offload_tuple_dir dir,
+				  struct nf_flow_rule *flow_rule)
 {
 	u32 mask = ~htonl(0xffffffff);
 	const __be32 *addr;
@@ -358,10 +462,10 @@ static void flow_offload_ipv6_dnat(struct net *net,
 		offset = offsetof(struct ipv6hdr, saddr);
 		break;
 	default:
-		return;
+		return -EOPNOTSUPP;
 	}
 
-	flow_offload_ipv6_mangle(flow_rule, offset, addr, &mask);
+	return flow_offload_ipv6_mangle(flow_rule, offset, addr, &mask);
 }
 
 static int flow_offload_l4proto(const struct flow_offload *flow)
@@ -383,14 +487,17 @@ static int flow_offload_l4proto(const struct flow_offload *flow)
 	return type;
 }
 
-static void flow_offload_port_snat(struct net *net,
-				   const struct flow_offload *flow,
-				   enum flow_offload_tuple_dir dir,
-				   struct nf_flow_rule *flow_rule)
+static int flow_offload_port_snat(struct net *net,
+				  const struct flow_offload *flow,
+				  enum flow_offload_tuple_dir dir,
+				  struct nf_flow_rule *flow_rule)
 {
 	struct flow_action_entry *entry = flow_action_entry_next(flow_rule);
 	u32 mask, port;
 	u32 offset;
+
+	if (!entry)
+		return -E2BIG;
 
 	switch (dir) {
 	case FLOW_OFFLOAD_DIR_ORIGINAL:
@@ -406,21 +513,25 @@ static void flow_offload_port_snat(struct net *net,
 		mask = ~htonl(0xffff);
 		break;
 	default:
-		return;
+		return -EOPNOTSUPP;
 	}
 
 	flow_offload_mangle(entry, flow_offload_l4proto(flow), offset,
 			    &port, &mask);
+	return 0;
 }
 
-static void flow_offload_port_dnat(struct net *net,
-				   const struct flow_offload *flow,
-				   enum flow_offload_tuple_dir dir,
-				   struct nf_flow_rule *flow_rule)
+static int flow_offload_port_dnat(struct net *net,
+				  const struct flow_offload *flow,
+				  enum flow_offload_tuple_dir dir,
+				  struct nf_flow_rule *flow_rule)
 {
 	struct flow_action_entry *entry = flow_action_entry_next(flow_rule);
 	u32 mask, port;
 	u32 offset;
+
+	if (!entry)
+		return -E2BIG;
 
 	switch (dir) {
 	case FLOW_OFFLOAD_DIR_ORIGINAL:
@@ -436,19 +547,23 @@ static void flow_offload_port_dnat(struct net *net,
 		mask = ~htonl(0xffff0000);
 		break;
 	default:
-		return;
+		return -EOPNOTSUPP;
 	}
 
 	flow_offload_mangle(entry, flow_offload_l4proto(flow), offset,
 			    &port, &mask);
+	return 0;
 }
 
-static void flow_offload_ipv4_checksum(struct net *net,
-				       const struct flow_offload *flow,
-				       struct nf_flow_rule *flow_rule)
+static int flow_offload_ipv4_checksum(struct net *net,
+				      const struct flow_offload *flow,
+				      struct nf_flow_rule *flow_rule)
 {
 	u8 protonum = flow->tuplehash[FLOW_OFFLOAD_DIR_ORIGINAL].tuple.l4proto;
 	struct flow_action_entry *entry = flow_action_entry_next(flow_rule);
+
+	if (!entry)
+		return -E2BIG;
 
 	entry->id = FLOW_ACTION_CSUM;
 	entry->csum_flags = TCA_CSUM_UPDATE_FLAG_IPV4HDR;
@@ -461,116 +576,221 @@ static void flow_offload_ipv4_checksum(struct net *net,
 		entry->csum_flags |= TCA_CSUM_UPDATE_FLAG_UDP;
 		break;
 	}
+
+	return 0;
 }
 
-static void flow_offload_redirect(const struct flow_offload *flow,
-				  enum flow_offload_tuple_dir dir,
-				  struct nf_flow_rule *flow_rule)
+static int flow_offload_redirect(struct net *net,
+				 const struct flow_offload *flow,
+				 enum flow_offload_tuple_dir dir,
+				 struct nf_flow_rule *flow_rule)
 {
-	struct flow_action_entry *entry = flow_action_entry_next(flow_rule);
-	struct rtable *rt;
+	const struct flow_offload_tuple *this_tuple, *other_tuple;
+	struct flow_action_entry *entry;
+	struct net_device *dev;
+	int ifindex;
 
-	rt = (struct rtable *)flow->tuplehash[dir].tuple.dst_cache;
+	this_tuple = &flow->tuplehash[dir].tuple;
+	switch (this_tuple->xmit_type) {
+	case FLOW_OFFLOAD_XMIT_DIRECT:
+		this_tuple = &flow->tuplehash[dir].tuple;
+		ifindex = this_tuple->out.hw_ifidx;
+		break;
+	case FLOW_OFFLOAD_XMIT_NEIGH:
+		other_tuple = &flow->tuplehash[!dir].tuple;
+		ifindex = other_tuple->iifidx;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	dev = dev_get_by_index(net, ifindex);
+	if (!dev)
+		return -ENODEV;
+
+	entry = flow_action_entry_next(flow_rule);
+	if (!entry) {
+		dev_put(dev);
+		return -E2BIG;
+	}
+
 	entry->id = FLOW_ACTION_REDIRECT;
-	entry->dev = rt->dst.dev;
-	dev_hold(rt->dst.dev);
+	entry->dev = dev;
+
+	return 0;
 }
 
-static void flow_offload_encap_tunnel(const struct flow_offload *flow,
-				      enum flow_offload_tuple_dir dir,
-				      struct nf_flow_rule *flow_rule)
+static int flow_offload_encap_tunnel(const struct flow_offload *flow,
+				     enum flow_offload_tuple_dir dir,
+				     struct nf_flow_rule *flow_rule)
 {
+	const struct flow_offload_tuple *this_tuple;
 	struct flow_action_entry *entry;
 	struct dst_entry *dst;
 
-	dst = flow->tuplehash[dir].tuple.dst_cache;
+	this_tuple = &flow->tuplehash[dir].tuple;
+	if (this_tuple->xmit_type == FLOW_OFFLOAD_XMIT_DIRECT)
+		return 0;
+
+	dst = this_tuple->dst_cache;
 	if (dst && dst->lwtstate) {
 		struct ip_tunnel_info *tun_info;
 
 		tun_info = lwt_tun_info(dst->lwtstate);
 		if (tun_info && (tun_info->mode & IP_TUNNEL_INFO_TX)) {
 			entry = flow_action_entry_next(flow_rule);
+			if (!entry)
+				return -E2BIG;
 			entry->id = FLOW_ACTION_TUNNEL_ENCAP;
 			entry->tunnel = tun_info;
 		}
 	}
+
+	return 0;
 }
 
-static void flow_offload_decap_tunnel(const struct flow_offload *flow,
-				      enum flow_offload_tuple_dir dir,
-				      struct nf_flow_rule *flow_rule)
+static int flow_offload_decap_tunnel(const struct flow_offload *flow,
+				     enum flow_offload_tuple_dir dir,
+				     struct nf_flow_rule *flow_rule)
 {
+	const struct flow_offload_tuple *other_tuple;
 	struct flow_action_entry *entry;
 	struct dst_entry *dst;
 
-	dst = flow->tuplehash[!dir].tuple.dst_cache;
+	other_tuple = &flow->tuplehash[!dir].tuple;
+	if (other_tuple->xmit_type == FLOW_OFFLOAD_XMIT_DIRECT)
+		return 0;
+
+	dst = other_tuple->dst_cache;
 	if (dst && dst->lwtstate) {
 		struct ip_tunnel_info *tun_info;
 
 		tun_info = lwt_tun_info(dst->lwtstate);
 		if (tun_info && (tun_info->mode & IP_TUNNEL_INFO_TX)) {
 			entry = flow_action_entry_next(flow_rule);
+			if (!entry)
+				return -E2BIG;
 			entry->id = FLOW_ACTION_TUNNEL_DECAP;
 		}
 	}
+
+	return 0;
 }
 
-int nf_flow_rule_route_ipv4(struct net *net, const struct flow_offload *flow,
-			    enum flow_offload_tuple_dir dir,
-			    struct nf_flow_rule *flow_rule)
+static int
+nf_flow_rule_route_common(struct net *net, const struct flow_offload *flow,
+			  enum flow_offload_tuple_dir dir,
+			  struct nf_flow_rule *flow_rule)
 {
-	flow_offload_decap_tunnel(flow, dir, flow_rule);
-	flow_offload_encap_tunnel(flow, dir, flow_rule);
+	const struct flow_offload_tuple *other_tuple;
+	const struct flow_offload_tuple *tuple;
+	int i;
+
+	if (flow_offload_decap_tunnel(flow, dir, flow_rule) < 0 ||
+	    flow_offload_encap_tunnel(flow, dir, flow_rule) < 0)
+		return -1;
 
 	if (flow_offload_eth_src(net, flow, dir, flow_rule) < 0 ||
 	    flow_offload_eth_dst(net, flow, dir, flow_rule) < 0)
 		return -1;
 
+	tuple = &flow->tuplehash[dir].tuple;
+
+	for (i = 0; i < tuple->encap_num; i++) {
+		struct flow_action_entry *entry;
+
+		if (tuple->in_vlan_ingress & BIT(i))
+			continue;
+
+		if (tuple->encap[i].proto == htons(ETH_P_8021Q)) {
+			entry = flow_action_entry_next(flow_rule);
+			if (!entry)
+				return -1;
+			entry->id = FLOW_ACTION_VLAN_POP;
+		}
+	}
+
+	other_tuple = &flow->tuplehash[!dir].tuple;
+
+	for (i = 0; i < other_tuple->encap_num; i++) {
+		struct flow_action_entry *entry;
+
+		if (other_tuple->in_vlan_ingress & BIT(i))
+			continue;
+
+		entry = flow_action_entry_next(flow_rule);
+		if (!entry)
+			return -1;
+
+		switch (other_tuple->encap[i].proto) {
+		case htons(ETH_P_PPP_SES):
+			entry->id = FLOW_ACTION_PPPOE_PUSH;
+			entry->pppoe.sid = other_tuple->encap[i].id;
+			break;
+		case htons(ETH_P_8021Q):
+			entry->id = FLOW_ACTION_VLAN_PUSH;
+			entry->vlan.vid = other_tuple->encap[i].id;
+			entry->vlan.proto = other_tuple->encap[i].proto;
+			break;
+		}
+	}
+
+	return 0;
+}
+
+int nf_flow_rule_route_ipv4(struct net *net, struct flow_offload *flow,
+			    enum flow_offload_tuple_dir dir,
+			    struct nf_flow_rule *flow_rule)
+{
+	if (nf_flow_rule_route_common(net, flow, dir, flow_rule) < 0)
+		return -1;
+
 	if (test_bit(NF_FLOW_SNAT, &flow->flags)) {
-		flow_offload_ipv4_snat(net, flow, dir, flow_rule);
-		flow_offload_port_snat(net, flow, dir, flow_rule);
+		if (flow_offload_ipv4_snat(net, flow, dir, flow_rule) < 0 ||
+		    flow_offload_port_snat(net, flow, dir, flow_rule) < 0)
+			return -1;
 	}
 	if (test_bit(NF_FLOW_DNAT, &flow->flags)) {
-		flow_offload_ipv4_dnat(net, flow, dir, flow_rule);
-		flow_offload_port_dnat(net, flow, dir, flow_rule);
+		if (flow_offload_ipv4_dnat(net, flow, dir, flow_rule) < 0 ||
+		    flow_offload_port_dnat(net, flow, dir, flow_rule) < 0)
+			return -1;
 	}
 	if (test_bit(NF_FLOW_SNAT, &flow->flags) ||
 	    test_bit(NF_FLOW_DNAT, &flow->flags))
-		flow_offload_ipv4_checksum(net, flow, flow_rule);
+		if (flow_offload_ipv4_checksum(net, flow, flow_rule) < 0)
+			return -1;
 
-	flow_offload_redirect(flow, dir, flow_rule);
+	if (flow_offload_redirect(net, flow, dir, flow_rule) < 0)
+		return -1;
 
 	return 0;
 }
 EXPORT_SYMBOL_GPL(nf_flow_rule_route_ipv4);
 
-int nf_flow_rule_route_ipv6(struct net *net, const struct flow_offload *flow,
+int nf_flow_rule_route_ipv6(struct net *net, struct flow_offload *flow,
 			    enum flow_offload_tuple_dir dir,
 			    struct nf_flow_rule *flow_rule)
 {
-	flow_offload_decap_tunnel(flow, dir, flow_rule);
-	flow_offload_encap_tunnel(flow, dir, flow_rule);
-
-	if (flow_offload_eth_src(net, flow, dir, flow_rule) < 0 ||
-	    flow_offload_eth_dst(net, flow, dir, flow_rule) < 0)
+	if (nf_flow_rule_route_common(net, flow, dir, flow_rule) < 0)
 		return -1;
 
 	if (test_bit(NF_FLOW_SNAT, &flow->flags)) {
-		flow_offload_ipv6_snat(net, flow, dir, flow_rule);
-		flow_offload_port_snat(net, flow, dir, flow_rule);
+		if (flow_offload_ipv6_snat(net, flow, dir, flow_rule) < 0 ||
+		    flow_offload_port_snat(net, flow, dir, flow_rule) < 0)
+			return -1;
 	}
 	if (test_bit(NF_FLOW_DNAT, &flow->flags)) {
-		flow_offload_ipv6_dnat(net, flow, dir, flow_rule);
-		flow_offload_port_dnat(net, flow, dir, flow_rule);
+		if (flow_offload_ipv6_dnat(net, flow, dir, flow_rule) < 0 ||
+		    flow_offload_port_dnat(net, flow, dir, flow_rule) < 0)
+			return -1;
 	}
 
-	flow_offload_redirect(flow, dir, flow_rule);
+	if (flow_offload_redirect(net, flow, dir, flow_rule) < 0)
+		return -1;
 
 	return 0;
 }
 EXPORT_SYMBOL_GPL(nf_flow_rule_route_ipv6);
-
-#define NF_FLOW_RULE_ACTION_MAX	16
 
 static struct nf_flow_rule *
 nf_flow_offload_rule_alloc(struct net *net,
@@ -578,10 +798,10 @@ nf_flow_offload_rule_alloc(struct net *net,
 			   enum flow_offload_tuple_dir dir)
 {
 	const struct nf_flowtable *flowtable = offload->flowtable;
-	const struct flow_offload *flow = offload->flow;
-	const struct flow_offload_tuple *tuple;
+	const struct flow_offload_tuple *tuple, *other_tuple;
+	struct flow_offload *flow = offload->flow;
+	struct dst_entry *other_dst = NULL;
 	struct nf_flow_rule *flow_rule;
-	struct dst_entry *other_dst;
 	int err = -ENOMEM;
 
 	flow_rule = kzalloc(sizeof(*flow_rule), GFP_KERNEL);
@@ -597,7 +817,10 @@ nf_flow_offload_rule_alloc(struct net *net,
 	flow_rule->rule->match.key = &flow_rule->match.key;
 
 	tuple = &flow->tuplehash[dir].tuple;
-	other_dst = flow->tuplehash[!dir].tuple.dst_cache;
+	other_tuple = &flow->tuplehash[!dir].tuple;
+	if (other_tuple->xmit_type == FLOW_OFFLOAD_XMIT_NEIGH)
+		other_dst = other_tuple->dst_cache;
+
 	err = nf_flow_rule_match(&flow_rule->match, tuple, other_dst);
 	if (err < 0)
 		goto err_flow_match;
@@ -714,7 +937,8 @@ static int flow_offload_tuple_add(struct flow_offload_work *offload,
 				  enum flow_offload_tuple_dir dir)
 {
 	return nf_flow_offload_tuple(offload->flowtable, offload->flow,
-				     flow_rule, dir, offload->priority,
+				     flow_rule, dir,
+				     offload->flowtable->priority,
 				     FLOW_CLS_REPLACE, NULL,
 				     &offload->flowtable->flow_block.cb_list);
 }
@@ -723,7 +947,8 @@ static void flow_offload_tuple_del(struct flow_offload_work *offload,
 				   enum flow_offload_tuple_dir dir)
 {
 	nf_flow_offload_tuple(offload->flowtable, offload->flow, NULL, dir,
-			      offload->priority, FLOW_CLS_DESTROY, NULL,
+			      offload->flowtable->priority,
+			      FLOW_CLS_DESTROY, NULL,
 			      &offload->flowtable->flow_block.cb_list);
 }
 
@@ -734,8 +959,9 @@ static int flow_offload_rule_add(struct flow_offload_work *offload,
 
 	ok_count += flow_offload_tuple_add(offload, flow_rule[0],
 					   FLOW_OFFLOAD_DIR_ORIGINAL);
-	ok_count += flow_offload_tuple_add(offload, flow_rule[1],
-					   FLOW_OFFLOAD_DIR_REPLY);
+	if (test_bit(NF_FLOW_HW_BIDIRECTIONAL, &offload->flow->flags))
+		ok_count += flow_offload_tuple_add(offload, flow_rule[1],
+						   FLOW_OFFLOAD_DIR_REPLY);
 	if (ok_count == 0)
 		return -ENOENT;
 
@@ -765,7 +991,8 @@ static void flow_offload_work_del(struct flow_offload_work *offload)
 {
 	clear_bit(IPS_HW_OFFLOAD_BIT, &offload->flow->ct->status);
 	flow_offload_tuple_del(offload, FLOW_OFFLOAD_DIR_ORIGINAL);
-	flow_offload_tuple_del(offload, FLOW_OFFLOAD_DIR_REPLY);
+	if (test_bit(NF_FLOW_HW_BIDIRECTIONAL, &offload->flow->flags))
+		flow_offload_tuple_del(offload, FLOW_OFFLOAD_DIR_REPLY);
 	set_bit(NF_FLOW_HW_DEAD, &offload->flow->flags);
 }
 
@@ -774,7 +1001,8 @@ static void flow_offload_tuple_stats(struct flow_offload_work *offload,
 				     struct flow_stats *stats)
 {
 	nf_flow_offload_tuple(offload->flowtable, offload->flow, NULL, dir,
-			      offload->priority, FLOW_CLS_STATS, stats,
+			      offload->flowtable->priority,
+			      FLOW_CLS_STATS, stats,
 			      &offload->flowtable->flow_block.cb_list);
 }
 
@@ -784,11 +1012,13 @@ static void flow_offload_work_stats(struct flow_offload_work *offload)
 	u64 lastused;
 
 	flow_offload_tuple_stats(offload, FLOW_OFFLOAD_DIR_ORIGINAL, &stats[0]);
-	flow_offload_tuple_stats(offload, FLOW_OFFLOAD_DIR_REPLY, &stats[1]);
+	if (test_bit(NF_FLOW_HW_BIDIRECTIONAL, &offload->flow->flags))
+		flow_offload_tuple_stats(offload, FLOW_OFFLOAD_DIR_REPLY,
+					 &stats[1]);
 
 	lastused = max_t(u64, stats[0].lastused, stats[1].lastused);
 	offload->flow->timeout = max_t(u64, offload->flow->timeout,
-				       lastused + NF_FLOW_TIMEOUT);
+				       lastused + flow_offload_get_timeout(offload->flow));
 
 	if (offload->flowtable->flags & NF_FLOWTABLE_COUNTER) {
 		if (stats[0].pkts)
@@ -805,17 +1035,22 @@ static void flow_offload_work_stats(struct flow_offload_work *offload)
 static void flow_offload_work_handler(struct work_struct *work)
 {
 	struct flow_offload_work *offload;
+	struct net *net;
 
 	offload = container_of(work, struct flow_offload_work, work);
+	net = read_pnet(&offload->flowtable->net);
 	switch (offload->cmd) {
 		case FLOW_CLS_REPLACE:
 			flow_offload_work_add(offload);
+			NF_FLOW_TABLE_STAT_DEC_ATOMIC(net, count_wq_add);
 			break;
 		case FLOW_CLS_DESTROY:
 			flow_offload_work_del(offload);
+			NF_FLOW_TABLE_STAT_DEC_ATOMIC(net, count_wq_del);
 			break;
 		case FLOW_CLS_STATS:
 			flow_offload_work_stats(offload);
+			NF_FLOW_TABLE_STAT_DEC_ATOMIC(net, count_wq_stats);
 			break;
 		default:
 			WARN_ON_ONCE(1);
@@ -827,7 +1062,18 @@ static void flow_offload_work_handler(struct work_struct *work)
 
 static void flow_offload_queue_work(struct flow_offload_work *offload)
 {
-	queue_work(nf_flow_offload_wq, &offload->work);
+	struct net *net = read_pnet(&offload->flowtable->net);
+
+	if (offload->cmd == FLOW_CLS_REPLACE) {
+		NF_FLOW_TABLE_STAT_INC_ATOMIC(net, count_wq_add);
+		queue_work(nf_flow_offload_add_wq, &offload->work);
+	} else if (offload->cmd == FLOW_CLS_DESTROY) {
+		NF_FLOW_TABLE_STAT_INC_ATOMIC(net, count_wq_del);
+		queue_work(nf_flow_offload_del_wq, &offload->work);
+	} else {
+		NF_FLOW_TABLE_STAT_INC_ATOMIC(net, count_wq_stats);
+		queue_work(nf_flow_offload_stats_wq, &offload->work);
+	}
 }
 
 static struct flow_offload_work *
@@ -847,7 +1093,6 @@ nf_flow_offload_work_alloc(struct nf_flowtable *flowtable,
 
 	offload->cmd = cmd;
 	offload->flow = flow;
-	offload->priority = flowtable->priority;
 	offload->flowtable = flowtable;
 	INIT_WORK(&offload->work, flow_offload_work_handler);
 
@@ -887,7 +1132,7 @@ void nf_flow_offload_stats(struct nf_flowtable *flowtable,
 	__s32 delta;
 
 	delta = nf_flow_timeout_delta(flow->timeout);
-	if ((delta >= (9 * NF_FLOW_TIMEOUT) / 10))
+	if ((delta >= (9 * flow_offload_get_timeout(flow)) / 10))
 		return;
 
 	offload = nf_flow_offload_work_alloc(flowtable, flow, FLOW_CLS_STATS);
@@ -897,10 +1142,21 @@ void nf_flow_offload_stats(struct nf_flowtable *flowtable,
 	flow_offload_queue_work(offload);
 }
 
+void nf_flow_table_offload_flush_cleanup(struct nf_flowtable *flowtable)
+{
+	if (nf_flowtable_hw_offload(flowtable)) {
+		flush_workqueue(nf_flow_offload_del_wq);
+		nf_flow_table_gc_run(flowtable);
+	}
+}
+
 void nf_flow_table_offload_flush(struct nf_flowtable *flowtable)
 {
-	if (nf_flowtable_hw_offload(flowtable))
-		flush_workqueue(nf_flow_offload_wq);
+	if (nf_flowtable_hw_offload(flowtable)) {
+		flush_workqueue(nf_flow_offload_add_wq);
+		flush_workqueue(nf_flow_offload_del_wq);
+		flush_workqueue(nf_flow_offload_stats_wq);
+	}
 }
 
 static int nf_flow_table_block_setup(struct nf_flowtable *flowtable,
@@ -1017,15 +1273,33 @@ EXPORT_SYMBOL_GPL(nf_flow_table_offload_setup);
 
 int nf_flow_table_offload_init(void)
 {
-	nf_flow_offload_wq  = alloc_workqueue("nf_flow_table_offload",
-					      WQ_UNBOUND, 0);
-	if (!nf_flow_offload_wq)
+	nf_flow_offload_add_wq  = alloc_workqueue("nf_ft_offload_add",
+						  WQ_UNBOUND | WQ_SYSFS, 0);
+	if (!nf_flow_offload_add_wq)
 		return -ENOMEM;
 
+	nf_flow_offload_del_wq  = alloc_workqueue("nf_ft_offload_del",
+						  WQ_UNBOUND | WQ_SYSFS, 0);
+	if (!nf_flow_offload_del_wq)
+		goto err_del_wq;
+
+	nf_flow_offload_stats_wq  = alloc_workqueue("nf_ft_offload_stats",
+						    WQ_UNBOUND | WQ_SYSFS, 0);
+	if (!nf_flow_offload_stats_wq)
+		goto err_stats_wq;
+
 	return 0;
+
+err_stats_wq:
+	destroy_workqueue(nf_flow_offload_del_wq);
+err_del_wq:
+	destroy_workqueue(nf_flow_offload_add_wq);
+	return -ENOMEM;
 }
 
 void nf_flow_table_offload_exit(void)
 {
-	destroy_workqueue(nf_flow_offload_wq);
+	destroy_workqueue(nf_flow_offload_add_wq);
+	destroy_workqueue(nf_flow_offload_del_wq);
+	destroy_workqueue(nf_flow_offload_stats_wq);
 }

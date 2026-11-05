@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2012-2013, 2017-2020 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef __LINUX_USB_QDSS_H
@@ -10,8 +11,8 @@
 #include <linux/kernel.h>
 #include <linux/scatterlist.h>
 
+#define USB_QDSS_CH_EBC	"qdss_ebc"
 #define USB_QDSS_CH_MDM	"qdss_mdm"
-#define USB_QDSS_CH_MSM	"qdss"
 #define USB_QDSS_CH_SW	"qdss_sw"
 
 struct qdss_request {

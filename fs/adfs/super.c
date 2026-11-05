@@ -220,7 +220,7 @@ static struct kmem_cache *adfs_inode_cachep;
 static struct inode *adfs_alloc_inode(struct super_block *sb)
 {
 	struct adfs_inode_info *ei;
-	ei = kmem_cache_alloc(adfs_inode_cachep, GFP_KERNEL);
+	ei = alloc_inode_sb(sb, adfs_inode_cachep, GFP_KERNEL);
 	if (!ei)
 		return NULL;
 	return &ei->vfs_inode;
@@ -341,6 +341,9 @@ static int adfs_validate_bblk(struct super_block *sb, struct buffer_head *bh,
 	/* Do some sanity checks on the ADFS disc record */
 	dr = (struct adfs_discrecord *)(b_data + ADFS_DR_OFFSET);
 	if (adfs_checkdiscrecord(dr))
+		return -EILSEQ;
+
+	if ((dr->nzones | dr->nzones_high << 8) == 0)
 		return -EILSEQ;
 
 	*drp = dr;

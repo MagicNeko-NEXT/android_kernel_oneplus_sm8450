@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/**
+/*
  * opt3001.c - Texas Instruments OPT3001 Light Sensor
  *
  * Copyright (C) 2014 Texas Instruments Incorporated - https://www.ti.com
@@ -740,8 +740,7 @@ out:
 	return IRQ_HANDLED;
 }
 
-static int opt3001_probe(struct i2c_client *client,
-		const struct i2c_device_id *id)
+static int opt3001_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 
@@ -799,7 +798,7 @@ static int opt3001_probe(struct i2c_client *client,
 	return 0;
 }
 
-static int opt3001_remove(struct i2c_client *client)
+static void opt3001_remove(struct i2c_client *client)
 {
 	struct iio_dev *iio = i2c_get_clientdata(client);
 	struct opt3001 *opt = iio_priv(iio);
@@ -813,7 +812,7 @@ static int opt3001_remove(struct i2c_client *client)
 	if (ret < 0) {
 		dev_err(opt->dev, "failed to read register %02x\n",
 				OPT3001_CONFIGURATION);
-		return ret;
+		return;
 	}
 
 	reg = ret;
@@ -824,10 +823,7 @@ static int opt3001_remove(struct i2c_client *client)
 	if (ret < 0) {
 		dev_err(opt->dev, "failed to write register %02x\n",
 				OPT3001_CONFIGURATION);
-		return ret;
 	}
-
-	return 0;
 }
 
 static const struct i2c_device_id opt3001_id[] = {

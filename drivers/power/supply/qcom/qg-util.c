@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2018-2020 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2025, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/alarmtimer.h>
@@ -219,7 +220,8 @@ int get_rtc_time(unsigned long *rtc_time)
 				CONFIG_RTC_HCTOSYS_DEVICE, rc);
 		goto close_time;
 	}
-	rtc_tm_to_time(&tm, rtc_time);
+
+	*rtc_time = rtc_tm_to_time64(&tm);
 
 close_time:
 	rtc_class_close(rtc);
@@ -488,7 +490,7 @@ bool is_chan_valid(struct qpnp_qg *chip,
 		return false;
 
 	if (!chip->ext_iio_chans[chan]) {
-		chip->ext_iio_chans[chan] = iio_channel_get(chip->dev,
+		chip->ext_iio_chans[chan] = devm_iio_channel_get(chip->dev,
 					qg_ext_iio_chan_name[chan]);
 		if (IS_ERR(chip->ext_iio_chans[chan])) {
 			rc = PTR_ERR(chip->ext_iio_chans[chan]);

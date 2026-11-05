@@ -58,11 +58,9 @@ struct its_vpe {
 				bool	enabled;
 				bool	group;
 			}			sgi_config[16];
+			atomic_t vmapp_count;
 		};
 	};
-
-	/* Track the VPE being mapped */
-	atomic_t vmapp_count;
 
 	/*
 	 * Ensures mutual exclusion between affinity setting of the
@@ -146,5 +144,7 @@ struct irq_domain_ops;
 int its_init_v4(struct irq_domain *domain,
 		const struct irq_domain_ops *vpe_ops,
 		const struct irq_domain_ops *sgi_ops);
+
+bool gic_cpuif_has_vsgi(void);
 
 #endif

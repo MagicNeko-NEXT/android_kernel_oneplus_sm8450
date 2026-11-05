@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2015, Sony Mobile Communications AB.
- * Copyright (c) 2012-2013, 2018-2019 The Linux Foundation. All rights reserved.
- * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/interrupt.h>
@@ -15,11 +15,11 @@
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeirq.h>
 #include <linux/regmap.h>
 #include <linux/soc/qcom/smem.h>
 #include <linux/soc/qcom/smem_state.h>
 #include <linux/spinlock.h>
-#include <linux/pm_wakeup.h>
 
 #include <linux/ipc_logging.h>
 
@@ -48,8 +48,7 @@
 #define SMP2P_FLAGS_RESTART_ACK_BIT 1
 
 #define SMP2P_MAGIC 0x504d5324
-#define SMP2P_VERSION	1
-#define SMP2P_FEATURES	SMP2P_FEATURE_SSR_ACK
+#define SMP2P_ALL_FEATURES	SMP2P_FEATURE_SSR_ACK
 
 /**
  * struct smp2p_smem_item - in memory communication structure
@@ -121,8 +120,12 @@ struct smp2p_entry {
  * struct qcom_smp2p - device driver context
  * @dev:	device driver handle
  * @in:		pointer to the inbound smem item
+ * @out:	pointer to the outbound smem item
  * @smem_items:	ids of the two smem items
  * @valid_entries: already scanned inbound entries
+ * @ssr_ack_enabled: SMP2P_FEATURE_SSR_ACK feature is supported and was enabled
+ * @ssr_ack: current cached state of the local ack bit
+ * @negotiation_done: whether negotiating finished
  * @irq_devname: poniter to the smp2p irq devname
  * @local_pid:	processor id of the inbound edge
  * @remote_pid:	processor id of the outbound edge
@@ -146,7 +149,7 @@ struct qcom_smp2p {
 
 	bool ssr_ack_enabled;
 	bool ssr_ack;
-	bool open;
+	bool negotiation_done;
 
 	char *irq_devname;
 	unsigned local_pid;
@@ -156,7 +159,6 @@ struct qcom_smp2p {
 	struct regmap *ipc_regmap;
 	int ipc_offset;
 	int ipc_bit;
-	struct wakeup_source *ws;
 
 	struct mbox_client mbox_client;
 	struct mbox_chan *mbox_chan;
@@ -192,25 +194,21 @@ static bool qcom_smp2p_check_ssr(struct qcom_smp2p *smp2p)
 		return false;
 
 	restart = in->flags & BIT(SMP2P_FLAGS_RESTART_DONE_BIT);
-	if (restart == smp2p->ssr_ack)
-		return false;
 
-	SMP2P_INFO("%d: SSR DETECTED\n", smp2p->remote_pid);
-	return true;
+	return restart != smp2p->ssr_ack;
 }
 
 static void qcom_smp2p_do_ssr_ack(struct qcom_smp2p *smp2p)
 {
 	struct smp2p_smem_item *out = smp2p->out;
-	u32 ack;
 	u32 val;
 
-	ack = !smp2p->ssr_ack;
-	smp2p->ssr_ack = ack;
-	ack = ack << SMP2P_FLAGS_RESTART_ACK_BIT;
+	SMP2P_INFO("%d: SSR detected, doing SSR Handshake\n", smp2p->remote_pid);
+	smp2p->ssr_ack = !smp2p->ssr_ack;
 
 	val = out->flags & ~BIT(SMP2P_FLAGS_RESTART_ACK_BIT);
-	val |= ack;
+	if (smp2p->ssr_ack)
+		val |= BIT(SMP2P_FLAGS_RESTART_ACK_BIT);
 	out->flags = val;
 
 	qcom_smp2p_kick(smp2p);
@@ -220,16 +218,14 @@ static void qcom_smp2p_negotiate(struct qcom_smp2p *smp2p)
 {
 	struct smp2p_smem_item *out = smp2p->out;
 	struct smp2p_smem_item *in = smp2p->in;
-	u32 features;
 
 	if (in->version == out->version) {
-		features = in->features & out->features;
-		out->features = features;
+		out->features &= in->features;
 
-		if (features & SMP2P_FEATURE_SSR_ACK)
+		if (out->features & SMP2P_FEATURE_SSR_ACK)
 			smp2p->ssr_ack_enabled = true;
 
-		smp2p->open = true;
+		smp2p->negotiation_done = true;
 		SMP2P_INFO("%d: state=open ssr_ack=%d\n", smp2p->remote_pid,
 			   smp2p->ssr_ack_enabled);
 	}
@@ -237,13 +233,15 @@ static void qcom_smp2p_negotiate(struct qcom_smp2p *smp2p)
 
 static void qcom_smp2p_notify_in(struct qcom_smp2p *smp2p)
 {
-	struct smp2p_smem_item *in = smp2p->in;
+	struct smp2p_smem_item *in;
 	struct smp2p_entry *entry;
 	unsigned long status;
 	int irq_pin;
 	char buf[SMP2P_MAX_ENTRY_NAME];
 	u32 val;
 	int i;
+
+	in = smp2p->in;
 
 	/* Match newly created entries */
 	for (i = smp2p->valid_entries; i < in->valid_entries; i++) {
@@ -296,14 +294,6 @@ static void qcom_smp2p_notify_in(struct qcom_smp2p *smp2p)
 	}
 }
 
-static irqreturn_t qcom_smp2p_isr(int irq, void *data)
-{
-	struct qcom_smp2p *smp2p = data;
-
-	__pm_stay_awake(smp2p->ws);
-	return IRQ_WAKE_THREAD;
-}
-
 /**
  * qcom_smp2p_intr() - interrupt handler for incoming notifications
  * @irq:	unused
@@ -318,6 +308,7 @@ static irqreturn_t qcom_smp2p_intr(int irq, void *data)
 	struct qcom_smp2p *smp2p = data;
 	unsigned int smem_id = smp2p->smem_items[SMP2P_INBOUND];
 	unsigned int pid = smp2p->remote_pid;
+	bool ack_restart;
 	size_t size;
 
 	in = smp2p->in;
@@ -334,21 +325,18 @@ static irqreturn_t qcom_smp2p_intr(int irq, void *data)
 		smp2p->in = in;
 	}
 
-	if (!smp2p->open)
+	if (!smp2p->negotiation_done)
 		qcom_smp2p_negotiate(smp2p);
 
-	if (smp2p->open) {
-		bool do_restart;
-
-		do_restart = qcom_smp2p_check_ssr(smp2p);
+	if (smp2p->negotiation_done) {
+		ack_restart = qcom_smp2p_check_ssr(smp2p);
 		qcom_smp2p_notify_in(smp2p);
 
-		if (do_restart)
+		if (ack_restart)
 			qcom_smp2p_do_ssr_ack(smp2p);
 	}
 
 out:
-	__pm_relax(smp2p->ws);
 	return IRQ_HANDLED;
 }
 
@@ -481,7 +469,7 @@ static int qcom_smp2p_outbound_entry(struct qcom_smp2p *smp2p,
 	char buf[SMP2P_MAX_ENTRY_NAME] = {};
 
 	/* Allocate an entry from the smem item */
-	strlcpy(buf, entry->name, SMP2P_MAX_ENTRY_NAME);
+	strscpy(buf, entry->name, SMP2P_MAX_ENTRY_NAME);
 	memcpy(out->entries[out->valid_entries].name, buf, SMP2P_MAX_ENTRY_NAME);
 
 	/* Make the logical entry reference the physical value */
@@ -525,14 +513,14 @@ static int qcom_smp2p_alloc_outbound_item(struct qcom_smp2p *smp2p)
 	out->remote_pid = smp2p->remote_pid;
 	out->total_entries = SMP2P_MAX_ENTRY;
 	out->valid_entries = 0;
-	out->features = SMP2P_FEATURES;
+	out->features = SMP2P_ALL_FEATURES;
 
 	/*
 	 * Make sure the rest of the header is written before we validate the
 	 * item by writing a valid version number.
 	 */
 	wmb();
-	out->version = SMP2P_VERSION;
+	out->version = 1;
 
 	qcom_smp2p_kick(smp2p);
 
@@ -578,10 +566,10 @@ static int smp2p_parse_ipc(struct qcom_smp2p *smp2p)
 static int qcom_smp2p_probe(struct platform_device *pdev)
 {
 	struct smp2p_entry *entry;
-	struct smp2p_entry *next_entry;
 	struct device_node *node;
 	struct qcom_smp2p *smp2p;
 	const char *key;
+	int irq;
 	int ret;
 
 	if (!ilc)
@@ -613,17 +601,17 @@ static int qcom_smp2p_probe(struct platform_device *pdev)
 	if (ret)
 		goto report_read_failure;
 
-	smp2p->irq = platform_get_irq(pdev, 0);
-	if (smp2p->irq < 0) {
-		dev_err(&pdev->dev, "unable to acquire smp2p interrupt\n");
-		return smp2p->irq;
-	}
+	irq = platform_get_irq(pdev, 0);
+	if (irq < 0)
+		return irq;
 
 	smp2p->mbox_client.dev = &pdev->dev;
 	smp2p->mbox_client.knows_txdone = true;
 	smp2p->mbox_chan = mbox_request_channel(&smp2p->mbox_client, 0);
 	if (IS_ERR(smp2p->mbox_chan)) {
-		if (PTR_ERR(smp2p->mbox_chan) != -ENODEV)
+		if ((PTR_ERR(smp2p->mbox_chan) != -ENODEV) &&
+			(PTR_ERR(smp2p->mbox_chan) != -ENOENT) &&
+			(PTR_ERR(smp2p->mbox_chan) != -EINVAL))
 			return PTR_ERR(smp2p->mbox_chan);
 
 		smp2p->mbox_chan = NULL;
@@ -638,9 +626,10 @@ static int qcom_smp2p_probe(struct platform_device *pdev)
 		goto release_mbox;
 
 	for_each_available_child_of_node(pdev->dev.of_node, node) {
-		entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+		entry = devm_kzalloc(&pdev->dev, sizeof(*entry), GFP_KERNEL);
 		if (!entry) {
 			ret = -ENOMEM;
+			of_node_put(node);
 			goto unwind_interfaces;
 		}
 
@@ -648,65 +637,74 @@ static int qcom_smp2p_probe(struct platform_device *pdev)
 		spin_lock_init(&entry->lock);
 
 		ret = of_property_read_string(node, "qcom,entry-name", &entry->name);
-		if (ret < 0)
+		if (ret < 0) {
+			of_node_put(node);
 			goto unwind_interfaces;
+		}
 
 		if (of_property_read_bool(node, "interrupt-controller")) {
 			ret = qcom_smp2p_inbound_entry(smp2p, entry, node);
-			if (ret < 0)
+			if (ret < 0) {
+				of_node_put(node);
 				goto unwind_interfaces;
+			}
 
 			list_add(&entry->node, &smp2p->inbound);
 		} else  {
 			ret = qcom_smp2p_outbound_entry(smp2p, entry, node);
-			if (ret < 0)
+			if (ret < 0) {
+				of_node_put(node);
 				goto unwind_interfaces;
+			}
 
 			list_add(&entry->node, &smp2p->outbound);
 		}
 	}
 
-	smp2p->ws = wakeup_source_register(&pdev->dev, "smp2p");
-	if (!smp2p->ws) {
-		ret = -ENOMEM;
-		goto unwind_interfaces;
-	}
-
 	/* Kick the outgoing edge after allocating entries */
 	qcom_smp2p_kick(smp2p);
 
+	smp2p->irq = irq;
 	smp2p->irq_devname = kasprintf(GFP_KERNEL, "smp2p_%d", smp2p->remote_pid);
 	if (!smp2p->irq_devname) {
 		ret = -ENOMEM;
-		goto unreg_ws;
+		goto unwind_interfaces;
 	}
-
-	ret = devm_request_threaded_irq(&pdev->dev, smp2p->irq,
-					qcom_smp2p_isr, qcom_smp2p_intr,
+	ret = devm_request_threaded_irq(&pdev->dev, irq,
+					NULL, qcom_smp2p_intr,
 					IRQF_ONESHOT,
 					smp2p->irq_devname, (void *)smp2p);
 	if (ret) {
 		dev_err(&pdev->dev, "failed to request interrupt\n");
-		goto unreg_ws;
+		goto unwind_interfaces;
 	}
 
-	enable_irq_wake(smp2p->irq);
+	/*
+	 * Treat smp2p interrupt as wakeup source, but keep it disabled
+	 * by default. User space can decide enabling it depending on its
+	 * use cases. For example if remoteproc crashes and device wants
+	 * to handle it immediatedly (e.g. to not miss phone calls) it can
+	 * enable wakeup source from user space, while other devices which
+	 * do not have proper autosleep feature may want to handle it with
+	 * other wakeup events (e.g. Power button) instead waking up immediately.
+	 */
+	device_set_wakeup_capable(&pdev->dev, true);
+
+	ret = dev_pm_set_wake_irq(&pdev->dev, irq);
+	if (ret)
+		goto set_wake_irq_fail;
 
 	return 0;
 
-unreg_ws:
-	wakeup_source_unregister(smp2p->ws);
+set_wake_irq_fail:
+	dev_pm_clear_wake_irq(&pdev->dev);
 
 unwind_interfaces:
-	list_for_each_entry_safe(entry, next_entry, &smp2p->inbound, node) {
+	list_for_each_entry(entry, &smp2p->inbound, node)
 		irq_domain_remove(entry->domain);
-		kfree(entry);
-	}
 
-	list_for_each_entry_safe(entry, next_entry, &smp2p->outbound, node) {
+	list_for_each_entry(entry, &smp2p->outbound, node)
 		qcom_smem_state_unregister(entry->state);
-		kfree(entry);
-	}
 
 	kfree(smp2p->irq_devname);
 
@@ -726,19 +724,14 @@ static int qcom_smp2p_remove(struct platform_device *pdev)
 {
 	struct qcom_smp2p *smp2p = platform_get_drvdata(pdev);
 	struct smp2p_entry *entry;
-	struct smp2p_entry *next_entry;
 
-	wakeup_source_unregister(smp2p->ws);
+	dev_pm_clear_wake_irq(&pdev->dev);
 
-	list_for_each_entry_safe(entry, next_entry, &smp2p->inbound, node) {
+	list_for_each_entry(entry, &smp2p->inbound, node)
 		irq_domain_remove(entry->domain);
-		kfree(entry);
-	}
 
-	list_for_each_entry_safe(entry, next_entry, &smp2p->outbound, node) {
+	list_for_each_entry(entry, &smp2p->outbound, node)
 		qcom_smem_state_unregister(entry->state);
-		kfree(entry);
-	}
 
 	mbox_free_channel(smp2p->mbox_chan);
 
@@ -748,89 +741,6 @@ static int qcom_smp2p_remove(struct platform_device *pdev)
 
 	return 0;
 }
-
-static int qcom_smp2p_restore(struct device *dev)
-{
-	int ret = 0;
-	struct qcom_smp2p *smp2p = dev_get_drvdata(dev);
-	struct smp2p_entry *entry;
-	struct device_node *node;
-	struct platform_device *pdev = container_of(dev, struct
-					platform_device, dev);
-
-	ret = qcom_smp2p_alloc_outbound_item(smp2p);
-	if (ret < 0)
-		goto print_err;
-
-	for_each_available_child_of_node(pdev->dev.of_node, node) {
-		entry = kzalloc(sizeof(*entry), GFP_KERNEL);
-		if (!entry) {
-			ret = -ENOMEM;
-			goto print_err;
-		}
-
-		entry->smp2p = smp2p;
-		spin_lock_init(&entry->lock);
-		ret = of_property_read_string(node, "qcom,entry-name",
-								&entry->name);
-		if (ret < 0)
-			goto rel_entry;
-
-		if (!of_property_read_bool(node, "interrupt-controller")) {
-			ret = qcom_smp2p_outbound_entry(smp2p, entry, node);
-			if (ret < 0)
-				goto rel_entry;
-			list_add(&entry->node, &smp2p->outbound);
-		} else {
-			kfree(entry);
-		}
-	}
-
-	enable_irq_wake(smp2p->irq);
-	/* Kick the outgoing edge after allocating entries */
-	qcom_smp2p_kick(smp2p);
-	return ret;
-
-rel_entry:
-	kfree(entry);
-
-print_err:
-	if (ret < 0 && ret != -EEXIST)
-		dev_err(dev, "failed to alloc items ret = %d\n", ret);
-
-	return ret;
-}
-
-static int qcom_smp2p_freeze(struct device *dev)
-{
-	struct qcom_smp2p *smp2p = dev_get_drvdata(dev);
-	struct smp2p_entry *entry;
-	struct smp2p_entry *next_entry;
-
-	disable_irq_wake(smp2p->irq);
-	/* Walk through the out bound list and release state and entry */
-	list_for_each_entry_safe(entry, next_entry, &smp2p->outbound, node) {
-		qcom_smem_state_unregister(entry->state);
-		list_del(&entry->node);
-		kfree(entry);
-	}
-	INIT_LIST_HEAD(&smp2p->outbound);
-
-	/* Walk through the in bound list and reset last value */
-	list_for_each_entry_safe(entry, next_entry, &smp2p->inbound, node) {
-		entry->last_value = 0;
-	}
-	/* make null to point it to valid smem item during first interrupt */
-	smp2p->in = NULL;
-	smp2p->valid_entries = 0;
-	return 0;
-}
-
-static const struct dev_pm_ops qcom_smp2p_pm_ops = {
-	.freeze = qcom_smp2p_freeze,
-	.restore = qcom_smp2p_restore,
-	.thaw = qcom_smp2p_restore,
-};
 
 static const struct of_device_id qcom_smp2p_of_match[] = {
 	{ .compatible = "qcom,smp2p" },
@@ -844,7 +754,6 @@ static struct platform_driver qcom_smp2p_driver = {
 	.driver  = {
 		.name  = "qcom_smp2p",
 		.of_match_table = qcom_smp2p_of_match,
-		.pm = &qcom_smp2p_pm_ops,
 	},
 };
 module_platform_driver(qcom_smp2p_driver);

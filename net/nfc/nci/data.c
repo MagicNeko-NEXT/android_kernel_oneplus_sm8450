@@ -26,14 +26,15 @@
 void nci_data_exchange_complete(struct nci_dev *ndev, struct sk_buff *skb,
 				__u8 conn_id, int err)
 {
-	struct nci_conn_info    *conn_info;
+	const struct nci_conn_info *conn_info;
 	data_exchange_cb_t cb;
 	void *cb_context;
 
 	conn_info = nci_get_conn_info_by_conn_id(ndev, conn_id);
 	if (!conn_info) {
 		kfree_skb(skb);
-		goto exit;
+		clear_bit(NCI_DATA_EXCHANGE, &ndev->flags);
+		return;
 	}
 
 	cb = conn_info->data_exchange_cb;
@@ -45,6 +46,12 @@ void nci_data_exchange_complete(struct nci_dev *ndev, struct sk_buff *skb,
 	del_timer_sync(&ndev->data_timer);
 	clear_bit(NCI_DATA_EXCHANGE_TO, &ndev->flags);
 
+	/* Mark the exchange as done before calling the callback.
+	 * The callback (e.g. rawsock_data_exchange_complete) may
+	 * want to immediately queue another data exchange.
+	 */
+	clear_bit(NCI_DATA_EXCHANGE, &ndev->flags);
+
 	if (cb) {
 		/* forward skb to nfc core */
 		cb(cb_context, skb, err);
@@ -54,9 +61,6 @@ void nci_data_exchange_complete(struct nci_dev *ndev, struct sk_buff *skb,
 		/* no waiting callback, free skb */
 		kfree_skb(skb);
 	}
-
-exit:
-	clear_bit(NCI_DATA_EXCHANGE, &ndev->flags);
 }
 
 /* ----------------- NCI TX Data ----------------- */
@@ -80,7 +84,7 @@ static inline void nci_push_data_hdr(struct nci_dev *ndev,
 
 int nci_conn_max_data_pkt_payload_size(struct nci_dev *ndev, __u8 conn_id)
 {
-	struct nci_conn_info *conn_info;
+	const struct nci_conn_info *conn_info;
 
 	conn_info = nci_get_conn_info_by_conn_id(ndev, conn_id);
 	if (!conn_info)
@@ -93,9 +97,9 @@ EXPORT_SYMBOL(nci_conn_max_data_pkt_payload_size);
 static int nci_queue_tx_data_frags(struct nci_dev *ndev,
 				   __u8 conn_id,
 				   struct sk_buff *skb) {
-	struct nci_conn_info    *conn_info;
+	const struct nci_conn_info *conn_info;
 	int total_len = skb->len;
-	unsigned char *data = skb->data;
+	const unsigned char *data = skb->data;
 	unsigned long flags;
 	struct sk_buff_head frags_q;
 	struct sk_buff *skb_frag;
@@ -166,7 +170,7 @@ exit:
 /* Send NCI data */
 int nci_send_data(struct nci_dev *ndev, __u8 conn_id, struct sk_buff *skb)
 {
-	struct nci_conn_info    *conn_info;
+	const struct nci_conn_info *conn_info;
 	int rc = 0;
 
 	pr_debug("conn_id 0x%x, plen %d\n", conn_id, skb->len);
@@ -269,7 +273,7 @@ void nci_rx_data_packet(struct nci_dev *ndev, struct sk_buff *skb)
 	__u8 pbf = nci_pbf(skb->data);
 	__u8 status = 0;
 	__u8 conn_id = nci_conn_id(skb->data);
-	struct nci_conn_info    *conn_info;
+	const struct nci_conn_info *conn_info;
 
 	pr_debug("len %d\n", skb->len);
 

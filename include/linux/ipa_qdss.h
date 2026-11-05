@@ -1,12 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #ifndef _IPA_QDSS_H_
 #define _IPA_QDSS_H_
-
-#include <linux/ipa.h>
 
 /**
  * enum ipa_qdss_notify - these are the only return items
@@ -57,44 +56,20 @@ struct ipa_qdss_conn_out_params {
 	phys_addr_t ipa_rx_db_pa;
 };
 
-#if IS_ENABLED(CONFIG_IPA3)
-
-/**
- * ipa_qdss_conn_pipes - Client should call this
- * function to connect QDSS -> IPA pipe
- *
- * @in: [in] input parameters from client
- * @out: [out] output params to client
- *
- * Note: Should not be called from atomic context
- *
- * @Return 0 on success, negative on failure
- */
-int ipa_qdss_conn_pipes(struct ipa_qdss_conn_in_params *in,
+struct ipa_qdss_ops {
+	int (*ipa_qdss_conn_pipes)(struct ipa_qdss_conn_in_params *in,
 	struct ipa_qdss_conn_out_params *out);
+	int (*ipa_qdss_disconn_pipes)(void);
+};
 
-/**
- * ipa_qdss_disconn_pipes() - Client should call this
- *		function to disconnect pipes
- *
- * Note: Should not be called from atomic context
- *
- * Returns: 0 on success, negative on failure
- */
-int ipa_qdss_disconn_pipes(void);
+#if IS_ENABLED(CONFIG_CORESIGHT_TMC_PCIE)
+void ipa_qdss_ready_callback(void *ops);
+void ipa_qdss_exit_callback(void);
+#else
+static inline void ipa_qdss_ready_callback(void *ops)
+{ }
+static inline void ipa_qdss_exit_callback(void)
+{ }
+#endif
 
-#else /* CONFIG_IPA3 */
-
-static inline int ipa_qdss_conn_pipes(struct ipa_qdss_conn_in_params *in,
-	struct ipa_qdss_conn_out_params *out)
-{
-	return -IPA_QDSS_PIPE_CONN_FAILURE;
-}
-
-static inline int ipa_qdss_disconn_pipes(void)
-{
-	return -IPA_QDSS_PIPE_DISCONN_FAILURE;
-}
-
-#endif /* CONFIG_IPA3 */
 #endif /* _IPA_QDSS_H_ */

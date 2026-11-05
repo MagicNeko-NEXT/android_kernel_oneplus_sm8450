@@ -173,7 +173,6 @@ void plist_requeue(struct plist_node *node, struct plist_head *head)
 
 	plist_check_head(head);
 }
-EXPORT_SYMBOL_GPL(plist_requeue);
 
 #ifdef CONFIG_DEBUG_PLIST
 #include <linux/sched.h>

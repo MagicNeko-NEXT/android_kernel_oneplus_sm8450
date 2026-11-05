@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "qcom-dcvs: " fmt
@@ -20,6 +21,7 @@
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <soc/qcom/dcvs.h>
+#include <soc/qcom/of_common.h>
 #include "dcvs_private.h"
 #include "trace-dcvs.h"
 
@@ -28,6 +30,7 @@ static const char * const dcvs_hw_names[NUM_DCVS_HW_TYPES] = {
 	[DCVS_LLCC]		= "LLCC",
 	[DCVS_L3]		= "L3",
 	[DCVS_DDRQOS]		= "DDRQOS",
+	[DCVS_UBWCP]		= "UBWCP",
 };
 
 enum dcvs_type {
@@ -171,7 +174,7 @@ static ssize_t show_cur_freq(struct kobject *kobj,
 			cur_freq = max(cur_freq, path->percpu_cur_freqs[cpu]);
 	}
 
-	return scnprintf(buf, PAGE_SIZE, "%lu\n", cur_freq);
+	return scnprintf(buf, PAGE_SIZE, "%d\n", cur_freq);
 }
 
 static ssize_t show_available_frequencies(struct kobject *kobj,
@@ -181,7 +184,7 @@ static ssize_t show_available_frequencies(struct kobject *kobj,
 	int i, cnt = 0;
 
 	for (i = 0; i < hw->table_len; i++)
-		cnt += scnprintf(buf + cnt, PAGE_SIZE - cnt, "%lu ",
+		cnt += scnprintf(buf + cnt, PAGE_SIZE - cnt, "%d ",
 				hw->freq_table[i]);
 
 	if (cnt)
@@ -202,7 +205,7 @@ DCVS_ATTR_RW(boost_freq);
 DCVS_ATTR_RO(cur_freq);
 DCVS_ATTR_RO(available_frequencies);
 
-static struct attribute *dcvs_hw_attr[] = {
+static struct attribute *dcvs_hw_attrs[] = {
 	&hw_min_freq.attr,
 	&hw_max_freq.attr,
 	&boost_freq.attr,
@@ -210,6 +213,7 @@ static struct attribute *dcvs_hw_attr[] = {
 	&available_frequencies.attr,
 	NULL,
 };
+ATTRIBUTE_GROUPS(dcvs_hw);
 
 static ssize_t attr_show(struct kobject *kobj, struct attribute *attr,
 				char *buf)
@@ -240,13 +244,13 @@ static const struct sysfs_ops qcom_dcvs_sysfs_ops = {
 	.store	= attr_store,
 };
 
-static struct kobj_type qcom_dcvs_ktype = {
+static const struct kobj_type qcom_dcvs_ktype = {
 	.sysfs_ops	= &qcom_dcvs_sysfs_ops,
 };
 
-static struct kobj_type dcvs_hw_ktype = {
+static const struct kobj_type dcvs_hw_ktype = {
 	.sysfs_ops	= &qcom_dcvs_sysfs_ops,
-	.default_attrs	= dcvs_hw_attr,
+	.default_groups	= dcvs_hw_groups,
 };
 
 static inline struct dcvs_path *get_dcvs_path(enum dcvs_hw_type hw,
@@ -442,7 +446,7 @@ int qcom_dcvs_update_votes(const char *name, struct dcvs_freq *votes,
 
 	return -EINVAL;
 }
-EXPORT_SYMBOL(qcom_dcvs_update_votes);
+EXPORT_SYMBOL_GPL(qcom_dcvs_update_votes);
 
 int qcom_dcvs_register_voter(const char *name, enum dcvs_hw_type hw_type,
 				enum dcvs_path_type path_type)
@@ -485,7 +489,7 @@ unlock_out:
 	mutex_unlock(&path->voter_lock);
 	return ret;
 }
-EXPORT_SYMBOL(qcom_dcvs_register_voter);
+EXPORT_SYMBOL_GPL(qcom_dcvs_register_voter);
 
 int qcom_dcvs_unregister_voter(const char *name, enum dcvs_hw_type hw_type,
 				enum dcvs_path_type path_type)
@@ -522,7 +526,7 @@ unlock_out:
 	mutex_unlock(&path->voter_lock);
 	return ret;
 }
-EXPORT_SYMBOL(qcom_dcvs_unregister_voter);
+EXPORT_SYMBOL_GPL(qcom_dcvs_unregister_voter);
 
 struct kobject *qcom_dcvs_kobject_get(enum dcvs_hw_type type)
 {
@@ -546,7 +550,7 @@ struct kobject *qcom_dcvs_kobject_get(enum dcvs_hw_type type)
 
 	return kobj;
 }
-EXPORT_SYMBOL(qcom_dcvs_kobject_get);
+EXPORT_SYMBOL_GPL(qcom_dcvs_kobject_get);
 
 int qcom_dcvs_hw_minmax_get(enum dcvs_hw_type hw_type, u32 *min, u32 *max)
 {
@@ -567,7 +571,7 @@ int qcom_dcvs_hw_minmax_get(enum dcvs_hw_type hw_type, u32 *min, u32 *max)
 
 	return 0;
 }
-EXPORT_SYMBOL(qcom_dcvs_hw_minmax_get);
+EXPORT_SYMBOL_GPL(qcom_dcvs_hw_minmax_get);
 
 struct device_node *qcom_dcvs_get_ddr_child_node(
 				struct device_node *of_parent)
@@ -586,7 +590,7 @@ struct device_node *qcom_dcvs_get_ddr_child_node(
 
 	return NULL;
 }
-EXPORT_SYMBOL(qcom_dcvs_get_ddr_child_node);
+EXPORT_SYMBOL_GPL(qcom_dcvs_get_ddr_child_node);
 
 static bool qcom_dcvs_hw_and_paths_inited(void)
 {
@@ -611,39 +615,51 @@ static bool qcom_dcvs_hw_and_paths_inited(void)
 static int populate_freq_table(struct device *dev, u32 **freq_table)
 {
 	int ret, len;
-	struct device_node *of_node = dev->of_node;
+	struct device_node *of_tbl_node, *of_node = dev->of_node;
 
-	if (of_parse_phandle(of_node, FTBL_PROP, 0))
-		of_node = of_parse_phandle(of_node, FTBL_PROP, 0);
+	of_node = of_parse_phandle(of_node, FTBL_PROP, 0);
+	if (!of_node)
+		of_node = dev->of_node;
+
 	if (of_get_child_count(of_node))
-		of_node = qcom_dcvs_get_ddr_child_node(of_node);
+		of_tbl_node = qcom_dcvs_get_ddr_child_node(of_node);
+	else
+		of_tbl_node = of_node;
 
-	if (!of_find_property(of_node, FTBL_PROP, &len)) {
+	if (!of_find_property(of_tbl_node, FTBL_PROP, &len)) {
 		dev_err(dev, "Unable to find freq tbl prop\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
 	len /= sizeof(**freq_table);
 	if (!len) {
 		dev_err(dev, "Error: empty freq table\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
 
 	*freq_table = devm_kzalloc(dev, len * sizeof(**freq_table), GFP_KERNEL);
-	if (!*freq_table)
-		return -ENOMEM;
-
-	ret = of_property_read_u32_array(of_node, FTBL_PROP, *freq_table, len);
-	if (ret < 0) {
-		dev_err(dev, "Error reading freq table from DT: %d\n", ret);
-		return ret;
+	if (!*freq_table) {
+		ret = -ENOMEM;
+		goto out;
 	}
 
-	return len;
+	ret = of_property_read_u32_array(of_tbl_node, FTBL_PROP, *freq_table, len);
+	if (ret < 0) {
+		dev_err(dev, "Error reading freq table from DT: %d\n", ret);
+		goto out;
+	}
+	ret = len;
+
+out:
+	if (of_node != dev->of_node)
+		of_node_put(of_node);
+	return ret;
 }
 
 static int qcom_dcvs_dev_probe(struct platform_device *pdev)
 {
-	struct device *dev = &pdev->dev;
+	struct device *dev = &pdev->dev, *dev_root;
 	int ret;
 
 	dcvs_data = devm_kzalloc(dev, sizeof(*dcvs_data), GFP_KERNEL);
@@ -656,8 +672,15 @@ static int qcom_dcvs_dev_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
-	ret = kobject_init_and_add(&dcvs_data->kobj, &qcom_dcvs_ktype,
-			&cpu_subsys.dev_root->kobj, "bus_dcvs");
+	dev_root = bus_get_dev_root(&cpu_subsys);
+	if (dev_root) {
+		ret = kobject_init_and_add(&dcvs_data->kobj, &qcom_dcvs_ktype,
+						&dev_root->kobj, "bus_dcvs");
+		put_device(dev_root);
+	} else {
+		dev_err(dev, "failed to get cpu_subsys dev_root\n");
+		return -ENODEV;
+	}
 	if (ret < 0) {
 		dev_err(dev, "failed to init qcom-dcvs kobj: %d\n", ret);
 		kobject_put(&dcvs_data->kobj);
@@ -711,8 +734,6 @@ static int qcom_dcvs_hw_probe(struct platform_device *pdev)
 
 	hw->hw_max_freq = hw->freq_table[hw->table_len-1];
 	hw->hw_min_freq = hw->freq_table[0];
-	/* start with boost_freq = max_freq for better boot perf */
-	hw->boost_freq = hw->hw_max_freq;
 
 	ret = of_property_read_u32(dev->of_node, QCOM_DCVS_WIDTH_PROP,
 								&hw->width);
@@ -768,7 +789,8 @@ static int qcom_dcvs_path_probe(struct platform_device *pdev)
 	switch (path_type) {
 	case DCVS_SLOW_PATH:
 		if (hw->type == DCVS_DDR || hw->type == DCVS_LLCC
-					|| hw->type == DCVS_DDRQOS)
+					|| hw->type == DCVS_DDRQOS
+					|| hw->type == DCVS_UBWCP)
 			ret = setup_icc_sp_device(dev, hw, path);
 		else if (hw->type == DCVS_L3)
 			ret = setup_epss_l3_sp_device(dev, hw, path);
@@ -812,16 +834,16 @@ static int qcom_dcvs_path_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&path->voter_list);
 	mutex_init(&path->voter_lock);
 
-	/* commit max_freq for boot perf */
-	new_freqs[hw->type].ib = hw->hw_max_freq;
-	new_freqs[hw->type].ab = 0;
-	new_freqs[hw->type].hw_type = hw->type;
-	if (path->type == DCVS_FAST_PATH)
-		ret = path->commit_dcvs_freqs(path, new_freqs, BIT(hw->type));
-	else
+	/* start slow paths with boost_freq = max_freq for better boot perf */
+	if (path->type == DCVS_SLOW_PATH) {
+		hw->boost_freq = hw->hw_max_freq;
+		new_freqs[hw->type].ib = hw->hw_max_freq;
+		new_freqs[hw->type].ab = 0;
+		new_freqs[hw->type].hw_type = hw->type;
 		ret = path->commit_dcvs_freqs(path, &new_freqs[hw->type], 1);
-	if (ret < 0)
-		dev_err(dev, "Error committing initial freq for path%d\n", ret);
+		if (ret < 0)
+			dev_err(dev, "Err committing freq for path=%d\n", ret);
+	}
 
 	hw->dcvs_paths[path_type] = path;
 	hw->num_inited_paths++;
@@ -895,22 +917,7 @@ static struct platform_driver qcom_dcvs_driver = {
 		.suppress_bind_attrs = true,
 	},
 };
-
-static int __init qcom_dcvs_init(void)
-{
-	return platform_driver_register(&qcom_dcvs_driver);
-}
-
-#if IS_MODULE(CONFIG_QCOM_DCVS)
-module_init(qcom_dcvs_init);
-#else
-arch_initcall(qcom_dcvs_init);
-#endif
-static __exit void qcom_dcvs_exit(void)
-{
-	platform_driver_unregister(&qcom_dcvs_driver);
-}
-module_exit(qcom_dcvs_exit);
+module_platform_driver(qcom_dcvs_driver);
 
 MODULE_DESCRIPTION("QCOM DCVS Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

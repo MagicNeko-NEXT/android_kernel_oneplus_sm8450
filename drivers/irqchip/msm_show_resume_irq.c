@@ -1,27 +1,28 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2011, 2014-2016, 2018, 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/cpuidle.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
-
+#include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/platform_device.h>
+#include <linux/syscore_ops.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
-#include <linux/irqdomain.h>
 #include <linux/irqchip/arm-gic-v3.h>
 #include <trace/hooks/cpuidle_psci.h>
-#include <trace/hooks/gic.h>
 
-int msm_show_resume_irq_mask;
+static void __iomem *base;
+static int msm_show_resume_irq_mask;
 module_param_named(debug_mask, msm_show_resume_irq_mask, int, 0664);
 
-static void msm_show_resume_irqs(void *data, struct gic_chip_data *gic_data)
+static void msm_show_resume_irqs(void)
 {
-	struct irq_domain *domain;
-	void __iomem *base;
 	unsigned int i;
 	u32 enabled;
 	u32 pending[32];
@@ -30,9 +31,6 @@ static void msm_show_resume_irqs(void *data, struct gic_chip_data *gic_data)
 
 	if (!msm_show_resume_irq_mask)
 		return;
-
-	base = gic_data->dist_base;
-	domain = gic_data->domain;
 
 	typer = readl_relaxed(base + GICD_TYPER);
 	gic_line_nr = min(GICD_TYPER_SPIS(typer), 1023u);
@@ -46,19 +44,11 @@ static void msm_show_resume_irqs(void *data, struct gic_chip_data *gic_data)
 	for (i = find_first_bit((unsigned long *)pending, gic_line_nr);
 	     i < gic_line_nr;
 	     i = find_next_bit((unsigned long *)pending, gic_line_nr, i + 1)) {
-		unsigned int irq = irq_find_mapping(domain, i);
-		struct irq_desc *desc = irq_to_desc(irq);
-		const char *name = "null";
 
 		if (i < 32)
 			continue;
 
-		if (desc == NULL)
-			name = "stray irq";
-		else if (desc->action && desc->action->name)
-			name = desc->action->name;
-
-		pr_warn("%s: IRQ %d HWIRQ %u triggered %s\n", __func__, irq, i, name);
+		pr_warn("%s: HWIRQ %u\n", __func__, i);
 	}
 }
 
@@ -78,25 +68,53 @@ static void gic_s2idle_exit(void *unused, struct cpuidle_device *dev, bool s2idl
 		return;
 
 	if (atomic_read(&cpus_in_s2idle) == num_online_cpus())
-		gic_resume();
+		msm_show_resume_irqs();
 
 	atomic_dec(&cpus_in_s2idle);
 }
 
-static int __init msm_show_resume_irq_init(void)
+static struct syscore_ops gic_syscore_ops = {
+	.resume = msm_show_resume_irqs,
+};
+
+static int msm_show_resume_probe(struct platform_device *pdev)
 {
+	base = of_iomap(pdev->dev.of_node, 0);
+	if (!base) {
+		pr_err("%pOF: unable to map GICD registers\n", pdev->dev.of_node);
+		return -ENXIO;
+	}
+
 	register_trace_prio_android_vh_cpuidle_psci_enter(gic_s2idle_enter, NULL, INT_MAX);
 	register_trace_prio_android_vh_cpuidle_psci_exit(gic_s2idle_exit, NULL, INT_MAX);
-
-	return register_trace_android_vh_gic_resume(msm_show_resume_irqs, NULL);
+	register_syscore_ops(&gic_syscore_ops);
+	return 0;
 }
 
-#if IS_MODULE(CONFIG_QCOM_SHOW_RESUME_IRQ)
-module_init(msm_show_resume_irq_init);
-#else
-pure_initcall(msm_show_resume_irq_init);
-#endif
+static int msm_show_resume_remove(struct platform_device *pdev)
+{
+	unregister_trace_android_vh_cpuidle_psci_enter(gic_s2idle_enter, NULL);
+	unregister_trace_android_vh_cpuidle_psci_exit(gic_s2idle_exit, NULL);
+	unregister_syscore_ops(&gic_syscore_ops);
+	iounmap(base);
+	return 0;
+}
 
-MODULE_DESCRIPTION("Qualcomm Technologies, Inc. IRQ Logging driver");
-MODULE_LICENSE("GPL v2");
+static const struct of_device_id msm_show_resume_match_table[] = {
+	{ .compatible = "qcom,show-resume-irqs" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, msm_show_resume_match_table);
 
+static struct platform_driver msm_show_resume_dev_driver = {
+	.probe  = msm_show_resume_probe,
+	.remove = msm_show_resume_remove,
+	.driver = {
+		.name = "show-resume-irqs",
+		.of_match_table = msm_show_resume_match_table,
+	},
+};
+module_platform_driver(msm_show_resume_dev_driver);
+
+MODULE_DESCRIPTION("Qualcomm Technologies, Inc. MSM Show resume IRQ");
+MODULE_LICENSE("GPL");

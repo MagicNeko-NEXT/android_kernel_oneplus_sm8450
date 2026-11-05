@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/**
+/*
  * trace.h - DesignWare USB3 DRD Controller Trace Support
  *
  * Copyright (C) 2014 Texas Instruments Incorporated - https://www.ti.com
@@ -19,6 +19,23 @@
 #include "core.h"
 #include "debug.h"
 
+DECLARE_EVENT_CLASS(dwc3_log_set_prtcap,
+	TP_PROTO(u32 mode),
+	TP_ARGS(mode),
+	TP_STRUCT__entry(
+		__field(u32, mode)
+	),
+	TP_fast_assign(
+		__entry->mode = mode;
+	),
+	TP_printk("mode %s", dwc3_mode_string(__entry->mode))
+);
+
+DEFINE_EVENT(dwc3_log_set_prtcap, dwc3_set_prtcap,
+	TP_PROTO(u32 mode),
+	TP_ARGS(mode)
+);
+
 DECLARE_EVENT_CLASS(dwc3_log_io,
 	TP_PROTO(void *base, u32 offset, u32 value),
 	TP_ARGS(base, offset, value),
@@ -32,8 +49,10 @@ DECLARE_EVENT_CLASS(dwc3_log_io,
 		__entry->offset = offset;
 		__entry->value = value;
 	),
-	TP_printk("addr %p value %08x", __entry->base + __entry->offset,
-			__entry->value)
+	TP_printk("addr %p offset %04x value %08x",
+		__entry->base + __entry->offset,
+		__entry->offset,
+		__entry->value)
 );
 
 DEFINE_EVENT(dwc3_log_io, dwc3_readl,
@@ -52,14 +71,13 @@ DECLARE_EVENT_CLASS(dwc3_log_event,
 	TP_STRUCT__entry(
 		__field(u32, event)
 		__field(u32, ep0state)
-		__dynamic_array(char, str, DWC3_MSG_MAX)
 	),
 	TP_fast_assign(
 		__entry->event = event;
 		__entry->ep0state = dwc->ep0state;
 	),
 	TP_printk("event (%08x): %s", __entry->event,
-			dwc3_decode_event(__get_str(str), DWC3_MSG_MAX,
+			dwc3_decode_event(__get_buf(DWC3_MSG_MAX), DWC3_MSG_MAX,
 					__entry->event, __entry->ep0state))
 );
 
@@ -77,7 +95,6 @@ DECLARE_EVENT_CLASS(dwc3_log_ctrl,
 		__field(__u16, wValue)
 		__field(__u16, wIndex)
 		__field(__u16, wLength)
-		__dynamic_array(char, str, DWC3_MSG_MAX)
 	),
 	TP_fast_assign(
 		__entry->bRequestType = ctrl->bRequestType;
@@ -86,7 +103,7 @@ DECLARE_EVENT_CLASS(dwc3_log_ctrl,
 		__entry->wIndex = le16_to_cpu(ctrl->wIndex);
 		__entry->wLength = le16_to_cpu(ctrl->wLength);
 	),
-	TP_printk("%s", usb_decode_ctrl(__get_str(str), DWC3_MSG_MAX,
+	TP_printk("%s", usb_decode_ctrl(__get_buf(DWC3_MSG_MAX), DWC3_MSG_MAX,
 					__entry->bRequestType,
 					__entry->bRequest, __entry->wValue,
 					__entry->wIndex, __entry->wLength)
@@ -220,8 +237,6 @@ DECLARE_EVENT_CLASS(dwc3_log_trb,
 	TP_STRUCT__entry(
 		__string(name, dep->name)
 		__field(struct dwc3_trb *, trb)
-		__field(u32, allocated)
-		__field(u32, queued)
 		__field(u32, bpl)
 		__field(u32, bph)
 		__field(u32, size)
@@ -241,7 +256,7 @@ DECLARE_EVENT_CLASS(dwc3_log_trb,
 		__entry->enqueue = dep->trb_enqueue;
 		__entry->dequeue = dep->trb_dequeue;
 	),
-	TP_printk("%s: trb %p (E%d:D%d) buf %08x%08x size %s%d ctrl %08x (%c%c%c%c:%c%c:%s)",
+	TP_printk("%s: trb %p (E%d:D%d) buf %08x%08x size %s%d ctrl %08x sofn %08x (%c%c%c%c:%c%c:%s)",
 		__get_str(name), __entry->trb, __entry->enqueue,
 		__entry->dequeue, __entry->bph, __entry->bpl,
 		({char *s;
@@ -267,6 +282,7 @@ DECLARE_EVENT_CLASS(dwc3_log_trb,
 			s = "";
 		} s; }),
 		DWC3_TRB_SIZE_LENGTH(__entry->size), __entry->ctrl,
+		DWC3_TRB_CTRL_GET_SID_SOFN(__entry->ctrl),
 		__entry->ctrl & DWC3_TRB_CTRL_HWO ? 'H' : 'h',
 		__entry->ctrl & DWC3_TRB_CTRL_LST ? 'L' : 'l',
 		__entry->ctrl & DWC3_TRB_CTRL_CHN ? 'C' : 'c',

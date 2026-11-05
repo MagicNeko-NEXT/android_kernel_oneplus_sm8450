@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2016-2018, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2025, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "%s " fmt, KBUILD_MODNAME
@@ -13,6 +13,7 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
+#include <linux/ktime.h>
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/notifier.h>
@@ -24,11 +25,12 @@
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
-#include <linux/syscore_ops.h>
 #include <linux/wait.h>
 
+#include <clocksource/arm_arch_timer.h>
 #include <soc/qcom/cmd-db.h>
 #include <soc/qcom/tcs.h>
+#include <soc/qcom/crm.h>
 #include <dt-bindings/soc/qcom,rpmh-rsc.h>
 
 #include "rpmh-internal.h"
@@ -36,53 +38,64 @@
 #define CREATE_TRACE_POINTS
 #include "trace-rpmh.h"
 
+#if IS_ENABLED(CONFIG_IPC_LOGGING)
 #include <linux/ipc_logging.h>
+#endif
 
 #define RSC_DRV_IPC_LOG_SIZE		2
 
-#define RSC_DRV_TCS_OFFSET		672
-#define RSC_DRV_CMD_OFFSET		20
+/* DRV ID Register */
+#define RSC_DRV_ID			0
+
+#define MAJOR_VER_MASK			0xFF
+#define MAJOR_VER_SHIFT			16
+#define MINOR_VER_MASK			0xFF
+#define MINOR_VER_SHIFT			8
+
+enum {
+	RSC_DRV_TCS_OFFSET,
+	RSC_DRV_CMD_OFFSET,
+	DRV_SOLVER_CONFIG,
+	DRV_PRNT_CHLD_CONFIG,
+	RSC_DRV_IRQ_ENABLE,
+	RSC_DRV_IRQ_STATUS,
+	RSC_DRV_IRQ_CLEAR,
+	RSC_DRV_CMD_WAIT_FOR_CMPL,
+	RSC_DRV_CONTROL,
+	RSC_DRV_STATUS,
+	RSC_DRV_CMD_ENABLE,
+	RSC_DRV_CMD_MSGID,
+	RSC_DRV_CMD_ADDR,
+	RSC_DRV_CMD_DATA,
+	RSC_DRV_CMD_STATUS,
+	RSC_DRV_CMD_RESP_DATA,
+	/* DRV channel Registers */
+	RSC_DRV_CHN_TCS_TRIGGER,
+	RSC_DRV_CHN_TCS_COMPLETE,
+	RSC_DRV_CHN_SEQ_BUSY,
+	RSC_DRV_CHN_SEQ_PC,
+	RSC_DRV_CHN_UPDATE,
+	RSC_DRV_CHN_BUSY,
+	RSC_DRV_CHN_EN,
+};
 
 /* DRV HW Solver Configuration Information Register */
-#define DRV_SOLVER_CONFIG		0x04
 #define DRV_HW_SOLVER_MASK		1
 #define DRV_HW_SOLVER_SHIFT		24
 
 /* DRV TCS Configuration Information Register */
-#define DRV_PRNT_CHLD_CONFIG		0x0C
 #define DRV_NUM_TCS_MASK		0x3F
 #define DRV_NUM_TCS_SHIFT		6
 #define DRV_NCPT_MASK			0x1F
 #define DRV_NCPT_SHIFT			27
 
-/* Offsets for common TCS Registers, one bit per TCS */
-#define RSC_DRV_IRQ_ENABLE		0x00
-#define RSC_DRV_IRQ_STATUS		0x04
-#define RSC_DRV_IRQ_CLEAR		0x08	/* w/o; write 1 to clear */
-
-/*
- * Offsets for per TCS Registers.
- *
- * TCSes start at 0x10 from tcs_base and are stored one after another.
- * Multiply tcs_id by RSC_DRV_TCS_OFFSET to find a given TCS and add one
- * of the below to find a register.
- */
-#define RSC_DRV_CMD_WAIT_FOR_CMPL	0x10	/* 1 bit per command */
-#define RSC_DRV_CONTROL			0x14
-#define RSC_DRV_STATUS			0x18	/* zero if tcs is busy */
-#define RSC_DRV_CMD_ENABLE		0x1C	/* 1 bit per command */
-
-/*
- * Offsets for per command in a TCS.
- *
- * Commands (up to 16) start at 0x30 in a TCS; multiply command index
- * by RSC_DRV_CMD_OFFSET and add one of the below to find a register.
- */
-#define RSC_DRV_CMD_MSGID		0x30
-#define RSC_DRV_CMD_ADDR		0x34
-#define RSC_DRV_CMD_DATA		0x38
-#define RSC_DRV_CMD_STATUS		0x3C
-#define RSC_DRV_CMD_RESP_DATA		0x40
+/* Offsets for CONTROL TCS Registers */
+#define RSC_DRV_CTL_TCS_DATA_HI		0x38
+#define RSC_DRV_CTL_TCS_DATA_HI_MASK	0xFFFFFF
+#define RSC_DRV_CTL_TCS_DATA_HI_VALID	BIT(31)
+#define RSC_DRV_CTL_TCS_DATA_LO		0x40
+#define RSC_DRV_CTL_TCS_DATA_LO_MASK	0xFFFFFFFF
+#define RSC_DRV_CTL_TCS_DATA_SIZE	32
 
 #define TCS_AMC_MODE_ENABLE		BIT(16)
 #define TCS_AMC_MODE_TRIGGER		BIT(24)
@@ -94,10 +107,19 @@
 #define CMD_STATUS_ISSUED		BIT(8)
 #define CMD_STATUS_COMPL		BIT(16)
 
+/* Offsets for DRV channel status register */
+#define CH0_CHN_BUSY			BIT(0)
+#define CH1_CHN_BUSY			BIT(1)
+#define CH0_WAKE_TCS_STATUS		BIT(0)
+#define CH0_SLEEP_TCS_STATUS		BIT(1)
+#define CH1_WAKE_TCS_STATUS		BIT(2)
+#define CH1_SLEEP_TCS_STATUS		BIT(3)
+#define CH_CLEAR_STATUS			BIT(31)
+
 #define ACCL_TYPE(addr)			((addr >> 16) & 0xF)
-#define NR_ACCL_TYPES			3
-#define MAX_RSC_COUNT			2
 #define VREG_ADDR(addr)			(addr & ~0xF)
+
+#define MAX_RSC_COUNT			5
 
 enum {
 	HW_ACCL_CLK = 0x3,
@@ -168,16 +190,105 @@ bool rpmh_standalone;
  *  +---------------------------------------------------+
  */
 
+#define USECS_TO_CYCLES(time_usecs)			\
+	xloops_to_cycles((time_usecs) * 0x10C7UL)
+
+static inline unsigned long xloops_to_cycles(u64 xloops)
+{
+	return (xloops * loops_per_jiffy * HZ) >> 32;
+}
+
+static u32 rpmh_rsc_reg_offset_ver_2_7[] = {
+	[RSC_DRV_TCS_OFFSET]		= 672,
+	[RSC_DRV_CMD_OFFSET]		= 20,
+	[DRV_SOLVER_CONFIG]		= 0x04,
+	[DRV_PRNT_CHLD_CONFIG]		= 0x0C,
+	[RSC_DRV_IRQ_ENABLE]		= 0x00,
+	[RSC_DRV_IRQ_STATUS]		= 0x04,
+	[RSC_DRV_IRQ_CLEAR]		= 0x08,
+	[RSC_DRV_CMD_WAIT_FOR_CMPL]	= 0x10,
+	[RSC_DRV_CONTROL]		= 0x14,
+	[RSC_DRV_STATUS]		= 0x18,
+	[RSC_DRV_CMD_ENABLE]		= 0x1C,
+	[RSC_DRV_CMD_MSGID]		= 0x30,
+	[RSC_DRV_CMD_ADDR]		= 0x34,
+	[RSC_DRV_CMD_DATA]		= 0x38,
+	[RSC_DRV_CMD_STATUS]		= 0x3C,
+	[RSC_DRV_CMD_RESP_DATA]		= 0x40,
+	[RSC_DRV_CHN_SEQ_BUSY]		= 0x0,
+	[RSC_DRV_CHN_SEQ_PC]		= 0x0,
+	[RSC_DRV_CHN_TCS_TRIGGER]	= 0x0,
+	[RSC_DRV_CHN_TCS_COMPLETE]	= 0x0,
+	[RSC_DRV_CHN_UPDATE]		= 0x0,
+	[RSC_DRV_CHN_BUSY]		= 0x0,
+	[RSC_DRV_CHN_EN]		= 0x0,
+};
+
+static u32 rpmh_rsc_reg_offset_ver_3_0[] = {
+	[RSC_DRV_TCS_OFFSET]		= 672,
+	[RSC_DRV_CMD_OFFSET]		= 24,
+	[DRV_SOLVER_CONFIG]		= 0x04,
+	[DRV_PRNT_CHLD_CONFIG]		= 0x0C,
+	[RSC_DRV_IRQ_ENABLE]		= 0x00,
+	[RSC_DRV_IRQ_STATUS]		= 0x04,
+	[RSC_DRV_IRQ_CLEAR]		= 0x08,
+	[RSC_DRV_CMD_WAIT_FOR_CMPL]	= 0x20,
+	[RSC_DRV_CONTROL]		= 0x24,
+	[RSC_DRV_STATUS]		= 0x28,
+	[RSC_DRV_CMD_ENABLE]		= 0x2C,
+	[RSC_DRV_CMD_MSGID]		= 0x34,
+	[RSC_DRV_CMD_ADDR]		= 0x38,
+	[RSC_DRV_CMD_DATA]		= 0x3C,
+	[RSC_DRV_CMD_STATUS]		= 0x40,
+	[RSC_DRV_CMD_RESP_DATA]		= 0x44,
+	[RSC_DRV_CHN_SEQ_BUSY]		= 0x464,
+	[RSC_DRV_CHN_SEQ_PC]		= 0x468,
+	[RSC_DRV_CHN_TCS_TRIGGER]	= 0x490,
+	[RSC_DRV_CHN_TCS_COMPLETE]	= 0x494,
+	[RSC_DRV_CHN_UPDATE]		= 0x498,
+	[RSC_DRV_CHN_BUSY]		= 0x49C,
+	[RSC_DRV_CHN_EN]		= 0x4A0,
+};
+
+static u32 rpmh_rsc_reg_offset_ver_3_0_hw_channel[] = {
+	[RSC_DRV_TCS_OFFSET]		= 336,
+	[RSC_DRV_CMD_OFFSET]		= 24,
+	[DRV_SOLVER_CONFIG]		= 0x04,
+	[DRV_PRNT_CHLD_CONFIG]		= 0x0C,
+	[RSC_DRV_IRQ_ENABLE]		= 0x00,
+	[RSC_DRV_IRQ_STATUS]		= 0x04,
+	[RSC_DRV_IRQ_CLEAR]		= 0x08,
+	[RSC_DRV_CMD_WAIT_FOR_CMPL]	= 0x20,
+	[RSC_DRV_CONTROL]		= 0x24,
+	[RSC_DRV_STATUS]		= 0x28,
+	[RSC_DRV_CMD_ENABLE]		= 0x2C,
+	[RSC_DRV_CMD_MSGID]		= 0x34,
+	[RSC_DRV_CMD_ADDR]		= 0x38,
+	[RSC_DRV_CMD_DATA]		= 0x3C,
+	[RSC_DRV_CMD_STATUS]		= 0x40,
+	[RSC_DRV_CMD_RESP_DATA]		= 0x44,
+	[RSC_DRV_CHN_SEQ_BUSY]		= 0x464,
+	[RSC_DRV_CHN_SEQ_PC]		= 0x468,
+	[RSC_DRV_CHN_TCS_TRIGGER]	= 0x490,
+	[RSC_DRV_CHN_TCS_COMPLETE]	= 0x494,
+	[RSC_DRV_CHN_UPDATE]		= 0x498,
+	[RSC_DRV_CHN_BUSY]		= 0x49C,
+	[RSC_DRV_CHN_EN]		= 0x4A0,
+};
+
 static inline void __iomem *
 tcs_reg_addr(const struct rsc_drv *drv, int reg, int tcs_id)
 {
-	return drv->tcs_base + RSC_DRV_TCS_OFFSET * tcs_id + reg;
+	if (!drv->tcs_distance)
+		return drv->tcs_base + drv->regs[RSC_DRV_TCS_OFFSET] * tcs_id + reg;
+
+	return drv->tcs_base + drv->tcs_distance * tcs_id + reg;
 }
 
 static inline void __iomem *
 tcs_cmd_addr(const struct rsc_drv *drv, int reg, int tcs_id, int cmd_id)
 {
-	return tcs_reg_addr(drv, reg, tcs_id) + RSC_DRV_CMD_OFFSET * cmd_id;
+	return tcs_reg_addr(drv, reg, tcs_id) + drv->regs[RSC_DRV_CMD_OFFSET] * cmd_id;
 }
 
 static u32 read_tcs_cmd(const struct rsc_drv *drv, int reg, int tcs_id,
@@ -224,25 +335,10 @@ static void write_tcs_reg_sync(const struct rsc_drv *drv, int reg, int tcs_id,
 }
 
 /**
- * tcs_is_free() - Return if a TCS is totally free.
- * @drv:    The RSC controller.
- * @tcs_id: The global ID of this TCS.
- *
- * Returns true if nobody has claimed this TCS (by setting tcs_in_use).
- *
- * Context: Must be called with the drv->lock held.
- *
- * Return: true if the given TCS is free.
- */
-static bool tcs_is_free(struct rsc_drv *drv, int tcs_id)
-{
-	return !test_bit(tcs_id, drv->tcs_in_use);
-}
-
-/**
  * tcs_invalidate() - Invalidate all TCSes of the given type (sleep or wake).
  * @drv:  The RSC controller.
  * @type: SLEEP_TCS or WAKE_TCS
+ * @ch:   Channel number
  *
  * This will clear the "slots" variable of the given tcs_group and also
  * tell the hardware to forget about all entries.
@@ -251,34 +347,63 @@ static bool tcs_is_free(struct rsc_drv *drv, int tcs_id)
  * function is called, since otherwise the device may immediately become
  * used again even before this function exits.
  */
-static void tcs_invalidate(struct rsc_drv *drv, int type)
+static void tcs_invalidate(struct rsc_drv *drv, int type, int ch)
 {
 	int m;
-	struct tcs_group *tcs = &drv->tcs[type];
+	struct tcs_group *tcs = &drv->ch[ch].tcs[type];
 
 	/* Caller ensures nobody else is running so no lock */
-	if (bitmap_empty(tcs->slots, MAX_TCS_SLOTS))
+	if (bitmap_empty(tcs->slots, tcs->ncpt * tcs->num_tcs))
 		return;
 
 	for (m = tcs->offset; m < tcs->offset + tcs->num_tcs; m++) {
-		write_tcs_reg_sync(drv, RSC_DRV_CMD_ENABLE, m, 0);
-		write_tcs_reg_sync(drv, RSC_DRV_CMD_WAIT_FOR_CMPL, m, 0);
+		write_tcs_reg_sync(drv, drv->regs[RSC_DRV_CMD_ENABLE], m, 0);
+		write_tcs_reg_sync(drv, drv->regs[RSC_DRV_CMD_WAIT_FOR_CMPL], m, 0);
 	}
-	bitmap_zero(tcs->slots, MAX_TCS_SLOTS);
+
+	bitmap_zero(tcs->slots, tcs->ncpt * tcs->num_tcs);
+}
+
+/**
+ * rpmh_rsc_get_channel() - Get the Unused channel to send data on.
+ * @drv: The RSC controller.
+ *
+ * Return: 0 on success, else -error.
+ */
+int rpmh_rsc_get_channel(struct rsc_drv *drv)
+{
+	int chn_update, chn_busy;
+
+	if (drv->num_channels == 1)
+		return CH0;
+
+	/* Select Unused channel */
+	do {
+		chn_update = readl_relaxed(drv->base + drv->regs[RSC_DRV_CHN_UPDATE]);
+		chn_busy = readl_relaxed(drv->base + drv->regs[RSC_DRV_CHN_BUSY]);
+	} while (chn_busy != chn_update);
+
+	if (chn_busy & CH0_CHN_BUSY)
+		return CH1;
+	else if (chn_busy & CH1_CHN_BUSY)
+		return CH0;
+	else
+		return -EBUSY;
 }
 
 /**
  * rpmh_rsc_invalidate() - Invalidate sleep and wake TCSes.
  * @drv: The RSC controller.
+ * @ch:  Channel number
  *
  * The caller must ensure that no other RPMH actions are happening when this
  * function is called, since otherwise the device may immediately become
  * used again even before this function exits.
  */
-void rpmh_rsc_invalidate(struct rsc_drv *drv)
+void rpmh_rsc_invalidate(struct rsc_drv *drv, int ch)
 {
-	tcs_invalidate(drv, SLEEP_TCS);
-	tcs_invalidate(drv, WAKE_TCS);
+	tcs_invalidate(drv, SLEEP_TCS, ch);
+	tcs_invalidate(drv, WAKE_TCS, ch);
 }
 
 /**
@@ -292,12 +417,13 @@ void rpmh_rsc_invalidate(struct rsc_drv *drv)
  * Return: A pointer to a tcs_group or an ERR_PTR.
  */
 static struct tcs_group *get_tcs_for_msg(struct rsc_drv *drv,
-					 const struct tcs_request *msg)
+					 enum rpmh_state state,
+					 int ch)
 {
 	int type;
 	struct tcs_group *tcs;
 
-	switch (msg->state) {
+	switch (state) {
 	case RPMH_ACTIVE_ONLY_STATE:
 		type = ACTIVE_TCS;
 		break;
@@ -318,9 +444,9 @@ static struct tcs_group *get_tcs_for_msg(struct rsc_drv *drv,
 	 * transfers have finished before we use it (maybe by running from
 	 * the last CPU in PM code).
 	 */
-	tcs = &drv->tcs[type];
-	if (msg->state == RPMH_ACTIVE_ONLY_STATE && !tcs->num_tcs)
-		tcs = &drv->tcs[WAKE_TCS];
+	tcs = &drv->ch[ch].tcs[type];
+	if (state == RPMH_ACTIVE_ONLY_STATE && !tcs->num_tcs)
+		tcs = &drv->ch[ch].tcs[WAKE_TCS];
 
 	return tcs;
 }
@@ -342,15 +468,21 @@ static struct tcs_group *get_tcs_for_msg(struct rsc_drv *drv,
  * Return: The stashed request.
  */
 static const struct tcs_request *get_req_from_tcs(struct rsc_drv *drv,
-						  int tcs_id)
+						  int tcs_id,
+						  int *ch)
 {
 	struct tcs_group *tcs;
 	int i;
 
-	for (i = 0; i < TCS_TYPE_NR; i++) {
-		tcs = &drv->tcs[i];
-		if (tcs->mask & BIT(tcs_id))
+	for (i = 0; i < MAX_CHANNEL; i++) {
+		if (!drv->ch[i].initialized)
+			continue;
+
+		tcs = get_tcs_for_msg(drv, RPMH_ACTIVE_ONLY_STATE, i);
+		if (tcs->mask & BIT(tcs_id)) {
+			*ch = i;
 			return tcs->req[tcs_id - tcs->offset];
+		}
 	}
 
 	return NULL;
@@ -376,24 +508,25 @@ static const struct tcs_request *get_req_from_tcs(struct rsc_drv *drv,
 static void __tcs_set_trigger(struct rsc_drv *drv, int tcs_id, bool trigger)
 {
 	u32 enable;
+	u32 reg = drv->regs[RSC_DRV_CONTROL];
 
 	/*
 	 * HW req: Clear the DRV_CONTROL and enable TCS again
 	 * While clearing ensure that the AMC mode trigger is cleared
 	 * and then the mode enable is cleared.
 	 */
-	enable = read_tcs_reg(drv, RSC_DRV_CONTROL, tcs_id);
+	enable = read_tcs_reg(drv, reg, tcs_id);
 	enable &= ~TCS_AMC_MODE_TRIGGER;
-	write_tcs_reg_sync(drv, RSC_DRV_CONTROL, tcs_id, enable);
+	write_tcs_reg_sync(drv, reg, tcs_id, enable);
 	enable &= ~TCS_AMC_MODE_ENABLE;
-	write_tcs_reg_sync(drv, RSC_DRV_CONTROL, tcs_id, enable);
+	write_tcs_reg_sync(drv, reg, tcs_id, enable);
 
 	if (trigger) {
 		/* Enable the AMC mode on the TCS and then trigger the TCS */
 		enable = TCS_AMC_MODE_ENABLE;
-		write_tcs_reg_sync(drv, RSC_DRV_CONTROL, tcs_id, enable);
+		write_tcs_reg_sync(drv, reg, tcs_id, enable);
 		enable |= TCS_AMC_MODE_TRIGGER;
-		write_tcs_reg(drv, RSC_DRV_CONTROL, tcs_id, enable);
+		write_tcs_reg(drv, reg, tcs_id, enable);
 	}
 }
 
@@ -409,13 +542,14 @@ static void __tcs_set_trigger(struct rsc_drv *drv, int tcs_id, bool trigger)
 static void enable_tcs_irq(struct rsc_drv *drv, int tcs_id, bool enable)
 {
 	u32 data;
+	u32 reg = drv->regs[RSC_DRV_IRQ_ENABLE];
 
-	data = readl_relaxed(drv->tcs_base + RSC_DRV_IRQ_ENABLE);
+	data = readl_relaxed(drv->tcs_base + reg);
 	if (enable)
 		data |= BIT(tcs_id);
 	else
 		data &= ~BIT(tcs_id);
-	writel_relaxed(data, drv->tcs_base + RSC_DRV_IRQ_ENABLE);
+	writel_relaxed(data, drv->tcs_base + reg);
 }
 
 /**
@@ -431,22 +565,21 @@ static void enable_tcs_irq(struct rsc_drv *drv, int tcs_id, bool enable)
 static irqreturn_t tcs_tx_done(int irq, void *p)
 {
 	struct rsc_drv *drv = p;
-	int i;
+	int i, ch;
 	unsigned long irq_status;
 	const struct tcs_request *req;
-	u32 enable;
 
-	irq_status = readl_relaxed(drv->tcs_base + RSC_DRV_IRQ_STATUS);
+	irq_status = readl_relaxed(drv->tcs_base + drv->regs[RSC_DRV_IRQ_STATUS]);
 
-	for_each_set_bit(i, &irq_status, BITS_PER_LONG) {
-		req = get_req_from_tcs(drv, i);
-		if (!req) {
-			WARN_ON(1);
+	for_each_set_bit(i, &irq_status, BITS_PER_TYPE(u32)) {
+		req = get_req_from_tcs(drv, i, &ch);
+		if (WARN_ON(!req))
 			goto skip;
-		}
 
 		trace_rpmh_tx_done(drv, i, req);
+#if IS_ENABLED(CONFIG_IPC_LOGGING)
 		ipc_log_string(drv->ipc_log_ctx, "IRQ response: m=%d", i);
+#endif
 
 		/* Clear AMC trigger & enable modes and
 		 * disable interrupt for this TCS
@@ -454,15 +587,9 @@ static irqreturn_t tcs_tx_done(int irq, void *p)
 		__tcs_set_trigger(drv, i, false);
 skip:
 		/* Reclaim the TCS */
-		write_tcs_reg(drv, RSC_DRV_CMD_ENABLE, i, 0);
-		write_tcs_reg(drv, RSC_DRV_CMD_WAIT_FOR_CMPL, i, 0);
-		writel_relaxed(BIT(i), drv->tcs_base + RSC_DRV_IRQ_CLEAR);
-
-		/* Clear the AMC MODE Trigger */
-		enable = read_tcs_reg(drv, RSC_DRV_CONTROL, i);
-		enable &= ~TCS_AMC_MODE_TRIGGER;
-		write_tcs_reg(drv, RSC_DRV_CONTROL, i, enable);
-
+		write_tcs_reg(drv, drv->regs[RSC_DRV_CMD_ENABLE], i, 0);
+		write_tcs_reg(drv, drv->regs[RSC_DRV_CMD_WAIT_FOR_CMPL], i, 0);
+		writel_relaxed(BIT(i), drv->tcs_base + drv->regs[RSC_DRV_IRQ_CLEAR]);
 		spin_lock(&drv->lock);
 		clear_bit(i, drv->tcs_in_use);
 		/*
@@ -470,7 +597,7 @@ skip:
 		 * spammed with interrupts coming when the solver
 		 * sends its wake votes.
 		 */
-		if (!drv->tcs[ACTIVE_TCS].num_tcs)
+		if (!drv->ch[ch].tcs[ACTIVE_TCS].num_tcs)
 			enable_tcs_irq(drv, i, false);
 		spin_unlock(&drv->lock);
 		wake_up(&drv->tcs_wait);
@@ -501,29 +628,36 @@ static void __tcs_buffer_write(struct rsc_drv *drv, int tcs_id, int cmd_id,
 	struct tcs_cmd *cmd;
 	int i, j;
 
+	/* Convert all commands to RR when the request has wait_for_compl set */
 	cmd_msgid |= msg->wait_for_compl ? CMD_MSGID_RESP_REQ : 0;
-	cmd_complete = read_tcs_reg(drv, RSC_DRV_CMD_WAIT_FOR_CMPL, tcs_id);
+	cmd_complete = read_tcs_reg(drv, drv->regs[RSC_DRV_CMD_WAIT_FOR_CMPL], tcs_id);
 
 	for (i = 0, j = cmd_id; i < msg->num_cmds; i++, j++) {
 		cmd = &msg->cmds[i];
 		cmd_enable |= BIT(j);
 		cmd_complete |= cmd->wait << j;
 		msgid = cmd_msgid;
+		/*
+		 * Additionally, if the cmd->wait is set, make the command
+		 * response reqd even if the overall request was fire-n-forget.
+		 */
 		msgid |= cmd->wait ? CMD_MSGID_RESP_REQ : 0;
 
-		write_tcs_cmd(drv, RSC_DRV_CMD_MSGID, tcs_id, j, msgid);
-		write_tcs_cmd(drv, RSC_DRV_CMD_ADDR, tcs_id, j, cmd->addr);
-		write_tcs_cmd(drv, RSC_DRV_CMD_DATA, tcs_id, j, cmd->data);
-		trace_rpmh_send_msg(drv, tcs_id, j, msgid, cmd);
+		write_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_MSGID], tcs_id, j, msgid);
+		write_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_ADDR], tcs_id, j, cmd->addr);
+		write_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_DATA], tcs_id, j, cmd->data);
+		trace_rpmh_send_msg(drv, tcs_id, msg->state, j, msgid, cmd);
+#if IS_ENABLED(CONFIG_IPC_LOGGING)
 		ipc_log_string(drv->ipc_log_ctx,
 			       "TCS write: m=%d n=%d msgid=%#x addr=%#x data=%#x wait=%d",
 			       tcs_id, j, msgid, cmd->addr,
 			       cmd->data, cmd->wait);
+#endif
 	}
 
-	write_tcs_reg(drv, RSC_DRV_CMD_WAIT_FOR_CMPL, tcs_id, cmd_complete);
-	cmd_enable |= read_tcs_reg(drv, RSC_DRV_CMD_ENABLE, tcs_id);
-	write_tcs_reg(drv, RSC_DRV_CMD_ENABLE, tcs_id, cmd_enable);
+	write_tcs_reg(drv, drv->regs[RSC_DRV_CMD_WAIT_FOR_CMPL], tcs_id, cmd_complete);
+	cmd_enable |= read_tcs_reg(drv, drv->regs[RSC_DRV_CMD_ENABLE], tcs_id);
+	write_tcs_reg(drv, drv->regs[RSC_DRV_CMD_ENABLE], tcs_id, cmd_enable);
 }
 
 /**
@@ -543,7 +677,7 @@ static void __tcs_buffer_write(struct rsc_drv *drv, int tcs_id, int cmd_id,
  *
  * Return: 0 if nothing in flight or -EBUSY if we should try again later.
  *         The caller must re-enable interrupts between tries since that's
- *         the only way tcs_is_free() will ever return true and the only way
+ *         the only way tcs_in_use will ever be updated and the only way
  *         RSC_DRV_CMD_ENABLE will ever be cleared.
  */
 static int check_for_req_inflight(struct rsc_drv *drv, struct tcs_group *tcs,
@@ -551,18 +685,15 @@ static int check_for_req_inflight(struct rsc_drv *drv, struct tcs_group *tcs,
 {
 	unsigned long curr_enabled;
 	u32 addr;
-	int i, j, k;
-	int tcs_id = tcs->offset;
+	int j, k;
+	int i = tcs->offset;
 	unsigned long accl;
 
-	for (i = 0; i < tcs->num_tcs; i++, tcs_id++) {
-		if (tcs_is_free(drv, tcs_id))
-			continue;
+	for_each_set_bit_from(i, drv->tcs_in_use, tcs->offset + tcs->num_tcs) {
+		curr_enabled = read_tcs_reg(drv, drv->regs[RSC_DRV_CMD_ENABLE], i);
 
-		curr_enabled = read_tcs_reg(drv, RSC_DRV_CMD_ENABLE, tcs_id);
-
-		for_each_set_bit(j, &curr_enabled, MAX_CMDS_PER_TCS) {
-			addr = read_tcs_cmd(drv, RSC_DRV_CMD_ADDR, tcs_id, j);
+		for_each_set_bit(j, &curr_enabled, tcs->ncpt) {
+			addr = read_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_ADDR], i, j);
 			for (k = 0; k < msg->num_cmds; k++) {
 			/*
 			 * Each RPMh VREG accelerator resource has 3 or 4 contiguous 4-byte
@@ -573,7 +704,7 @@ static int check_for_req_inflight(struct rsc_drv *drv, struct tcs_group *tcs,
 				if (accl == HW_ACCL_VREG &&
 				    VREG_ADDR(addr) == VREG_ADDR(msg->cmds[k].addr))
 					return -EBUSY;
-				else if (addr == msg->cmds[k].addr)
+				else if (cmd_db_match_resource_addr(msg->cmds[k].addr, addr))
 					return -EBUSY;
 			}
 		}
@@ -589,18 +720,34 @@ static int check_for_req_inflight(struct rsc_drv *drv, struct tcs_group *tcs,
  *
  * Must be called with the drv->lock held since that protects tcs_in_use.
  *
- * Return: The first tcs that's free.
+ * Return: The first tcs that's free or -EBUSY if all in use.
  */
 static int find_free_tcs(struct tcs_group *tcs)
 {
-	int i;
+	const struct rsc_drv *drv = tcs->drv;
+	unsigned long i;
+	unsigned long max = tcs->offset + tcs->num_tcs;
+	int timeout = 100;
+	u32 sts;
 
-	for (i = 0; i < tcs->num_tcs; i++) {
-		if (tcs_is_free(tcs->drv, tcs->offset + i))
-			return tcs->offset + i;
+	i = find_next_zero_bit(drv->tcs_in_use, max, tcs->offset);
+	if (i >= max)
+		return -EBUSY;
+
+	sts = read_tcs_reg(drv, drv->regs[RSC_DRV_STATUS], i);
+
+	while (timeout) {
+		sts = read_tcs_reg(drv, drv->regs[RSC_DRV_STATUS], i);
+		if (sts)
+			break;
+		timeout--;
+		udelay(1);
 	}
 
-	return -EBUSY;
+	if (!timeout)
+		return -EBUSY;
+
+	return i;
 }
 
 /**
@@ -638,6 +785,7 @@ static int claim_tcs_for_req(struct rsc_drv *drv, struct tcs_group *tcs,
  * rpmh_rsc_send_data() - Write / trigger active-only message.
  * @drv: The controller.
  * @msg: The data to be sent.
+ * @ch:  Channel number
  *
  * NOTES:
  * - This is only used for "ACTIVE_ONLY" since the limitations of this
@@ -654,14 +802,16 @@ static int claim_tcs_for_req(struct rsc_drv *drv, struct tcs_group *tcs,
  *   the interrupt handler to run. If the interrupts is set to run on the
  *   active CPU this can never happen if interrupts are disabled.
  *
- * Return: 0 on success, else -error.
+ * Return: 0 on success, -EINVAL on error.
  */
-int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
+int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg, int ch)
 {
 	struct tcs_group *tcs;
 	int tcs_id;
 
-	tcs = get_tcs_for_msg(drv, msg);
+	might_sleep();
+
+	tcs = get_tcs_for_msg(drv, msg->state, ch);
 	if (IS_ERR(tcs))
 		return PTR_ERR(tcs);
 
@@ -680,17 +830,20 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 
 	tcs->req[tcs_id - tcs->offset] = msg;
 	set_bit(tcs_id, drv->tcs_in_use);
-	if (msg->state == RPMH_ACTIVE_ONLY_STATE && tcs->type != ACTIVE_TCS) {
-		/*
-		 * Clear previously programmed WAKE commands in selected
-		 * repurposed TCS to avoid triggering them. tcs->slots will be
-		 * cleaned from rpmh_flush() by invoking rpmh_rsc_invalidate()
-		 */
-		write_tcs_reg_sync(drv, RSC_DRV_CMD_ENABLE, tcs_id, 0);
-		write_tcs_reg_sync(drv, RSC_DRV_CMD_WAIT_FOR_CMPL, tcs_id, 0);
+
+	/*
+	 * Clear previously programmed ACTIVE/WAKE commands in selected
+	 * repurposed TCS to avoid triggering them. tcs->slots will be
+	 * cleaned from rpmh_flush() by invoking rpmh_rsc_invalidate()
+	 */
+	write_tcs_reg_sync(drv, drv->regs[RSC_DRV_CMD_ENABLE], tcs_id, 0);
+	write_tcs_reg_sync(drv, drv->regs[RSC_DRV_CMD_WAIT_FOR_CMPL], tcs_id, 0);
+
+	if (msg->wait_for_compl || (msg->state == RPMH_ACTIVE_ONLY_STATE &&
+	    tcs->type != ACTIVE_TCS))
 		enable_tcs_irq(drv, tcs_id, true);
-	}
-	spin_unlock_irq(&drv->lock);
+	else
+		enable_tcs_irq(drv, tcs_id, false);
 
 	/*
 	 * These two can be done after the lock is released because:
@@ -702,7 +855,17 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 	 */
 	__tcs_buffer_write(drv, tcs_id, 0, msg);
 	__tcs_set_trigger(drv, tcs_id, true);
-	ipc_log_string(drv->ipc_log_ctx, "TCS trigger: m=%d", tcs_id);
+#if IS_ENABLED(CONFIG_IPC_LOGGING)
+	ipc_log_string(drv->ipc_log_ctx, "TCS trigger: m=%d wait_for_compl=%u",
+		       tcs_id, msg->wait_for_compl);
+#endif
+	if (!msg->wait_for_compl)
+		clear_bit(tcs_id, drv->tcs_in_use);
+
+	spin_unlock_irq(&drv->lock);
+
+	if (!msg->wait_for_compl)
+		wake_up(&drv->tcs_wait);
 
 	return 0;
 }
@@ -730,7 +893,8 @@ static int find_slots(struct tcs_group *tcs, const struct tcs_request *msg,
 
 	/* Do over, until we can fit the full payload in a single TCS */
 	do {
-		slot = bitmap_find_next_zero_area(tcs->slots, MAX_TCS_SLOTS,
+		slot = bitmap_find_next_zero_area(tcs->slots,
+						  tcs->ncpt * tcs->num_tcs,
 						  i, msg->num_cmds, 0);
 		if (slot >= tcs->num_tcs * tcs->ncpt)
 			return -ENOMEM;
@@ -750,8 +914,9 @@ static int find_slots(struct tcs_group *tcs, const struct tcs_request *msg,
  * rpmh_rsc_write_ctrl_data() - Write request to controller but don't trigger.
  * @drv: The controller.
  * @msg: The data to be written to the controller.
+ * @ch:  Channel number
  *
- * This should only be called for for sleep/wake state, never active-only
+ * This should only be called for sleep/wake state, never active-only
  * state.
  *
  * The caller must ensure that no other RPMH actions are happening and the
@@ -759,13 +924,20 @@ static int find_slots(struct tcs_group *tcs, const struct tcs_request *msg,
  *
  * Return: 0 if no error; else -error.
  */
-int rpmh_rsc_write_ctrl_data(struct rsc_drv *drv, const struct tcs_request *msg)
+int rpmh_rsc_write_ctrl_data(struct rsc_drv *drv, const struct tcs_request *msg, int ch)
 {
 	struct tcs_group *tcs;
 	int tcs_id = 0, cmd_id = 0;
 	int ret;
 
-	tcs = get_tcs_for_msg(drv, msg);
+	if (!msg->num_cmds) {
+#if IS_ENABLED(CONFIG_IPC_LOGGING)
+		ipc_log_string(drv->ipc_log_ctx, "Empty num_cmds, returning");
+#endif
+		return 0;
+	}
+
+	tcs = get_tcs_for_msg(drv, msg->state, ch);
 	if (IS_ERR(tcs))
 		return PTR_ERR(tcs);
 
@@ -779,11 +951,16 @@ int rpmh_rsc_write_ctrl_data(struct rsc_drv *drv, const struct tcs_request *msg)
 
 static struct tcs_group *get_tcs_from_index(struct rsc_drv *drv, int tcs_id)
 {
-	unsigned int i;
+	unsigned int i, j;
 
 	for (i = 0; i < TCS_TYPE_NR; i++) {
-		if (drv->tcs[i].mask & BIT(tcs_id))
-			return &drv->tcs[i];
+		for (j = 0; j < MAX_CHANNEL; j++) {
+			if (!drv->ch[j].initialized)
+				continue;
+
+			if (drv->ch[j].tcs[i].mask & BIT(tcs_id))
+				return &drv->ch[j].tcs[i];
+		}
 	}
 
 	return NULL;
@@ -792,23 +969,24 @@ static struct tcs_group *get_tcs_from_index(struct rsc_drv *drv, int tcs_id)
 static void print_tcs_info(struct rsc_drv *drv, int tcs_id, unsigned long *accl,
 			   bool *aoss_irq_sts)
 {
+	int ch = 0;
 	struct tcs_group *tcs_grp = get_tcs_from_index(drv, tcs_id);
-	const struct tcs_request *req = get_req_from_tcs(drv, tcs_id);
+	const struct tcs_request *req = get_req_from_tcs(drv, tcs_id, &ch);
 	unsigned long cmds_enabled;
 	u32 addr, data, msgid, sts, irq_sts;
 	bool in_use = test_bit(tcs_id, drv->tcs_in_use);
 	int i;
 
-	sts = read_tcs_reg(drv, RSC_DRV_STATUS, tcs_id);
-	cmds_enabled = read_tcs_reg(drv, RSC_DRV_CMD_ENABLE, tcs_id);
-	if (!cmds_enabled)
+	sts = read_tcs_reg(drv, drv->regs[RSC_DRV_STATUS], tcs_id);
+	cmds_enabled = read_tcs_reg(drv, drv->regs[RSC_DRV_CMD_ENABLE], tcs_id);
+	if (!cmds_enabled || !tcs_grp)
 		return;
 
-	if (!tcs_grp || !req)
+	if (!req)
 		goto print_tcs_data;
 
-	data = read_tcs_reg(drv, RSC_DRV_CONTROL, tcs_id);
-	irq_sts = readl_relaxed(drv->tcs_base + RSC_DRV_IRQ_STATUS);
+	data = read_tcs_reg(drv, drv->regs[RSC_DRV_CONTROL], tcs_id);
+	irq_sts = readl_relaxed(drv->tcs_base + drv->regs[RSC_DRV_IRQ_STATUS]);
 	pr_warn("Request: tcs-in-use:%s active_tcs=%s(%d) state=%d wait_for_compl=%u]\n",
 		(in_use ? "YES" : "NO"),
 		((tcs_grp->type == ACTIVE_TCS) ? "YES" : "NO"),
@@ -817,14 +995,14 @@ static void print_tcs_info(struct rsc_drv *drv, int tcs_id, unsigned long *accl,
 		tcs_id, sts ? "IDLE" : "BUSY", data,
 		(irq_sts & BIT(tcs_id)) ? "COMPLETED" : "PENDING");
 
-		*aoss_irq_sts = (irq_sts & BIT(tcs_id)) ? true : false;
+	*aoss_irq_sts = (irq_sts & BIT(tcs_id)) ? true : false;
 
 print_tcs_data:
-	for_each_set_bit(i, &cmds_enabled, MAX_CMDS_PER_TCS) {
-		addr = read_tcs_cmd(drv, RSC_DRV_CMD_ADDR, tcs_id, i);
-		data = read_tcs_cmd(drv, RSC_DRV_CMD_DATA, tcs_id, i);
-		msgid = read_tcs_cmd(drv, RSC_DRV_CMD_MSGID, tcs_id, i);
-		sts = read_tcs_cmd(drv, RSC_DRV_CMD_STATUS, tcs_id, i);
+	for_each_set_bit(i, &cmds_enabled, tcs_grp->ncpt) {
+		addr = read_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_ADDR], tcs_id, i);
+		data = read_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_DATA], tcs_id, i);
+		msgid = read_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_MSGID], tcs_id, i);
+		sts = read_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_STATUS], tcs_id, i);
 		pr_warn("\tCMD=%d [addr=0x%x data=0x%x hdr=0x%x sts=0x%x enabled=1]\n",
 			i, addr, data, msgid, sts);
 		if (!(sts & CMD_STATUS_ISSUED))
@@ -832,6 +1010,30 @@ print_tcs_data:
 		if (!(sts & CMD_STATUS_COMPL))
 			*accl |= BIT(ACCL_TYPE(addr));
 	}
+}
+
+void rpmh_rsc_debug_channel_busy(struct rsc_drv *drv)
+{
+	u32 event_sts, ctrl_sts;
+	u32 chn_update, chn_busy, chn_en;
+	u32 seq_busy, seq_pc;
+
+	pr_err("RSC:%s\n", drv->name);
+
+	event_sts = readl_relaxed(drv->base + drv->regs[RSC_DRV_CHN_TCS_COMPLETE]);
+	ctrl_sts = readl_relaxed(drv->base + drv->regs[RSC_DRV_CHN_TCS_TRIGGER]);
+	chn_update = readl_relaxed(drv->base + drv->regs[RSC_DRV_CHN_UPDATE]);
+	chn_busy = readl_relaxed(drv->base + drv->regs[RSC_DRV_CHN_BUSY]);
+	chn_en = readl_relaxed(drv->base + drv->regs[RSC_DRV_CHN_EN]);
+	seq_busy = readl_relaxed(drv->base + drv->regs[RSC_DRV_CHN_SEQ_BUSY]);
+	seq_pc = readl_relaxed(drv->base + drv->regs[RSC_DRV_CHN_SEQ_PC]);
+
+	pr_err("event sts: 0x%x ctrl_sts: 0x%x\n", event_sts, ctrl_sts);
+	pr_err("chn_update: 0x%x chn_busy: 0x%x chn_en: 0x%x\n", chn_update, chn_busy, chn_en);
+	pr_err("seq_busy: 0x%x seq_pc: 0x%x\n", seq_busy, seq_pc);
+
+	crm_dump_regs("cam_crm");
+	crm_dump_drv_regs("cam_crm", drv->id);
 }
 
 void rpmh_rsc_debug(struct rsc_drv *drv, struct completion *compl)
@@ -875,13 +1077,21 @@ void rpmh_rsc_debug(struct rsc_drv *drv, struct completion *compl)
 		pr_warn("ERROR:Possible lockup in Linux\n");
 
 	/* Show fast path status, if the TCS is busy */
-	if (drv->tcs[FAST_PATH_TCS].num_tcs) {
-		int tcs_id = drv->tcs[FAST_PATH_TCS].offset;
-		bool sts = read_tcs_reg(drv, RSC_DRV_STATUS, tcs_id);
+	for (i = 0; i < MAX_CHANNEL; i++) {
+		if (!drv->ch[i].initialized)
+			continue;
 
-		if (!sts) {
-			pr_err("Fast-path TCS information:\n");
-			print_tcs_info(drv, tcs_id, &accl, &aoss_irq_sts);
+		/* Show fast path status, if the TCS is busy */
+		if (drv->ch[i].tcs[FAST_PATH_TCS].num_tcs) {
+			int tcs_id = drv->ch[i].tcs[FAST_PATH_TCS].offset;
+			bool sts = read_tcs_reg(drv,
+						drv->regs[RSC_DRV_STATUS],
+						tcs_id);
+
+			if (!sts) {
+				pr_err("Fast-path TCS information:\n");
+				print_tcs_info(drv, tcs_id, &accl, &aoss_irq_sts);
+			}
 		}
 	}
 
@@ -911,29 +1121,80 @@ void rpmh_rsc_debug(struct rsc_drv *drv, struct completion *compl)
  */
 static bool rpmh_rsc_ctrlr_is_busy(struct rsc_drv *drv)
 {
-	int m;
-	struct tcs_group *tcs = &drv->tcs[ACTIVE_TCS];
+	int i;
+	struct tcs_group *tcs;
+	unsigned long set;
+	unsigned long max;
 
-	/*
-	 * If we made an active request on a RSC that does not have a
-	 * dedicated TCS for active state use, then re-purposed wake TCSes
-	 * should be checked for not busy, because we used wake TCSes for
-	 * active requests in this case.
-	 */
-	if (!tcs->num_tcs)
-		tcs = &drv->tcs[WAKE_TCS];
+	for (i = 0; i < MAX_CHANNEL; i++) {
+		if (!drv->ch[i].initialized)
+			continue;
 
-	for (m = tcs->offset; m < tcs->offset + tcs->num_tcs; m++) {
-		if (!tcs_is_free(drv, m))
+		tcs = &drv->ch[i].tcs[ACTIVE_TCS];
+		/*
+		 * If we made an active request on a RSC that does not have a
+		 * dedicated TCS for active state use, then re-purposed wake TCSes
+		 * should be checked for not busy, because we used wake TCSes for
+		 * active requests in this case.
+		 */
+		if (!tcs->num_tcs)
+			tcs = &drv->ch[i].tcs[WAKE_TCS];
+
+		max = tcs->offset + tcs->num_tcs;
+		set = find_next_bit(drv->tcs_in_use, max, tcs->offset);
+		if (set < max)
+			return true;
+
+		/* Check if there is pending fastpath transaction */
+		tcs = &drv->ch[i].tcs[FAST_PATH_TCS];
+		if (tcs->num_tcs &&
+		    !read_tcs_reg(drv, drv->regs[RSC_DRV_STATUS], tcs->offset))
 			return true;
 	}
 
-	/* Check if there is pending fastpath transaction */
-	if (drv->tcs[FAST_PATH_TCS].num_tcs &&
-	    !read_tcs_reg(drv, RSC_DRV_STATUS, drv->tcs[FAST_PATH_TCS].offset))
-		return true;
-
 	return false;
+}
+
+/**
+ * rpmh_rsc_write_next_wakeup() - Write next wakeup in CONTROL_TCS.
+ * @drv: The controller
+ *
+ * Writes maximum wakeup cycles when called from suspend.
+ * Writes earliest hrtimer wakeup when called from idle.
+ */
+void rpmh_rsc_write_next_wakeup(struct rsc_drv *drv)
+{
+	ktime_t now, wakeup;
+	u64 wakeup_us, wakeup_cycles = ~0;
+	u32 lo, hi;
+
+	if (!drv->tcs[CONTROL_TCS].num_tcs || !drv->genpd_nb.notifier_call)
+		return;
+
+	/* Set highest time when system (timekeeping) is suspended */
+	if (system_state == SYSTEM_SUSPEND)
+		goto exit;
+
+	/* Find the earliest hrtimer wakeup from online cpus */
+	wakeup = dev_pm_genpd_get_next_hrtimer(drv->dev);
+
+	/* Find the relative wakeup in kernel time scale */
+	now = ktime_get();
+	wakeup = ktime_sub(wakeup, now);
+	wakeup_us = ktime_to_us(wakeup);
+
+	/* Convert the wakeup to arch timer scale */
+	wakeup_cycles = USECS_TO_CYCLES(wakeup_us);
+	wakeup_cycles += arch_timer_read_counter();
+
+exit:
+	lo = wakeup_cycles & RSC_DRV_CTL_TCS_DATA_LO_MASK;
+	hi = wakeup_cycles >> RSC_DRV_CTL_TCS_DATA_SIZE;
+	hi &= RSC_DRV_CTL_TCS_DATA_HI_MASK;
+	hi |= RSC_DRV_CTL_TCS_DATA_HI_VALID;
+
+	writel_relaxed(lo, drv->base + RSC_DRV_CTL_TCS_DATA_LO);
+	writel_relaxed(hi, drv->base + RSC_DRV_CTL_TCS_DATA_HI);
 }
 
 /**
@@ -958,7 +1219,7 @@ static int rpmh_rsc_cpu_pm_callback(struct notifier_block *nfb,
 {
 	struct rsc_drv *drv = container_of(nfb, struct rsc_drv, rsc_pm);
 	int ret = NOTIFY_OK;
-	int cpus_in_pm;
+	int cpus_in_pm, ch;
 
 	switch (action) {
 	case CPU_PM_ENTER:
@@ -997,7 +1258,8 @@ static int rpmh_rsc_cpu_pm_callback(struct notifier_block *nfb,
 	 * CPU.
 	 */
 	if (spin_trylock(&drv->lock)) {
-		if (rpmh_rsc_ctrlr_is_busy(drv) || rpmh_flush(&drv->client))
+		ch = rpmh_rsc_get_channel(drv);
+		if (ch < 0 || rpmh_rsc_ctrlr_is_busy(drv) || rpmh_flush(&drv->client, ch))
 			ret = NOTIFY_BAD;
 		spin_unlock(&drv->lock);
 	} else {
@@ -1034,8 +1296,10 @@ int rpmh_rsc_mode_solver_set(struct rsc_drv *drv, bool enable)
 		if (!enable || !rpmh_rsc_ctrlr_is_busy(drv)) {
 			drv->in_solver_mode = enable;
 			trace_rpmh_solver_set(drv, enable);
+#if IS_ENABLED(CONFIG_IPC_LOGGING)
 			ipc_log_string(drv->ipc_log_ctx,
 				       "solver mode set: %d", enable);
+#endif
 			ret = 0;
 		}
 		spin_unlock(&drv->lock);
@@ -1044,23 +1308,140 @@ int rpmh_rsc_mode_solver_set(struct rsc_drv *drv, bool enable)
 	return ret;
 }
 
+int rpmh_rsc_is_tcs_completed(struct rsc_drv *drv, int ch)
+{
+	u32 sts;
+	int retry = 10, ret = 0;
+
+	do {
+		sts = readl_relaxed(drv->base + drv->regs[RSC_DRV_CHN_TCS_COMPLETE]);
+
+		if (ch == 0)
+			sts &= CH0_WAKE_TCS_STATUS;
+		else
+			sts &= CH1_WAKE_TCS_STATUS;
+
+		retry--;
+		/*
+		 * Wait till all the WAKE votes of the new channel are
+		 * applied during channel switch.
+		 * Maximum delay of 100 usec.
+		 */
+		if (!sts)
+			udelay(10);
+	} while (!sts && retry);
+
+	if (!retry) {
+		ret = -EBUSY;
+		goto exit;
+	}
+
+	writel_relaxed(CH_CLEAR_STATUS,
+		       drv->base + drv->regs[RSC_DRV_CHN_TCS_COMPLETE]);
+
+exit:
+	trace_rpmh_switch_channel(drv, ch, ret);
+#if IS_ENABLED(CONFIG_IPC_LOGGING)
+	ipc_log_string(drv->ipc_log_ctx, "channel switched to: %d ret: %d", ch, ret);
+#endif
+	return 0;
+}
+
+/**
+ * rpmh_rsc_switch_channel() - Switch to the channel
+ * @drv:     The controller.
+ * @ch:      The channel number to switch to.
+ *
+ * NOTE: Caller should ensure serialization before making this call.
+ * Return:
+ * * 0			- success
+ * * -Error             - Error code
+ */
+int rpmh_rsc_switch_channel(struct rsc_drv *drv, int ch)
+{
+	writel_relaxed(BIT(ch), drv->base + drv->regs[RSC_DRV_CHN_UPDATE]);
+	return rpmh_rsc_is_tcs_completed(drv, ch);
+}
+
+/**
+ * rpmh_rsc_drv_enable() - Enable the DRV and trigger Wake vote
+ * @drv:     The controller.
+ *
+ * NOTE: Caller should ensure serialization before making this call.
+ * Return:
+ * * 0			- success
+ * * -Error             - Error code
+ */
+int rpmh_rsc_drv_enable(struct rsc_drv *drv, bool enable)
+{
+	int ret = 0, ch;
+	u32 chn_en;
+
+	spin_lock(&drv->lock);
+
+	chn_en = readl_relaxed(drv->base + drv->regs[RSC_DRV_CHN_EN]);
+	if (chn_en == enable) {
+		ret = -EINVAL;
+		goto exit;
+	}
+
+	if (enable) {
+		/* Start with channel 0 */
+		ch = 0;
+
+		ret = rpmh_flush(&drv->client, ch);
+		if (ret)
+			goto exit;
+
+		writel_relaxed(enable, drv->base + drv->regs[RSC_DRV_CHN_EN]);
+
+		ret = rpmh_rsc_switch_channel(drv, ch);
+		if (ret)
+			goto exit;
+	} else {
+		/* Select unused channel */
+		ch = rpmh_rsc_get_channel(drv);
+		if (ch < 0)
+			goto exit;
+
+		ret = rpmh_flush(&drv->client, ch);
+		if (ret)
+			goto exit;
+
+		ret = rpmh_rsc_switch_channel(drv, ch);
+		if (ret)
+			goto exit;
+
+		writel_relaxed(0, drv->base + drv->regs[RSC_DRV_CHN_UPDATE]);
+		writel_relaxed(enable, drv->base + drv->regs[RSC_DRV_CHN_EN]);
+	}
+exit:
+	spin_unlock(&drv->lock);
+	trace_rpmh_drv_enable(drv, enable, ret);
+#if IS_ENABLED(CONFIG_IPC_LOGGING)
+	ipc_log_string(drv->ipc_log_ctx, "drv enable: %d ret: %d", enable, ret);
+#endif
+	return ret;
+}
+
 /**
  * rpmh_rsc_init_fast_path() - Initialize the fast-path TCS contents
  * @drv:    The controller.
  * @msg:    The TCS request to populate.
+ * @ch:     Channel number
  *
  * Return:
  * * 0			- success
  * * -ENODEV            - no fast-path TCS available
  */
-int rpmh_rsc_init_fast_path(struct rsc_drv *drv, const struct tcs_request *msg)
+int rpmh_rsc_init_fast_path(struct rsc_drv *drv, const struct tcs_request *msg, int ch)
 {
 	int tcs_id;
 
-	if (!drv->tcs[FAST_PATH_TCS].num_tcs)
+	if (!drv->ch[ch].tcs[FAST_PATH_TCS].num_tcs)
 		return -ENODEV;
 
-	tcs_id = drv->tcs[FAST_PATH_TCS].offset;
+	tcs_id = drv->ch[ch].tcs[FAST_PATH_TCS].offset;
 
 	/* We won't use the AMC IRQ to confirm if the TCS is free */
 	enable_tcs_irq(drv, tcs_id, false);
@@ -1075,6 +1456,7 @@ int rpmh_rsc_init_fast_path(struct rsc_drv *drv, const struct tcs_request *msg)
  * @drv:     The controller.
  * @msg:     The TCS request data to be updated.
  * @mask:    The update mask for elements in @msg to be sent
+ * @ch:      Channel number
  *
  * NOTE: Caller should ensure serialization before making this call.
  * Return:
@@ -1083,7 +1465,7 @@ int rpmh_rsc_init_fast_path(struct rsc_drv *drv, const struct tcs_request *msg)
  */
 int rpmh_rsc_update_fast_path(struct rsc_drv *drv,
 			      const struct tcs_request *msg,
-			      u32 mask)
+			      u32 mask, int ch)
 {
 	int i;
 	u32 sts;
@@ -1091,14 +1473,14 @@ int rpmh_rsc_update_fast_path(struct rsc_drv *drv,
 	struct tcs_cmd *cmd;
 	int retry = 5;
 
-	if (!drv->tcs[FAST_PATH_TCS].num_tcs)
+	if (!drv->ch[ch].tcs[FAST_PATH_TCS].num_tcs)
 		return -ENODEV;
 
-	tcs_id = drv->tcs[FAST_PATH_TCS].offset;
+	tcs_id = drv->ch[ch].tcs[FAST_PATH_TCS].offset;
 
 	/* Ensure the TCS is free before writing to the TCS */
 	do {
-		sts = read_tcs_reg(drv, RSC_DRV_STATUS, tcs_id);
+		sts = read_tcs_reg(drv, drv->regs[RSC_DRV_STATUS], tcs_id);
 		if (!sts) {
 			retry--;
 			/* Report and bail, if it took too many attempts */
@@ -1119,7 +1501,7 @@ int rpmh_rsc_update_fast_path(struct rsc_drv *drv,
 		if (!(mask & BIT(i)))
 			continue;
 		cmd = &msg->cmds[i];
-		write_tcs_cmd(drv, RSC_DRV_CMD_DATA, tcs_id, i, cmd->data);
+		write_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_DATA], tcs_id, i, cmd->data);
 	}
 
 	/* Trigger the TCS to send the request */
@@ -1135,14 +1517,28 @@ static int rpmh_rsc_poweroff_noirq(struct device *dev)
 
 static void rpmh_rsc_tcs_irq_enable(struct rsc_drv *drv)
 {
-	writel_relaxed(drv->tcs[ACTIVE_TCS].mask, drv->tcs_base + RSC_DRV_IRQ_ENABLE);
+	u32 tcs_mask;
+	int ch;
+
+	for (ch = 0; ch < MAX_CHANNEL; ch++) {
+		if (!drv->ch[ch].initialized)
+			continue;
+
+		tcs_mask = readl_relaxed(drv->tcs_base + drv->regs[RSC_DRV_IRQ_ENABLE]);
+		tcs_mask |= drv->ch[ch].tcs[ACTIVE_TCS].mask;
+		writel_relaxed(tcs_mask, drv->tcs_base + drv->regs[RSC_DRV_IRQ_ENABLE]);
+	}
 }
 
 static int rpmh_rsc_restore_noirq(struct device *dev)
 {
-	struct rsc_drv *drv = dev_get_drvdata(dev);
+	struct rsc_drv_top *rsc_top = dev_get_drvdata(dev);
+	int i;
 
-	rpmh_rsc_tcs_irq_enable(drv);
+	for (i = 0; i < rsc_top->drv_count; i++) {
+		if (rsc_top->drv[i].initialized)
+			rpmh_rsc_tcs_irq_enable(&rsc_top->drv[i]);
+	}
 
 	return 0;
 }
@@ -1165,67 +1561,48 @@ static struct rsc_drv_top *rpmh_rsc_get_top_device(const char *name)
 	return rsc_top;
 }
 
-static int rpmh_rsc_syscore_suspend(void)
+const struct device *rpmh_rsc_get_device(const char *name, u32 drv_id)
 {
-	struct rsc_drv_top *rsc_top = rpmh_rsc_get_top_device("apps_rsc");
+	struct rsc_drv_top *rsc_top = rpmh_rsc_get_top_device(name);
+	int i;
 
-	if (IS_ERR(rsc_top))
-		return 0;
+	if (IS_ERR(rsc_top) || strcmp(name, "cam_rsc"))
+		return ERR_PTR(-ENODEV);
 
-	if (rpmh_rsc_ctrlr_is_busy(rsc_top->drv))
-		return -EAGAIN;
+	for (i = 0; i < rsc_top->drv_count; i++) {
+		if (i == drv_id && rsc_top->drv[i].initialized)
+			return rsc_top->drv[i].dev;
+	}
 
-	return _rpmh_flush(&rsc_top->drv->client);
+	return ERR_PTR(-ENODEV);
 }
 
-static void rpmh_rsc_syscore_resume(void)
-{
-}
-
-static struct syscore_ops rpmh_rsc_syscore_ops = {
-	.suspend = rpmh_rsc_syscore_suspend,
-	.resume = rpmh_rsc_syscore_resume,
-};
-
-static int rpmh_probe_tcs_config(struct platform_device *pdev,
-				 struct rsc_drv *drv, void __iomem *base)
+static int rpmh_probe_channel_tcs_config(struct device_node *np,
+					 struct rsc_drv *drv,
+					 u32 max_tcs, u32 ncpt, int ch)
 {
 	struct tcs_type_config {
 		u32 type;
 		u32 n;
 	} tcs_cfg[TCS_TYPE_NR] = { { 0 } };
-	struct device_node *dn = pdev->dev.of_node;
-	u32 config, max_tcs, ncpt, offset;
-	int i, ret, n, st = 0;
 	struct tcs_group *tcs;
+	struct drv_channel *channel = &drv->ch[ch];
+	int i, ret, n, st = 0;
+	u32 tcs_mask;
 
-	ret = of_property_read_u32(dn, "qcom,tcs-offset", &offset);
-	if (ret)
-		return ret;
-	drv->tcs_base = base + offset;
-
-	config = readl_relaxed(base + DRV_PRNT_CHLD_CONFIG);
-
-	max_tcs = config;
-	max_tcs &= DRV_NUM_TCS_MASK << (DRV_NUM_TCS_SHIFT * drv->id);
-	max_tcs = max_tcs >> (DRV_NUM_TCS_SHIFT * drv->id);
-
-	ncpt = config & (DRV_NCPT_MASK << DRV_NCPT_SHIFT);
-	ncpt = ncpt >> DRV_NCPT_SHIFT;
-
-	n = of_property_count_u32_elems(dn, "qcom,tcs-config");
+	n = of_property_count_u32_elems(np, "qcom,tcs-config");
 	if (n != 2 * TCS_TYPE_NR)
 		return -EINVAL;
 
 	for (i = 0; i < TCS_TYPE_NR; i++) {
-		ret = of_property_read_u32_index(dn, "qcom,tcs-config",
+		ret = of_property_read_u32_index(np, "qcom,tcs-config",
 						 i * 2, &tcs_cfg[i].type);
 		if (ret)
 			return ret;
 		if (tcs_cfg[i].type >= TCS_TYPE_NR)
 			return -EINVAL;
 
-		ret = of_property_read_u32_index(dn, "qcom,tcs-config",
+		ret = of_property_read_u32_index(np, "qcom,tcs-config",
 						 i * 2 + 1, &tcs_cfg[i].n);
 		if (ret)
 			return ret;
@@ -1234,7 +1611,7 @@ static int rpmh_probe_tcs_config(struct platform_device *pdev,
 	}
 
 	for (i = 0; i < TCS_TYPE_NR; i++) {
-		tcs = &drv->tcs[tcs_cfg[i].type];
+		tcs = &channel->tcs[tcs_cfg[i].type];
 		if (tcs->drv)
 			return -EINVAL;
 		tcs->drv = drv;
@@ -1249,52 +1626,118 @@ static int rpmh_probe_tcs_config(struct platform_device *pdev,
 		    st + tcs->num_tcs >= BITS_PER_BYTE * sizeof(tcs->mask))
 			return -EINVAL;
 
-		tcs->mask = ((1 << tcs->num_tcs) - 1) << st;
-		tcs->offset = st;
+		tcs->mask = ((1 << tcs->num_tcs) - 1) << (st + drv->num_tcs);
+		tcs->offset = st + drv->num_tcs;
 		st += tcs->num_tcs;
 	}
 
-	drv->num_tcs = st;
+	/* Enable the active TCS to send requests immediately */
+	tcs_mask = readl_relaxed(drv->tcs_base + drv->regs[RSC_DRV_IRQ_ENABLE]);
+	tcs_mask |= drv->ch[ch].tcs[ACTIVE_TCS].mask;
+	writel_relaxed(tcs_mask, drv->tcs_base + drv->regs[RSC_DRV_IRQ_ENABLE]);
+
+	channel->drv = drv;
+	channel->initialized = true;
+	drv->num_tcs += st;
 
 	return 0;
 }
 
-static int rpmh_rsc_pd_cb(struct notifier_block *nb,
-			  unsigned long action, void *data)
+/**
+ * rpmh_rsc_pd_callback() - Check if any of the AMCs are busy.
+ * @nfb:    Pointer to the genpd notifier block in struct rsc_drv.
+ * @action: GENPD_NOTIFY_PRE_OFF, GENPD_NOTIFY_OFF, GENPD_NOTIFY_PRE_ON or GENPD_NOTIFY_ON.
+ * @v:      Unused
+ *
+ * This function is given to dev_pm_genpd_add_notifier() so we can be informed
+ * about when cluster-pd is going down. When cluster go down we know no more active
+ * transfers will be started so we write sleep/wake sets. This function gets
+ * called from cpuidle code paths and also at system suspend time.
+ *
+ * If AMCs are not busy then writes cached sleep and wake messages to TCSes.
+ * The firmware then takes care of triggering them when entering deepest low power modes.
+ *
+ * Return:
+ * * NOTIFY_OK          - success
+ * * NOTIFY_BAD         - failure
+ */
+static int rpmh_rsc_pd_callback(struct notifier_block *nfb,
+				unsigned long action, void *v)
 {
-	struct rsc_drv *drv = container_of(nb, struct rsc_drv, genpd_nb);
+	struct rsc_drv *drv = container_of(nfb, struct rsc_drv, genpd_nb);
+	int ch;
 
-	/* We don't need to lock as domin on/off are serialized */
+	ch = rpmh_rsc_get_channel(drv);
+
+	/* We don't need to lock as genpd on/off are serialized */
 	if ((action == GENPD_NOTIFY_PRE_OFF) &&
-	    (rpmh_rsc_ctrlr_is_busy(drv) || _rpmh_flush(&drv->client)))
+	    (ch < 0 || rpmh_rsc_ctrlr_is_busy(drv) || _rpmh_flush(&drv->client, ch)))
 		return NOTIFY_BAD;
 
 	return NOTIFY_OK;
 }
 
-static int rpmh_rsc_pd_attach(struct rsc_drv *drv)
+static int rpmh_rsc_pd_attach(struct rsc_drv *drv, struct device *dev)
 {
 	int ret;
 
-	pm_runtime_enable(drv->dev);
-	ret = dev_pm_domain_attach(drv->dev, false);
+	pm_runtime_enable(dev);
+	drv->genpd_nb.notifier_call = rpmh_rsc_pd_callback;
+	ret = dev_pm_genpd_add_notifier(dev, &drv->genpd_nb);
+	if (ret)
+		pm_runtime_disable(dev);
+
+	return ret;
+}
+
+static int rpmh_probe_tcs_config(struct rsc_drv *drv)
+{
+	struct device_node *cn, *np = drv->dev->of_node;
+	int ch = 0, ret;
+	u32 offset, config;
+	u32 max_tcs, ncpt;
+
+	ret = of_property_read_u32(np, "qcom,tcs-offset", &offset);
 	if (ret)
 		return ret;
+	drv->tcs_base = drv->base + offset;
 
-	drv->genpd_nb.notifier_call = rpmh_rsc_pd_cb;
-	return dev_pm_genpd_add_notifier(drv->dev, &drv->genpd_nb);
+	ret = of_property_read_u32(np, "qcom,tcs-distance", &drv->tcs_distance);
+	if (ret)
+		drv->tcs_distance = 0;
+
+	config = readl_relaxed(drv->base + drv->regs[DRV_PRNT_CHLD_CONFIG]);
+
+	max_tcs = config;
+	max_tcs &= DRV_NUM_TCS_MASK << (DRV_NUM_TCS_SHIFT * drv->id);
+	max_tcs = max_tcs >> (DRV_NUM_TCS_SHIFT * drv->id);
+
+	ncpt = config & (DRV_NCPT_MASK << DRV_NCPT_SHIFT);
+	ncpt = ncpt >> DRV_NCPT_SHIFT;
+	for_each_child_of_node(np, cn) {
+
+		if (!of_node_name_eq(cn, "channel"))
+			continue;
+
+		ret = rpmh_probe_channel_tcs_config(cn, drv, max_tcs, ncpt, ch);
+		if (ret)
+			return ret;
+		ch++;
+	}
+	drv->num_channels = ch;
+
+	return 0;
 }
 
 static int rpmh_rsc_probe(struct platform_device *pdev)
 {
-	struct device_node *dn = pdev->dev.of_node;
+	struct device_node *np, *dn = pdev->dev.of_node;
 	struct rsc_drv *drv;
-	struct resource *res;
-	char drv_id[10] = {0};
 	struct rsc_drv_top *rsc_top;
 	int ret, irq;
-	u32 solver_config;
-	void __iomem *base;
+	u32 rsc_id, major_ver, minor_ver, solver_config;
+	int i, j, drv_count;
+	const char *name;
 
 	/*
 	 * Even though RPMh doesn't directly use cmd-db, all of its children
@@ -1313,94 +1756,156 @@ static int rpmh_rsc_probe(struct platform_device *pdev)
 		dev_info(&pdev->dev, "RPMH is running in standalone mode.\n");
 
 
-	drv = devm_kzalloc(&pdev->dev, sizeof(*drv), GFP_KERNEL);
-	if (!drv)
-		return -ENOMEM;
-
-	ret = of_property_read_u32(dn, "qcom,drv-id", &drv->id);
-	if (ret)
-		return ret;
-
 	rsc_top = devm_kzalloc(&pdev->dev, sizeof(*rsc_top), GFP_KERNEL);
 	if (!rsc_top)
 		return -ENOMEM;
 
-	drv->name = of_get_property(dn, "label", NULL);
-	if (!drv->name)
-		drv->name = dev_name(&pdev->dev);
+	ret = of_property_read_u32(dn, "qcom,drv-count", &drv_count);
+	if (ret)
+		return ret;
 
+	drv = devm_kcalloc(&pdev->dev, drv_count, sizeof(*drv), GFP_KERNEL);
+	if (!drv)
+		return -ENOMEM;
+
+	name = of_get_property(dn, "label", NULL);
+	if (!name)
+		name = dev_name(&pdev->dev);
+
+	rsc_top->drv_count = drv_count;
 	rsc_top->drv = drv;
 	rsc_top->dev = &pdev->dev;
-	scnprintf(rsc_top->name, sizeof(rsc_top->name), "%s", drv->name);
+	scnprintf(rsc_top->name, sizeof(rsc_top->name), "%s", name);
 
-	snprintf(drv_id, ARRAY_SIZE(drv_id), "drv-%d", drv->id);
-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, drv_id);
-	base = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(base))
-		return PTR_ERR(base);
+	for_each_child_of_node(dn, np) {
+		struct device *drv_dev;
 
-	ret = rpmh_probe_tcs_config(pdev, drv, base);
-	if (ret)
-		return ret;
+		if (!of_node_name_eq(np, "drv"))
+			continue;
 
-	spin_lock_init(&drv->lock);
-	spin_lock_init(&drv->client.cache_lock);
-	init_waitqueue_head(&drv->tcs_wait);
-	bitmap_zero(drv->tcs_in_use, MAX_TCS_NR);
-
-	irq = platform_get_irq(pdev, drv->id);
-	if (irq < 0)
-		return irq;
-
-	drv->irq = irq;
-
-	ret = devm_request_irq(&pdev->dev, irq, tcs_tx_done,
-			       IRQF_TRIGGER_HIGH | IRQF_NO_SUSPEND,
-			       drv->name, drv);
-	if (ret)
-		return ret;
-
-	drv->dev = &pdev->dev;
-	/*
-	 * CPU PM notification are not required for controllers that support
-	 * 'HW solver' mode where they can be in autonomous mode executing low
-	 * power mode to power down.
-	 */
-	solver_config = readl_relaxed(base + DRV_SOLVER_CONFIG);
-	solver_config &= DRV_HW_SOLVER_MASK << DRV_HW_SOLVER_SHIFT;
-	solver_config = solver_config >> DRV_HW_SOLVER_SHIFT;
-	if (of_find_property(dn, "power-domains", NULL)) {
-		ret = rpmh_rsc_pd_attach(drv);
-		if (ret == -EPROBE_DEFER) {
-			pr_err("Failed to attach RSC %s to domain ret=%d\n", drv->name, ret);
+		ret = of_property_read_u32(np, "qcom,drv-id", &i);
+		if (ret)
 			return ret;
-		}
-		register_syscore_ops(&rpmh_rsc_syscore_ops);
-	} else if (!solver_config) {
-		drv->rsc_pm.notifier_call = rpmh_rsc_cpu_pm_callback;
-		cpu_pm_register_notifier(&drv->rsc_pm);
-		drv->client.flags &= ~SOLVER_PRESENT;
-	} else {
-		drv->client.flags |= SOLVER_PRESENT;
+
+		scnprintf(drv[i].name, sizeof(drv[i].name), "%s-drv-%d", name, i);
+
+		drv[i].base = devm_platform_ioremap_resource(pdev, i);
+		if (IS_ERR(drv[i].base))
+			return PTR_ERR(drv[i].base);
+
+		drv_dev = kzalloc(sizeof(*drv_dev), GFP_KERNEL);
+		if (!drv_dev)
+			return -ENOMEM;
+
+		drv[i].id = i;
+		drv[i].pdev = pdev;
+		drv[i].dev = drv_dev;
+		drv_dev->parent = &pdev->dev;
+		drv_dev->of_node = np;
+		dev_set_name(drv_dev, "%s:%pOFn%d", dev_name(drv_dev->parent), np, i);
+		ret = device_register(drv_dev);
+		if (ret)
+			return ret;
+
+		rsc_id = readl_relaxed(drv[i].base + RSC_DRV_ID);
+		major_ver = rsc_id & (MAJOR_VER_MASK << MAJOR_VER_SHIFT);
+		major_ver >>= MAJOR_VER_SHIFT;
+		minor_ver = rsc_id & (MINOR_VER_MASK << MINOR_VER_SHIFT);
+		minor_ver >>= MINOR_VER_SHIFT;
+
+		if (major_ver >= 3)
+			drv[i].regs = rpmh_rsc_reg_offset_ver_3_0;
+		else
+			drv[i].regs = rpmh_rsc_reg_offset_ver_2_7;
+
+		ret = rpmh_probe_tcs_config(&drv[i]);
+		if (ret)
+			return ret;
+
+		dev_set_drvdata(drv_dev, &drv[i]);
+		drv[i].initialized = true;
 	}
 
-	/* Enable the active TCS to send requests immediately */
-	writel_relaxed(drv->tcs[ACTIVE_TCS].mask,
-		       drv->tcs_base + RSC_DRV_IRQ_ENABLE);
+	for (i = 0; i < drv_count; i++) {
+		if (!drv[i].initialized)
+			continue;
 
-	INIT_LIST_HEAD(&drv->client.cache);
-	INIT_LIST_HEAD(&drv->client.batch_cache);
+		/*
+		 * CPU PM notification are not required for controllers that support
+		 * 'HW solver' mode where they can be in autonomous mode executing low
+		 * power mode to power down.
+		 */
+		solver_config = readl_relaxed(drv[i].base +
+					      drv[i].regs[DRV_SOLVER_CONFIG]);
+		solver_config &= DRV_HW_SOLVER_MASK << DRV_HW_SOLVER_SHIFT;
+		solver_config = solver_config >> DRV_HW_SOLVER_SHIFT;
 
-	drv->ipc_log_ctx = ipc_log_context_create(RSC_DRV_IPC_LOG_SIZE,
-						  drv->name, 0);
+		spin_lock_init(&drv[i].lock);
+		spin_lock_init(&drv[i].client.cache_lock);
 
-	dev_set_drvdata(&pdev->dev, drv);
+		if (of_find_property(dn, "power-domains", NULL) && pdev->dev.pm_domain) {
+			ret = rpmh_rsc_pd_attach(&drv[i], &pdev->dev);
+			if (ret)
+				return ret;
+		} else if (!solver_config &&
+			   !of_find_property(dn, "qcom,hw-channel", NULL)) {
+			drv[i].rsc_pm.notifier_call = rpmh_rsc_cpu_pm_callback;
+			cpu_pm_register_notifier(&drv[i].rsc_pm);
+		} else if (solver_config) {
+			drv[i].client.flags = SOLVER_PRESENT;
+		} else {
+		/*
+		 * The requets for HW channel TCSes has to be either
+		 * RPMH_SLEEP_STATE or RPMH_WAKE_ONLY_STATE.
+		 *
+		 * Assume 'solver' state which does nothing but to disallow
+		 * RPMH_ACTIVE_ONLY_STATE requests.
+		 */
+			drv[i].client.flags = SOLVER_PRESENT | HW_CHANNEL_PRESENT;
+			drv[i].client.in_solver_mode = true;
+			drv[i].in_solver_mode = true;
+			drv[i].regs = rpmh_rsc_reg_offset_ver_3_0_hw_channel;
+		}
 
-	if (__rsc_count < MAX_RSC_COUNT)
-		__rsc_drv[__rsc_count++] = drv;
+		init_waitqueue_head(&drv[i].tcs_wait);
+		bitmap_zero(drv[i].tcs_in_use, MAX_TCS_NR);
+		drv[i].client.non_batch_cache = devm_kcalloc(&pdev->dev, CMD_DB_MAX_RESOURCES,
+							     sizeof(struct cache_req), GFP_KERNEL);
+		if (!drv[i].client.non_batch_cache)
+			return -ENOMEM;
+
+		for (j = 0; j < CMD_DB_MAX_RESOURCES; j++)
+			INIT_LIST_HEAD(&drv[i].client.non_batch_cache[j].list);
+
+		irq = platform_get_irq(pdev, drv[i].id);
+		if (irq < 0)
+			return irq;
+
+		drv[i].irq = irq;
+
+		ret = devm_request_irq(&pdev->dev, irq, tcs_tx_done,
+				       IRQF_TRIGGER_HIGH | IRQF_NO_SUSPEND,
+				       drv[i].name, &drv[i]);
+		if (ret)
+			return ret;
+
+#if IS_ENABLED(CONFIG_IPC_LOGGING)
+		drv[i].ipc_log_ctx = ipc_log_context_create(
+						RSC_DRV_IPC_LOG_SIZE,
+						drv[i].name, 0);
+#endif
+
+		if (__rsc_count < MAX_RSC_COUNT)
+			__rsc_drv[__rsc_count++] = &drv[i];
+
+		ret = devm_of_platform_populate(drv[i].dev);
+		if (ret)
+			return ret;
+	}
 
 	INIT_LIST_HEAD(&rsc_top->list);
 	list_add_tail(&rsc_top->list, &rpmh_rsc_dev_list);
+	dev_set_drvdata(&pdev->dev, rsc_top);
 
 	return devm_of_platform_populate(&pdev->dev);
 }
@@ -1415,7 +1920,6 @@ static const struct of_device_id rpmh_drv_match[] = {
 	{ }
 };
 MODULE_DEVICE_TABLE(of, rpmh_drv_match);
-
 
 static struct platform_driver rpmh_driver = {
 	.probe = rpmh_rsc_probe,

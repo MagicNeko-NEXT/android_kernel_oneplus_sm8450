@@ -1,1 +1,1 @@
-../../../../gki-modules/oplus/kernel/device_info/device_info/device_info.h
+../../../../sm8450-modules/oplus/kernel/device_info/device_info/device_info.h

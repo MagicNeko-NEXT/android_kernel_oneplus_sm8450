@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2012-2013, 2015-2017, 2019-2021 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/kernel.h>
@@ -61,6 +62,16 @@ do {									\
 #define CSR_QDSSSPARE		(0x064)
 #define CSR_IPCAT		(0x068)
 #define CSR_BYTECNTVAL		(0x06C)
+#define CSR_TS_HBEAT_VAL0_LO	(0x084)
+#define CSR_TS_HBEAT_VAL0_HI	(0x088)
+#define CSR_TS_HBEAT_VAL1_LO	(0x08c)
+#define CSR_TS_HBEAT_VAL1_HI	(0x090)
+#define CSR_TS_HBEAT_MASK0_LO	(0x094)
+#define CSR_TS_HBEAT_MASK0_HI	(0x098)
+#define CSR_TS_HBEAT_MASK1_LO	(0x09c)
+#define CSR_TS_HBEAT_MASK1_HI	(0x0a0)
+#define CSR_ARADDR_EXT		(0x130)
+#define CSR_AWADDR_EXT		(0x134)
 #define MSR_NUM			((drvdata->msr_end - drvdata->msr_start + 1) \
 				/ sizeof(uint32_t))
 #define MSR_MAX_NUM		128
@@ -81,6 +92,16 @@ do {									\
 #define CSR_MAX_ATID	128
 #define CSR_ATID_REG_SIZE	0xc
 
+#define CSR_ARADDR_EXT_VAL	0x104
+#define CSR_AWADDR_EXT_VAL	0x104
+
+#define CSR_ATID_REG_OFFSET(atid, atid_offset) \
+		((atid / 32) * 4 + atid_offset)
+
+#define CSR_ATID_REG_BIT(atid)	(atid % 32)
+#define CSR_MAX_ATID	128
+#define CSR_ATID_REG_SIZE	0xc
+
 struct csr_drvdata {
 	void __iomem		*base;
 	phys_addr_t		pbase;
@@ -92,6 +113,10 @@ struct csr_drvdata {
 	atomic_t		*msr_refcnt;
 	uint32_t		blksize;
 	uint32_t		flushperiod;
+	u64			hbeat_val0;
+	u64			hbeat_val1;
+	u64			hbeat_mask0;
+	u64			hbeat_mask1;
 	struct coresight_csr		csr;
 	struct clk		*clk;
 	spinlock_t		spin_lock;
@@ -102,12 +127,14 @@ struct csr_drvdata {
 	bool			timestamp_support;
 	bool			enable_flush;
 	bool			msr_support;
+	bool			aodbg_csr_support;
+	uint32_t		atid_offset;
 };
 
 DEFINE_CORESIGHT_DEVLIST(csr_devs, "csr");
 
 static LIST_HEAD(csr_list);
-static DEFINE_MUTEX(csr_lock);
+static DEFINE_SPINLOCK(csr_spinlock);
 
 #define to_csr_drvdata(c) container_of(c, struct csr_drvdata, csr)
 
@@ -237,6 +264,48 @@ void msm_qdss_csr_disable_flush(struct coresight_csr *csr)
 }
 EXPORT_SYMBOL(msm_qdss_csr_disable_flush);
 
+void msm_qdss_csr_enable_eth(struct coresight_csr *csr)
+{
+	struct csr_drvdata *drvdata;
+	unsigned long flags;
+
+	if (csr == NULL)
+		return;
+
+	drvdata = to_csr_drvdata(csr);
+	if (IS_ERR_OR_NULL(drvdata))
+		return;
+
+	spin_lock_irqsave(&drvdata->spin_lock, flags);
+	CSR_UNLOCK(drvdata);
+	csr_writel(drvdata, CSR_ARADDR_EXT_VAL, CSR_ARADDR_EXT);
+	csr_writel(drvdata, CSR_AWADDR_EXT_VAL, CSR_AWADDR_EXT);
+	CSR_LOCK(drvdata);
+	spin_unlock_irqrestore(&drvdata->spin_lock, flags);
+}
+EXPORT_SYMBOL(msm_qdss_csr_enable_eth);
+
+void msm_qdss_csr_disable_eth(struct coresight_csr *csr)
+{
+	struct csr_drvdata *drvdata;
+	unsigned long flags;
+
+	if (csr == NULL)
+		return;
+
+	drvdata = to_csr_drvdata(csr);
+	if (IS_ERR_OR_NULL(drvdata))
+		return;
+
+	spin_lock_irqsave(&drvdata->spin_lock, flags);
+	CSR_UNLOCK(drvdata);
+	csr_writel(drvdata, 0, CSR_ARADDR_EXT);
+	csr_writel(drvdata, 0, CSR_AWADDR_EXT);
+	CSR_LOCK(drvdata);
+	spin_unlock_irqrestore(&drvdata->spin_lock, flags);
+}
+EXPORT_SYMBOL(msm_qdss_csr_disable_eth);
+
 int coresight_csr_hwctrl_set(struct coresight_csr *csr, uint64_t addr,
 			 uint32_t val)
 {
@@ -296,7 +365,7 @@ void coresight_csr_set_byte_cntr(struct coresight_csr *csr, int irqctrl_offset, 
 }
 EXPORT_SYMBOL(coresight_csr_set_byte_cntr);
 
-int coresight_csr_set_etr_atid(struct coresight_csr *csr,
+static int __coresight_csr_set_etr_atid(struct coresight_csr *csr,
 			uint32_t atid_offset, uint32_t atid,
 			bool enable)
 {
@@ -337,24 +406,68 @@ int coresight_csr_set_etr_atid(struct coresight_csr *csr,
 
 	CSR_LOCK(drvdata);
 	spin_unlock_irqrestore(&drvdata->spin_lock, flags);
-
 	return 0;
+}
+
+/*
+ * of_coresight_get_csr_atid_offset: Get the csr atid register offset of a sink device.
+ *
+ * Returns the csr atid offset. If the result is less than zero, it means
+ * failure.
+ */
+static int of_coresight_get_csr_atid_offset(struct coresight_device *csdev,
+				u32 *atid_offset)
+{
+	return of_property_read_u32(csdev->dev.parent->of_node,
+					"csr-atid-offset", atid_offset);
+}
+
+int coresight_csr_set_etr_atid(struct coresight_device *csdev, int atid, bool enable,
+				struct list_head *path)
+{
+	struct coresight_device *sink_csdev;
+	int atid_offset;
+	struct coresight_csr *csr;
+	const char *csr_name;
+
+	if (!path)
+		path = coresight_get_path(csdev);
+
+	if (!path)
+		return -EINVAL;
+
+	sink_csdev = coresight_get_sink(path);
+
+	if (!sink_csdev)
+		return -EINVAL;
+
+	/* if no csr for this sink, indicates this sink is not etr.*/
+	if (of_get_coresight_csr_name(sink_csdev->dev.parent->of_node, &csr_name))
+		return 0;
+
+	csr = coresight_csr_get(csr_name);
+
+	if (of_coresight_get_csr_atid_offset(sink_csdev, &atid_offset))
+		return -EINVAL;
+
+	return __coresight_csr_set_etr_atid(csr, atid_offset, atid, enable);
 }
 EXPORT_SYMBOL(coresight_csr_set_etr_atid);
 
 struct coresight_csr *coresight_csr_get(const char *name)
 {
 	struct coresight_csr *csr;
+	unsigned long flags;
 
-	mutex_lock(&csr_lock);
+	spin_lock_irqsave(&csr_spinlock, flags);
 	list_for_each_entry(csr, &csr_list, link) {
 		if (!strcmp(csr->name, name)) {
-			mutex_unlock(&csr_lock);
+			spin_unlock_irqrestore(&csr_spinlock, flags);
 			return csr;
 		}
 	}
 
-	mutex_unlock(&csr_lock);
+	spin_unlock_irqrestore(&csr_spinlock, flags);
 	return ERR_PTR(-EINVAL);
 }
 EXPORT_SYMBOL(coresight_csr_get);
@@ -383,6 +496,7 @@ static ssize_t timestamp_show(struct device *dev,
 	uint32_t val, time_val0, time_val1;
 	int ret;
 	unsigned long flags;
+	unsigned long csr_ts_offset = 0;
 
 	struct csr_drvdata *drvdata = dev_get_drvdata(dev->parent);
 
@@ -391,6 +505,9 @@ static ssize_t timestamp_show(struct device *dev,
 		return 0;
 	}
 
+	if (drvdata->aodbg_csr_support)
+		csr_ts_offset = 0x14;
+
 	ret = clk_prepare_enable(drvdata->clk);
 	if (ret)
 		return ret;
@@ -398,16 +515,16 @@ static ssize_t timestamp_show(struct device *dev,
 	spin_lock_irqsave(&drvdata->spin_lock, flags);
 	CSR_UNLOCK(drvdata);
 
-	val = csr_readl(drvdata, CSR_TIMESTAMPCTRL);
+	val = csr_readl(drvdata, CSR_TIMESTAMPCTRL - csr_ts_offset);
 
 	val  = val & ~BIT(0);
-	csr_writel(drvdata, val, CSR_TIMESTAMPCTRL);
+	csr_writel(drvdata, val, CSR_TIMESTAMPCTRL - csr_ts_offset);
 
 	val  = val | BIT(0);
-	csr_writel(drvdata, val, CSR_TIMESTAMPCTRL);
+	csr_writel(drvdata, val, CSR_TIMESTAMPCTRL - csr_ts_offset);
 
-	time_val0 = csr_readl(drvdata, CSR_QDSSTIMEVAL0);
-	time_val1 = csr_readl(drvdata, CSR_QDSSTIMEVAL1);
+	time_val0 = csr_readl(drvdata, CSR_QDSSTIMEVAL0 - csr_ts_offset);
+	time_val1 = csr_readl(drvdata, CSR_QDSSTIMEVAL1 - csr_ts_offset);
 
 	CSR_LOCK(drvdata);
 	spin_unlock_irqrestore(&drvdata->spin_lock, flags);
@@ -422,6 +539,40 @@ static ssize_t timestamp_show(struct device *dev,
 }
 
 static DEVICE_ATTR_RO(timestamp);
+
+static ssize_t timestamp_ctrl_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf,
+				 size_t size)
+{
+	uint32_t val;
+	int ret;
+	unsigned long flags;
+	struct csr_drvdata *drvdata = dev_get_drvdata(dev->parent);
+
+	if (IS_ERR_OR_NULL(drvdata) || !drvdata->timestamp_support) {
+		dev_err(dev, "Invalid param\n");
+		return 0;
+	}
+
+	ret = sscanf(buf, "%x", &val);
+	if (ret != 1)
+		return -EINVAL;
+
+	ret = clk_prepare_enable(drvdata->clk);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&drvdata->spin_lock, flags);
+	CSR_UNLOCK(drvdata);
+	csr_writel(drvdata, val, CSR_TIMESTAMPCTRL);
+	CSR_LOCK(drvdata);
+	spin_unlock_irqrestore(&drvdata->spin_lock, flags);
+	clk_disable_unprepare(drvdata->clk);
+	return size;
+}
+
+static DEVICE_ATTR_WO(timestamp_ctrl);
 
 static ssize_t msr_show(struct device *dev,
 				struct device_attribute *attr,
@@ -469,6 +620,8 @@ static ssize_t msr_store(struct device *dev,
 
 	spin_lock_irqsave(&drvdata->spin_lock, flags);
 	CSR_UNLOCK(drvdata);
+	rval = csr_readl(drvdata, drvdata->msr_start + offset * 4);
+	val |= rval;
 	csr_writel(drvdata, val, drvdata->msr_start + offset * 4);
 	rval = csr_readl(drvdata, drvdata->msr_start + offset * 4);
 	drvdata->msr[offset] = rval;
@@ -524,7 +677,7 @@ static ssize_t flushperiod_show(struct device *dev,
 		return -EINVAL;
 	}
 
-	return scnprintf(buf, PAGE_SIZE, "%#lx\n", drvdata->flushperiod);
+	return scnprintf(buf, PAGE_SIZE, "%#x\n", drvdata->flushperiod);
 }
 
 static ssize_t flushperiod_store(struct device *dev,
@@ -563,10 +716,207 @@ out:
 
 static DEVICE_ATTR_RW(flushperiod);
 
+static ssize_t hbeat_val0_show(struct device *dev,
+				struct device_attribute *attr,
+				char *buf)
+{
+	struct csr_drvdata *drvdata = dev_get_drvdata(dev->parent);
+
+	if (IS_ERR_OR_NULL(drvdata) || !drvdata->timestamp_support)
+		return -EINVAL;
+
+	return scnprintf(buf, PAGE_SIZE, "%llx\n", drvdata->hbeat_val0);
+}
+
+static ssize_t hbeat_val0_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf,
+				 size_t size)
+{
+	struct csr_drvdata *drvdata = dev_get_drvdata(dev->parent);
+	unsigned long val, flags;
+	u32 val_lo, val_hi;
+	int ret;
+
+	if (IS_ERR_OR_NULL(drvdata) || !drvdata->timestamp_support)
+		return -EINVAL;
+
+	if (kstrtoul(buf, 16, &val))
+		return -EINVAL;
+
+	ret = clk_prepare_enable(drvdata->clk);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&drvdata->spin_lock, flags);
+
+	drvdata->hbeat_val0 = val;
+	val_lo = val & 0xFFFFFFFF;
+	val_hi = val >> 32;
+
+	CSR_UNLOCK(drvdata);
+	csr_writel(drvdata, val_lo, CSR_TS_HBEAT_VAL0_LO);
+	csr_writel(drvdata, val_hi, CSR_TS_HBEAT_VAL0_HI);
+	CSR_LOCK(drvdata);
+	spin_unlock_irqrestore(&drvdata->spin_lock, flags);
+	clk_disable_unprepare(drvdata->clk);
+	return size;
+}
+static DEVICE_ATTR_RW(hbeat_val0);
+
+static ssize_t hbeat_val1_show(struct device *dev,
+				struct device_attribute *attr,
+				char *buf)
+{
+	struct csr_drvdata *drvdata = dev_get_drvdata(dev->parent);
+
+	if (IS_ERR_OR_NULL(drvdata) || !drvdata->timestamp_support)
+		return -EINVAL;
+
+	return scnprintf(buf, PAGE_SIZE, "%llx\n", drvdata->hbeat_val1);
+}
+
+static ssize_t hbeat_val1_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf,
+				 size_t size)
+{
+	struct csr_drvdata *drvdata = dev_get_drvdata(dev->parent);
+	unsigned long val, flags;
+	u32 val_lo, val_hi;
+	int ret;
+
+	if (IS_ERR_OR_NULL(drvdata) || !drvdata->timestamp_support)
+		return -EINVAL;
+
+	if (kstrtoul(buf, 16, &val))
+		return -EINVAL;
+
+	ret = clk_prepare_enable(drvdata->clk);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&drvdata->spin_lock, flags);
+
+	drvdata->hbeat_val1 = val;
+	val_lo = val & 0xFFFFFFFF;
+	val_hi = val >> 32;
+
+	CSR_UNLOCK(drvdata);
+	csr_writel(drvdata, val_lo, CSR_TS_HBEAT_VAL1_LO);
+	csr_writel(drvdata, val_hi, CSR_TS_HBEAT_VAL1_HI);
+	CSR_LOCK(drvdata);
+	spin_unlock_irqrestore(&drvdata->spin_lock, flags);
+	clk_disable_unprepare(drvdata->clk);
+	return size;
+}
+static DEVICE_ATTR_RW(hbeat_val1);
+
+static ssize_t hbeat_mask0_show(struct device *dev,
+				struct device_attribute *attr,
+				char *buf)
+{
+	struct csr_drvdata *drvdata = dev_get_drvdata(dev->parent);
+
+	if (IS_ERR_OR_NULL(drvdata) || !drvdata->timestamp_support)
+		return -EINVAL;
+
+	return scnprintf(buf, PAGE_SIZE, "%llx\n", drvdata->hbeat_mask0);
+}
+
+static ssize_t hbeat_mask0_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf,
+				 size_t size)
+{
+	struct csr_drvdata *drvdata = dev_get_drvdata(dev->parent);
+	unsigned long val, flags;
+	u32 val_lo, val_hi;
+	int ret;
+
+	if (IS_ERR_OR_NULL(drvdata) || !drvdata->timestamp_support)
+		return -EINVAL;
+
+	if (kstrtoul(buf, 16, &val))
+		return -EINVAL;
+
+	ret = clk_prepare_enable(drvdata->clk);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&drvdata->spin_lock, flags);
+
+	drvdata->hbeat_mask0 = val;
+	val_lo = val & 0xFFFFFFFF;
+	val_hi = val >> 32;
+
+	CSR_UNLOCK(drvdata);
+	csr_writel(drvdata, val_lo, CSR_TS_HBEAT_MASK0_LO);
+	csr_writel(drvdata, val_hi, CSR_TS_HBEAT_MASK0_HI);
+	CSR_LOCK(drvdata);
+	spin_unlock_irqrestore(&drvdata->spin_lock, flags);
+	clk_disable_unprepare(drvdata->clk);
+	return size;
+}
+static DEVICE_ATTR_RW(hbeat_mask0);
+
+static ssize_t hbeat_mask1_show(struct device *dev,
+				struct device_attribute *attr,
+				char *buf)
+{
+	struct csr_drvdata *drvdata = dev_get_drvdata(dev->parent);
+
+	if (IS_ERR_OR_NULL(drvdata) || !drvdata->timestamp_support)
+		return -EINVAL;
+
+	return scnprintf(buf, PAGE_SIZE, "%llx\n", drvdata->hbeat_mask1);
+}
+
+static ssize_t hbeat_mask1_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf,
+				 size_t size)
+{
+	struct csr_drvdata *drvdata = dev_get_drvdata(dev->parent);
+	unsigned long val, flags;
+	u32 val_lo, val_hi;
+	int ret;
+
+	if (IS_ERR_OR_NULL(drvdata) || !drvdata->timestamp_support)
+		return -EINVAL;
+
+	if (kstrtoul(buf, 16, &val))
+		return -EINVAL;
+
+	ret = clk_prepare_enable(drvdata->clk);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&drvdata->spin_lock, flags);
+
+	drvdata->hbeat_mask1 = val;
+	val_lo = val & 0xFFFFFFFF;
+	val_hi = val >> 32;
+
+	CSR_UNLOCK(drvdata);
+	csr_writel(drvdata, val_lo, CSR_TS_HBEAT_MASK1_LO);
+	csr_writel(drvdata, val_hi, CSR_TS_HBEAT_MASK1_HI);
+	CSR_LOCK(drvdata);
+	spin_unlock_irqrestore(&drvdata->spin_lock, flags);
+	clk_disable_unprepare(drvdata->clk);
+	return size;
+}
+static DEVICE_ATTR_RW(hbeat_mask1);
+
 static struct attribute *swao_csr_attrs[] = {
 	&dev_attr_timestamp.attr,
 	&dev_attr_msr.attr,
 	&dev_attr_msr_reset.attr,
+	&dev_attr_hbeat_val0.attr,
+	&dev_attr_hbeat_val1.attr,
+	&dev_attr_hbeat_mask0.attr,
+	&dev_attr_hbeat_mask1.attr,
+	&dev_attr_timestamp_ctrl.attr,
 	NULL,
 };
 
@@ -662,6 +1012,13 @@ static int csr_probe(struct platform_device *pdev)
 	else
 		dev_dbg(dev, "timestamp_support operation supported\n");
 
+	drvdata->aodbg_csr_support = of_property_read_bool(pdev->dev.of_node,
+						"qcom,aodbg-csr-support");
+	if (!drvdata->aodbg_csr_support)
+		dev_dbg(dev, "aodbg_csr_support operation not supported\n");
+	else
+		dev_dbg(dev, "aodbg_csr_support operation supported\n");
+
 	drvdata->perflsheot_set_support = of_property_read_bool(
 			pdev->dev.of_node, "qcom,perflsheot-set-support");
 	if (!drvdata->perflsheot_set_support)
@@ -696,7 +1053,7 @@ static int csr_probe(struct platform_device *pdev)
 		dev_dbg(dev, "msr_support operation supported\n");
 	}
 
-	desc.type = CORESIGHT_DEV_TYPE_NONE;
+	desc.type = CORESIGHT_DEV_TYPE_HELPER;
 	desc.pdata = pdev->dev.platform_data;
 	desc.dev = &pdev->dev;
 	if (drvdata->timestamp_support || drvdata->msr_support)
@@ -712,9 +1069,9 @@ static int csr_probe(struct platform_device *pdev)
 	spin_lock_init(&drvdata->spin_lock);
 	drvdata->csr.name = desc.name;
 
-	mutex_lock(&csr_lock);
+	spin_lock(&csr_spinlock);
 	list_add_tail(&drvdata->csr.link, &csr_list);
-	mutex_unlock(&csr_lock);
+	spin_unlock(&csr_spinlock);
 
 	dev_info(dev, "CSR initialized: %s\n", drvdata->csr.name);
 	return 0;
@@ -724,9 +1081,9 @@ static int csr_remove(struct platform_device *pdev)
 {
 	struct csr_drvdata *drvdata = platform_get_drvdata(pdev);
 
-	mutex_lock(&csr_lock);
+	spin_lock(&csr_spinlock);
 	list_del(&drvdata->csr.link);
-	mutex_unlock(&csr_lock);
+	spin_unlock(&csr_spinlock);
 
 	coresight_unregister(drvdata->csdev);
 	return 0;
@@ -759,5 +1116,5 @@ static void __exit csr_exit(void)
 }
 module_exit(csr_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("CoreSight CSR driver");

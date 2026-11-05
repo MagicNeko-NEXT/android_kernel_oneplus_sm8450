@@ -5,6 +5,7 @@
 
 obj-y	:= sch_generic.o sch_mq.o
 
+obj-$(CONFIG_INET)		+= sch_frag.o
 obj-$(CONFIG_NET_SCHED)		+= sch_api.o sch_blackhole.o
 obj-$(CONFIG_NET_CLS)		+= cls_api.o
 obj-$(CONFIG_NET_CLS_ACT)	+= act_api.o
@@ -48,6 +49,7 @@ obj-$(CONFIG_NET_SCH_DRR)	+= sch_drr.o
 obj-$(CONFIG_NET_SCH_PLUG)	+= sch_plug.o
 obj-$(CONFIG_NET_SCH_ETS)	+= sch_ets.o
 obj-$(CONFIG_NET_SCH_MQPRIO)	+= sch_mqprio.o
+obj-$(CONFIG_NET_SCH_MQPRIO_LIB) += sch_mqprio_lib.o
 obj-$(CONFIG_NET_SCH_SKBPRIO)	+= sch_skbprio.o
 obj-$(CONFIG_NET_SCH_CHOKE)	+= sch_choke.o
 obj-$(CONFIG_NET_SCH_QFQ)	+= sch_qfq.o

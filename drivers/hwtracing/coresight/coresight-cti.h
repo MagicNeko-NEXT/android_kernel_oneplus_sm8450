@@ -165,9 +165,12 @@ struct cti_config {
 	int nr_trig_max;
 
 	/* cti enable control */
-	atomic_t enable_req_count;
+	int enable_req_count;
 	bool hw_enabled;
 	bool hw_powered;
+#if defined(CONFIG_DEEPSLEEP) || defined(CONFIG_HIBERNATION)
+	bool hw_enabled_store;
+#endif
 
 	/* registered triggers and filtering */
 	DECLARE_BITMAP(trig_in_use, CTIINOUTEN_MAX);
@@ -199,6 +202,7 @@ struct cti_pctrl {
  * @config:	Configuration data for this CTI device.
  * @node:	List entry of this device in the list of CTI devices.
  * @csdev_release: release function for underlying coresight_device.
+ * @atclk:	optional clock for the core parts of the CTI.
  */
 struct cti_drvdata {
 	void __iomem *base;
@@ -211,6 +215,7 @@ struct cti_drvdata {
 	bool	extended_cti;
 	struct cti_pctrl		*gpio_trigin;
 	struct cti_pctrl		*gpio_trigout;
+	struct clk			*atclk;
 };
 
 /*
@@ -247,8 +252,8 @@ int cti_add_connection_entry(struct device *dev, struct cti_drvdata *drvdata,
 			     const char *assoc_dev_name);
 struct cti_trig_con *cti_allocate_trig_con(struct device *dev, int in_sigs,
 					   int out_sigs);
-int cti_enable(struct coresight_device *csdev);
-int cti_disable(struct coresight_device *csdev);
+int cti_enable(struct coresight_device *csdev, enum cs_mode mode, void *data);
+int cti_disable(struct coresight_device *csdev, void *data);
 void cti_trigin_gpio_disable(struct cti_drvdata *drvdata);
 void cti_trigout_gpio_disable(struct cti_drvdata *drvdata);
 void cti_write_all_hw_regs(struct cti_drvdata *drvdata);

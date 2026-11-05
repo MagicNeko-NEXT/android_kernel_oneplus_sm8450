@@ -223,10 +223,14 @@ static void get_lowlevel_driver(void)
 static int port_check(struct device *dev, void *dev_drv)
 {
 	struct parport_driver *drv = dev_drv;
+	struct parport *port;
 
 	/* only send ports, do not send other devices connected to bus */
-	if (is_parport(dev))
-		drv->match_port(to_parport_dev(dev));
+	if (is_parport(dev)) {
+		port = to_parport_dev(dev);
+		if (test_bit(PARPORT_ANNOUNCED, &port->devflags))
+			drv->match_port(port);
+	}
 	return 0;
 }
 
@@ -243,7 +247,7 @@ static int port_detect(struct device *dev, void *dev_drv)
 }
 
 /**
- *	parport_register_driver - register a parallel port device driver
+ *	__parport_register_driver - register a parallel port device driver
  *	@drv: structure describing the driver
  *	@owner: owner module of drv
  *	@mod_name: module name string
@@ -467,7 +471,7 @@ struct parport *parport_register_port(unsigned long base, int irq, int dma,
 	atomic_set(&tmp->ref_count, 1);
 	INIT_LIST_HEAD(&tmp->full_list);
 
-	name = kmalloc(15, GFP_KERNEL);
+	name = kmalloc(PARPORT_NAME_MAX_LEN, GFP_KERNEL);
 	if (!name) {
 		kfree(tmp);
 		return NULL;
@@ -553,6 +557,7 @@ void parport_announce_port(struct parport *port)
 		if (slave)
 			attach_driver_chain(slave);
 	}
+	set_bit(PARPORT_ANNOUNCED, &port->devflags);
 	mutex_unlock(&registration_lock);
 }
 EXPORT_SYMBOL(parport_announce_port);
@@ -581,6 +586,8 @@ void parport_remove_port(struct parport *port)
 	int i;
 
 	mutex_lock(&registration_lock);
+
+	clear_bit(PARPORT_ANNOUNCED, &port->devflags);
 
 	/* Spread the word. */
 	detach_driver_chain(port);

@@ -1,6 +1,7 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /*
- * Copyright (c) 2020 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2020-2021 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef __QTI_POWER_SUPPLY_IIO_H__
@@ -140,4 +141,34 @@
 #define PSY_IIO_CP_INPUT_CURRENT_MAX		0x72
 #define PSY_IIO_CURRENT_CAPABILITY		0x73
 
+/* SMB1355 Parallel */
+#define PSY_IIO_CHARGE_TYPE			0x74
+#define PSY_IIO_ONLINE				0x75
+#define PSY_IIO_CHARGING_ENABLED		0x76
+#define PSY_IIO_PIN_ENABLED			0x77
+#define PSY_IIO_INPUT_SUSPEND			0x78
+#define PSY_IIO_PARALLEL_BATFET_MODE		0x79
+#define PSY_IIO_PARALLEL_FCC_MAX		0x7a
+
+/* USB */
+#define PSY_IIO_MOISTURE_DETECTION_EN		0x7b
+
+/* BMS */
+#define PSY_IIO_CLEAR_SOH			0x7c
+#define PSY_IIO_SYS_SOC				0x7d
+
+/* QNOVO5 */
+#define PSY_IIO_VOLTAGE_QNOVO       0x7e
+#define PSY_IIO_CURRENT_QNOVO       0x7f
+
+/* FG */
+#define PSY_IIO_CHARGE_COUNTER_SHADOW		0x80
+#define PSY_IIO_CHARGE_NOW_RAW				0x81
+#define PSY_IIO_CYCLE_COUNTS			0x82
+#define PSY_IIO_CC_STEP				0x83
+#define PSY_IIO_CC_STEP_SEL				0x84
+#define PSY_IIO_VOLTAGE_MAX_DESIGN			0x85
+#define PSY_IIO_CHARGE_NOW				0x86
+#define PSY_IIO_CONSTANT_CHARGE_VOLTAGE		0x87
+#define PSY_IIO_CALIBRATE				0x88
 #endif /* __QTI_POWER_SUPPLY_IIO_H__ */

@@ -2,6 +2,7 @@
 
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/init.h>
@@ -16,13 +17,13 @@
 
 enum {
 	TASK_DEFAULT = 0,
-	TASK_IN_WHITELIST,
-	TASK_IN_BLACKLIST,
+	TASK_IN_ALLOWLIST,
+	TASK_IN_BLOCKLIST,
 };
 
 enum {
-	HUNG_TASK_MODE_WHITELIST = 0,
-	HUNG_TASK_MODE_BLACKLIST,
+	HUNG_TASK_MODE_ALLOWLIST = 0,
+	HUNG_TASK_MODE_BLOCKLIST,
 };
 
 /**
@@ -52,18 +53,18 @@ void qcom_before_check_tasks(void *ignore, struct task_struct *t, unsigned long 
 {
 	struct walt_task_struct *wts = (struct walt_task_struct *) t->android_vendor_data1;
 
-	if ((hung_task_enh.global_detect_mode == HUNG_TASK_MODE_WHITELIST &&
-			wts->hung_detect_status != TASK_IN_WHITELIST) ||
-			(hung_task_enh.global_detect_mode == HUNG_TASK_MODE_BLACKLIST &&
-			wts->hung_detect_status == TASK_IN_BLACKLIST)) {
+	if ((hung_task_enh.global_detect_mode == HUNG_TASK_MODE_ALLOWLIST &&
+			wts->hung_detect_status != TASK_IN_ALLOWLIST) ||
+			(hung_task_enh.global_detect_mode == HUNG_TASK_MODE_BLOCKLIST &&
+			wts->hung_detect_status == TASK_IN_BLOCKLIST)) {
 		*need_check = false;
 		return;
 	}
 
 	*need_check = true;
 
-	if (unlikely(t->in_iowait) && (t->state == TASK_UNINTERRUPTIBLE ||
-			t->state == TASK_STOPPED || t->state == TASK_TRACED) &&
+	if (unlikely(t->in_iowait) && (t->__state == TASK_UNINTERRUPTIBLE ||
+			t->__state == TASK_STOPPED || t->__state == TASK_TRACED) &&
 			t->last_switch_time != 0 &&
 			time_is_before_jiffies(t->last_switch_time + timeout * HZ) &&
 			(t->mm != NULL && t == t->group_leader))
@@ -144,10 +145,10 @@ static int hung_task_handler(struct ctl_table *table, int write,
 
 	wts = (struct walt_task_struct *) task->android_vendor_data1;
 	if (pid_and_val[1] == 1) {
-		if (hung_task_enh.global_detect_mode == HUNG_TASK_MODE_WHITELIST)
-			wts->hung_detect_status = TASK_IN_WHITELIST;
+		if (hung_task_enh.global_detect_mode == HUNG_TASK_MODE_ALLOWLIST)
+			wts->hung_detect_status = TASK_IN_ALLOWLIST;
 		else
-			wts->hung_detect_status = TASK_IN_BLACKLIST;
+			wts->hung_detect_status = TASK_IN_BLOCKLIST;
 	} else {
 		wts->hung_detect_status = TASK_DEFAULT;
 	}
@@ -207,15 +208,6 @@ struct ctl_table hung_task_table[] = {
 	{ }
 };
 
-struct ctl_table hung_task_base_table[] = {
-	{
-		.procname	= "hung_task_enh",
-		.mode		= 0555,
-		.child		= hung_task_table,
-	},
-	{ }
-};
-
 static int __init hung_task_enh_init(void)
 {
 	int ret;
@@ -235,8 +227,8 @@ static int __init hung_task_enh_init(void)
 		return ret;
 	}
 
-	hung_task_enh.ctl_table_hdr = register_sysctl_table(
-						hung_task_base_table);
+	hung_task_enh.ctl_table_hdr = register_sysctl("hung_task_enh",
+						hung_task_table);
 	if (!hung_task_enh.ctl_table_hdr) {
 		unregister_trace_android_vh_check_uninterruptible_tasks(
 						qcom_before_check_tasks, NULL);
@@ -260,4 +252,4 @@ static void __exit hung_task_enh_exit(void)
 module_exit(hung_task_enh_exit);
 
 MODULE_DESCRIPTION("QCOM Hung Task Enhancement");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

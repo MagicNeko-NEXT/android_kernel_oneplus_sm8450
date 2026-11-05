@@ -64,6 +64,7 @@ static int __do_binderfs_test(struct __test_metadata *_metadata)
 		device_path[sizeof(P_tmpdir "/binderfs_XXXXXX/") + BINDERFS_MAX_NAME];
 	static const char * const binder_features[] = {
 		"oneway_spam_detection",
+		"extended_error",
 		"freeze_notification",
 	};
 
@@ -291,6 +292,11 @@ static int write_id_mapping(enum idmap_type type, pid_t pid, const char *buf,
 	return 0;
 }
 
+static bool has_userns(void)
+{
+	return (access("/proc/self/ns/user", F_OK) == 0);
+}
+
 static void change_userns(struct __test_metadata *_metadata, int syncfds[2])
 {
 	int ret;
@@ -378,6 +384,9 @@ static void *binder_version_thread(void *data)
  */
 TEST(binderfs_stress)
 {
+	if (!has_userns())
+		SKIP(return, "%s: user namespace not supported\n", __func__);
+
 	int fds[1000];
 	int syncfds[2];
 	pid_t pid;
@@ -413,7 +422,8 @@ TEST(binderfs_stress)
 
 		ret = mount(NULL, binderfs_mntpt, "binder", 0, 0);
 		ASSERT_EQ(ret, 0) {
-			TH_LOG("%s - Failed to mount binderfs", strerror(errno));
+			TH_LOG("%s - Failed to mount binderfs, check if CONFIG_ANDROID_BINDERFS is enabled in the running kernel",
+				strerror(errno));
 		}
 
 		for (int i = 0; i < ARRAY_SIZE(fds); i++) {
@@ -501,6 +511,8 @@ TEST(binderfs_test_privileged)
 
 TEST(binderfs_test_unprivileged)
 {
+	if (!has_userns())
+		SKIP(return, "%s: user namespace not supported\n", __func__);
 	int ret;
 	int syncfds[2];
 	pid_t pid;

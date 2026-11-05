@@ -1,22 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
-#include <linux/dma-iommu.h>
 #include <linux/dma-mapping.h>
 #include <linux/dma-mapping-fast.h>
 #include <linux/qcom-dma-mapping.h>
 #include <linux/dma-map-ops.h>
 #include <linux/io-pgtable-fast.h>
 #include <linux/vmalloc.h>
-#include <asm/cacheflush.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/vmalloc.h>
 #include <linux/pci.h>
 #include <linux/iova.h>
 #include <linux/io-pgtable.h>
-#include <linux/rwlock.h>
 #include <linux/qcom-iommu-util.h>
 #include <trace/hooks/iommu.h>
 #include "qcom-dma-iommu-generic.h"
@@ -28,6 +27,35 @@
 
 static struct rb_root mappings;
 static DEFINE_RWLOCK(mappings_lock);
+
+static bool dev_use_swiotlb(struct device *dev, size_t size,
+			    enum dma_data_direction dir)
+{
+	return IS_ENABLED(CONFIG_SWIOTLB) && dma_kmalloc_needs_bounce(dev, size, dir);
+}
+
+static bool dev_use_sg_swiotlb(struct device *dev, struct scatterlist *sg,
+			       int nents, enum dma_data_direction dir)
+{
+	struct scatterlist *s;
+	int i;
+
+	if (!IS_ENABLED(CONFIG_SWIOTLB))
+		return false;
+
+	/*
+	 * If kmalloc() buffers are not DMA-safe for this device and
+	 * direction, check the individual lengths in the sg list. If any
+	 * element is deemed unsafe, use the swiotlb for bouncing.
+	 */
+	if (!dma_kmalloc_safe(dev, dir)) {
+		for_each_sg(sg, s, nents, i)
+			if (!dma_kmalloc_size_aligned(s->length))
+				return true;
+	}
+
+	return false;
+}
 
 static int fast_smmu_add_mapping(struct dma_fast_smmu_mapping *fast)
 {
@@ -229,6 +257,12 @@ static dma_addr_t fast_smmu_map_page(struct device *dev, struct page *page,
 	bool is_coherent = is_dma_coherent(dev, attrs);
 	int prot = qcom_dma_info_to_prot(dir, is_coherent, attrs);
 
+	if (dev_use_swiotlb(dev, size, dir) &&
+	    iova_offset(mapping->iovad, phys_plus_off | size)) {
+		dev_warn_once(dev, "Fastmap does not support bounce buffers\n");
+		return DMA_MAPPING_ERROR;
+	}
+
 	if (!skip_sync && !is_coherent)
 		qcom_arch_sync_dma_for_device(phys_plus_off, size, dir);
 
@@ -358,6 +392,11 @@ static int fast_smmu_map_sg(struct device *dev, struct scatterlist *sg,
 	dma_addr_t iova;
 	unsigned long flags;
 	size_t unused = 0;
+
+	if (dev_use_sg_swiotlb(dev, sg, nents, dir)) {
+		dev_warn_once(dev, "Fastmap does not support bounce buffers\n");
+		goto fail;
+	}
 
 	iova_len = qcom_iommu_dma_prepare_map_sg(dev, mapping->iovad, sg, nents);
 
@@ -582,8 +621,7 @@ static void *fast_smmu_alloc(struct device *dev, size_t size,
 		return NULL;
 	}
 
-	if (!(attrs & DMA_ATTR_SKIP_ZEROING))
-		gfp |= __GFP_ZERO;
+	gfp |= __GFP_ZERO;
 
 	*handle = DMA_MAPPING_ERROR;
 	size = ALIGN(size, SZ_4K);
@@ -747,7 +785,7 @@ static dma_addr_t fast_smmu_dma_map_resource(
 	prot |= IOMMU_MMIO;
 
 	if (iommu_map(mapping->domain, dma_addr, phys_addr - offset,
-			len, prot)) {
+			len, prot, GFP_ATOMIC)) {
 		spin_lock_irqsave(&mapping->lock, flags);
 		__fast_smmu_free_iova(mapping, dma_addr, len);
 		spin_unlock_irqrestore(&mapping->lock, flags);
@@ -936,7 +974,7 @@ static void fast_smmu_reserve_pci_windows(struct device *dev,
 
 static void fast_smmu_reserve_msi_iova(struct device *dev, struct dma_fast_smmu_mapping *fast)
 {
-	dma_addr_t msi_iova_base;
+	dma_addr_t msi_iova_base, msi_iova_end;
 	u32 msi_size;
 	int ret;
 	unsigned long flags;
@@ -957,8 +995,9 @@ static void fast_smmu_reserve_msi_iova(struct device *dev, struct dma_fast_smmu_
 			msi_size);
 		goto out;
 	}
-	dev_dbg(dev, "iova allocator reserved 0x%lx-0x%lx for MSI\n", msi_iova_base,
-		msi_iova_base + msi_size);
+	msi_iova_end = msi_iova_base + msi_size - 1;
+	dev_dbg(dev, "iova allocator reserved 0x%pad-0x%pad for MSI\n", &msi_iova_base,
+		&msi_iova_end);
 	spin_unlock_irqrestore(&fast->lock, flags);
 
 	ret = iommu_get_msi_cookie(fast->domain, msi_iova_base);
@@ -999,7 +1038,7 @@ static void fast_smmu_reserve_iommu_regions(struct device *dev,
 		bitmap_set(fast->clean_bitmap, lo, hi - lo + 1);
 	}
 	spin_unlock_irqrestore(&mapping->lock, flags);
-	qcom_iommu_put_resv_regions(dev, &resv_regions);
+	iommu_put_resv_regions(dev, &resv_regions);
 
 	fast_smmu_reserve_msi_iova(dev, fast);
 }
@@ -1010,8 +1049,6 @@ void fast_smmu_put_dma_cookie(struct iommu_domain *domain)
 
 	if (!fast)
 		return;
-
-	iommu_put_dma_cookie(domain);
 
 	if (fast->iovad) {
 		put_iova_domain(fast->iovad);
@@ -1078,19 +1115,18 @@ int fast_smmu_init_mapping(struct device *dev, struct iommu_domain *domain,
 EXPORT_SYMBOL(fast_smmu_init_mapping);
 
 static void __fast_smmu_setup_dma_ops(void *data, struct device *dev,
-					u64 dma_base, u64 size)
+					u64 dma_base, u64 dma_limit)
 {
 	struct dma_fast_smmu_mapping *fast;
 	struct iommu_domain *domain;
-	int is_fast;
 	int ret;
 
 	domain = iommu_get_domain_for_dev(dev);
 	if (!domain)
 		return;
 
-	ret = iommu_domain_get_attr(domain, DOMAIN_ATTR_FAST, &is_fast);
-	if (ret || !is_fast)
+	ret = qcom_iommu_get_mappings_configuration(domain);
+	if (ret < 0 || !(ret & QCOM_IOMMU_MAPPING_CONF_FAST))
 		return;
 
 	fast = dev_get_mapping(dev);
@@ -1107,9 +1143,9 @@ static void __fast_smmu_setup_dma_ops(void *data, struct device *dev,
  * Called by drivers who create their own iommu domains via
  * iommu_domain_alloc().
  */
-void fast_smmu_setup_dma_ops(struct device *dev, u64 dma_base, u64 size)
+void fast_smmu_setup_dma_ops(struct device *dev, u64 dma_base, u64 dma_limit)
 {
-	__fast_smmu_setup_dma_ops(NULL, dev, dma_base, size);
+	__fast_smmu_setup_dma_ops(NULL, dev, dma_base, dma_limit);
 }
 EXPORT_SYMBOL(fast_smmu_setup_dma_ops);
 
@@ -1118,3 +1154,4 @@ int __init dma_mapping_fast_init(void)
 	return register_trace_android_rvh_iommu_setup_dma_ops(
 			__fast_smmu_setup_dma_ops, NULL);
 }
+

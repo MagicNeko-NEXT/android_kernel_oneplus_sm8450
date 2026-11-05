@@ -1,5 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Copyright (c) 2018, Linaro Ltd. */
+/*
+ * Copyright (c) 2018, Linaro Ltd.
+ * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ */
 
 #ifndef __DT_BINDINGS_POWER_QCOM_AOSS_QMP_H
 #define __DT_BINDINGS_POWER_QCOM_AOSS_QMP_H

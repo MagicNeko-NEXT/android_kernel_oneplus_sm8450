@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2015,2019 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/io.h>
@@ -8,7 +9,7 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/types.h>
-#include <linux/qcom_scm.h>
+#include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/arm-smccc.h>
 #include <linux/dma-mapping.h>
 #include <linux/qtee_shmbridge.h>
@@ -58,11 +59,11 @@ static void __scm_smc_do_quirk(const struct arm_smccc_args *smc,
 
 static void fill_wq_resume_args(struct arm_smccc_args *resume, u32 smc_call_ctx)
 {
-	memset(resume->args, 0, ARRAY_SIZE(resume->args));
+	memset(resume->args, 0, sizeof(resume->args[0]) * ARRAY_SIZE(resume->args));
 
 	resume->args[0] = ARM_SMCCC_CALL_VAL(ARM_SMCCC_STD_CALL,
-			 ARM_SMCCC_SMC_64, ARM_SMCCC_OWNER_SIP,
-			 SCM_SMC_FNID(QCOM_SCM_SVC_WAITQ, QCOM_SCM_WAITQ_RESUME));
+					ARM_SMCCC_SMC_64, ARM_SMCCC_OWNER_SIP,
+					SCM_SMC_FNID(QCOM_SCM_SVC_WAITQ, QCOM_SCM_WAITQ_RESUME));
 
 	resume->args[1] = QCOM_SCM_ARGS(1);
 
@@ -82,25 +83,34 @@ static void fill_wq_wake_ack_args(struct arm_smccc_args *wake_ack, u32 smc_call_
 	wake_ack->args[2] = smc_call_ctx;
 }
 
-static void fill_get_wq_ctx_args(struct arm_smccc_args *get_wq_ctx)
+static void fill_get_wq_ctx_args(struct arm_smccc_args *get_wq_ctx, bool multi_smc)
 {
+	unsigned int type;
 	memset(get_wq_ctx->args, 0, ARRAY_SIZE(get_wq_ctx->args));
 
-	get_wq_ctx->args[0] = ARM_SMCCC_CALL_VAL(ARM_SMCCC_STD_CALL,
+	/*
+	 * If Multi SMC call support is available, we expect the firmware
+	 * to support FAST SMC call for QCOM_SCM_WAITQ_GET_WQ_CTX, so
+	 * use it. If we use the standard call, we may sleep while
+	 * getting the waitQ context which leads to deadlock.
+	 */
+	type = multi_smc ? ARM_SMCCC_FAST_CALL : ARM_SMCCC_STD_CALL;
+
+	get_wq_ctx->args[0] = ARM_SMCCC_CALL_VAL(type,
 			 ARM_SMCCC_SMC_64, ARM_SMCCC_OWNER_SIP,
 			 SCM_SMC_FNID(QCOM_SCM_SVC_WAITQ, QCOM_SCM_WAITQ_GET_WQ_CTX));
 }
 
-int scm_get_wq_ctx(u32 *wq_ctx, u32 *flags, u32 *more_pending)
+int scm_get_wq_ctx(u32 *wq_ctx, u32 *flags, u32 *more_pending, bool multi_smc)
 {
 	int ret;
-	struct arm_smccc_args get_wq_ctx = {0};
 	struct arm_smccc_res get_wq_res;
+	struct arm_smccc_args get_wq_ctx = {0};
 
-	fill_get_wq_ctx_args(&get_wq_ctx);
+	fill_get_wq_ctx_args(&get_wq_ctx, multi_smc);
 
-	__scm_smc_do_quirk(&get_wq_ctx, &get_wq_res);
 	/* Guaranteed to return only success or error, no WAITQ_* */
+	__scm_smc_do_quirk(&get_wq_ctx, &get_wq_res);
 	ret = get_wq_res.a0;
 	if (ret)
 		return ret;
@@ -113,7 +123,7 @@ int scm_get_wq_ctx(u32 *wq_ctx, u32 *flags, u32 *more_pending)
 }
 
 static int scm_smc_do_quirk(struct device *dev, struct arm_smccc_args *smc,
-			    struct arm_smccc_res *res)
+		    struct arm_smccc_res *res)
 {
 	struct completion *wq = NULL;
 	struct qcom_scm *qscm;
@@ -134,7 +144,7 @@ static int scm_smc_do_quirk(struct device *dev, struct arm_smccc_args *smc,
 			qscm = dev_get_drvdata(dev);
 			wq = qcom_scm_lookup_wq(qscm, wq_ctx);
 			if (IS_ERR_OR_NULL(wq)) {
-				pr_err("No waitqueue found for wq_ctx %d: %d\n",
+				pr_err("Did not find waitqueue for wq_ctx %d: %ld\n",
 						wq_ctx, PTR_ERR(wq));
 				return PTR_ERR(wq);
 			}
@@ -142,36 +152,30 @@ static int scm_smc_do_quirk(struct device *dev, struct arm_smccc_args *smc,
 			if (res->a0 == QCOM_SCM_WAITQ_SLEEP) {
 				wait_for_completion(wq);
 				fill_wq_resume_args(smc, smc_call_ctx);
-				wq = NULL;
 				continue;
 			} else {
 				fill_wq_wake_ack_args(smc, smc_call_ctx);
+				scm_waitq_flag_handler(wq, flags);
 				continue;
 			}
 		} else if ((long)res->a0 < 0) {
 			/* Error, return to caller with original SMC call */
 			*smc = original;
 			break;
-		} else {
-			/*
-			 * Success.
-			 * wq will be set only if a prior WAKE happened.
-			 * Its value will be the one from the prior WAKE.
-			 */
-			if (wq)
-				scm_waitq_flag_handler(wq, flags);
-			break;
-		}
+		} else
+			return 0;
 	} while (IS_WAITQ_SLEEP_OR_WAKE(res));
 
 	return 0;
 }
 
 static int __scm_smc_do(struct device *dev, struct arm_smccc_args *smc,
-			 struct arm_smccc_res *res,
-			 enum qcom_scm_call_type call_type)
+			struct arm_smccc_res *res,
+			enum qcom_scm_call_type call_type,
+			bool multicall_allowed)
 {
 	int ret, retry_count = 0;
+	bool multi_smc_call = qcom_scm_multi_call_allow(dev, multicall_allowed);
 
 	if (call_type == QCOM_SCM_CALL_ATOMIC) {
 		__scm_smc_do_quirk(smc, res);
@@ -179,9 +183,13 @@ static int __scm_smc_do(struct device *dev, struct arm_smccc_args *smc,
 	}
 
 	do {
-		mutex_lock(&qcom_scm_lock);
+		if (!multi_smc_call)
+			mutex_lock(&qcom_scm_lock);
+		down(&qcom_scm_sem_lock);
 		ret = scm_smc_do_quirk(dev, smc, res);
-		mutex_unlock(&qcom_scm_lock);
+		up(&qcom_scm_sem_lock);
+		if (!multi_smc_call)
+			mutex_unlock(&qcom_scm_lock);
 		if (ret)
 			return ret;
 
@@ -195,6 +203,7 @@ static int __scm_smc_do(struct device *dev, struct arm_smccc_args *smc,
 
 	return 0;
 }
+
 
 int __scm_smc_call(struct device *dev, const struct qcom_scm_desc *desc,
 		   enum qcom_scm_convention qcom_convention,
@@ -267,8 +276,8 @@ int __scm_smc_call(struct device *dev, const struct qcom_scm_desc *desc,
 		smc.args[SCM_SMC_LAST_REG_IDX] = shm.paddr;
 	}
 
-	ret = __scm_smc_do(dev, &smc, &smc_res, call_type);
-	/* ret error check follows shm cleanup */
+	/* ret error check follows after shm cleanup*/
+	ret = __scm_smc_do(dev, &smc, &smc_res, call_type, desc->multicall_allowed);
 
 	if (shm.vaddr) {
 		dma_unmap_single(dev, shm.paddr, alloc_len, DMA_TO_DEVICE);
@@ -290,4 +299,5 @@ int __scm_smc_call(struct device *dev, const struct qcom_scm_desc *desc,
 	ret = (long)smc_res.a0 ? qcom_scm_remap_error(smc_res.a0) : 0;
 
 	return ret;
+
 }

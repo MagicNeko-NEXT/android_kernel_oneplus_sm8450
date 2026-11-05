@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2012-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef _F_QDSS_H
@@ -28,16 +29,7 @@ struct usb_qdss_ch {
 	void (*notify)(void *priv, unsigned int event,
 		struct qdss_request *d_req, struct usb_qdss_ch *ch);
 	void *priv;
-};
-
-struct usb_qdss_bam_connect_info {
-	u32 usb_bam_pipe_idx;
-	u32 peer_pipe_idx;
-	unsigned long usb_bam_handle;
-	struct sps_mem_buffer *data_fifo;
-	unsigned long qdss_bam_iova;
-	phys_addr_t qdss_bam_phys;
-	u32 qdss_bam_size;
+	int ch_type;
 };
 
 struct gqdss {
@@ -52,7 +44,6 @@ struct gqdss {
 /* struct f_qdss - USB qdss function driver private structure */
 struct f_qdss {
 	struct gqdss port;
-	struct usb_qdss_bam_connect_info bam_info;
 	struct usb_gadget *gadget;
 	short int port_num;
 	u8 ctrl_iface_id;
@@ -92,7 +83,6 @@ struct qdss_req {
 	struct list_head list;
 };
 
-int uninit_data(struct usb_ep *ep);
 int set_qdss_data_connection(struct f_qdss *qdss, int enable);
-int alloc_sps_req(struct usb_ep *data_ep);
+int alloc_hw_req(struct usb_ep *data_ep);
 #endif

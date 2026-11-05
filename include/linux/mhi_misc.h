@@ -1,8 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/*
- * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
- *
- */
+/* Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved. */
 
 #ifndef _MHI_MISC_H_
 #define _MHI_MISC_H_
@@ -20,6 +17,28 @@ enum MHI_DEBUG_LEVEL {
 	MHI_MSG_LVL_CRITICAL,
 	MHI_MSG_LVL_MASK_ALL,
 	MHI_MSG_LVL_MAX,
+};
+
+/**
+ * struct mhi_buf - MHI Buffer description
+ * @node: list entry point
+ * @buf: Virtual address of the buffer
+ * @name: Buffer label. For offload channel, configurations name must be:
+ *        ECA - Event context array data
+ *        CCA - Channel context array data
+ * @dma_addr: IOMMU address of the buffer
+ * @phys_addr: physical address of the buffer
+ * @len: # of bytes
+ * @is_io: buffer is of IO/registesr type (resource) rather than of DDR/RAM type
+ */
+struct mhi_buf_extended {
+	struct list_head node;
+	void *buf;
+	const char *name;
+	dma_addr_t dma_addr;
+	phys_addr_t phys_addr;
+	size_t len;
+	bool is_io;
 };
 
 #ifdef CONFIG_MHI_BUS_MISC
@@ -166,6 +185,21 @@ void mhi_controller_set_base(struct mhi_controller *mhi_cntrl,
 			     phys_addr_t base);
 
 /**
+ * mhi_controller_get_base - Get the controller base / resource start address
+ * @mhi_cntrl: MHI controller
+ * @base: Pointer to physical address to be populated
+ */
+int mhi_controller_get_base(struct mhi_controller *mhi_cntrl,
+			    phys_addr_t *base);
+
+/**
+ * mhi_controller_get_numeric_id - set numeric ID for controller
+ * @mhi_cntrl: MHI controller
+ * returns value set as ID or 0 if no value was set
+ */
+u32 mhi_controller_get_numeric_id(struct mhi_controller *mhi_cntrl);
+
+/**
  * mhi_get_channel_db_base - retrieve the channel doorbell base address
  * @mhi_dev: Device associated with the channels
  * @value: Pointer to an address value which will be populated
@@ -265,6 +299,28 @@ int mhi_get_remote_time(struct mhi_device *mhi_dev,
  * @mhi_cntrl: MHI controller
  */
 int mhi_force_reset(struct mhi_controller *mhi_cntrl);
+
+/**
+ * mhi_controller_set_loglevel - API for controller to set a desired log level
+ * which will be set to VERBOSE or 0 by default
+ * @mhi_cntrl: MHI controller
+ * @lvl: Log level from MHI_DEBUG_LEVEL enumerator
+ */
+void mhi_controller_set_loglevel(struct mhi_controller *mhi_cntrl,
+				 enum MHI_DEBUG_LEVEL lvl);
+
+/**
+ * mhi_get_soc_info - Get SoC info before registering mhi controller
+ * @mhi_cntrl: MHI controller
+ */
+int mhi_get_soc_info(struct mhi_controller *mhi_cntrl);
+
+/**
+ * mhi_host_notify_db_disable_trace - Host notification to ring channel DB
+ * to MHI device to stop tracing due SMMU fault
+ * @mhi_cntrl: MHI controller
+ */
+int mhi_host_notify_db_disable_trace(struct mhi_controller *mhi_cntrl);
 
 #else
 
@@ -447,6 +503,27 @@ void mhi_controller_set_base(struct mhi_controller *mhi_cntrl,
 }
 
 /**
+ * mhi_controller_get_base - Get the controller base / resource start address
+ * @mhi_cntrl: MHI controller
+ * @base: Pointer to physical address to be populated
+ */
+int mhi_controller_get_base(struct mhi_controller *mhi_cntrl,
+			    phys_addr_t *base)
+{
+	return -EINVAL;
+}
+
+/**
+ * mhi_controller_get_numeric_id - set numeric ID for controller
+ * @mhi_cntrl: MHI controller
+ * returns value set as ID or 0 if no value was set
+ */
+u32 mhi_controller_get_numeric_id(struct mhi_controller *mhi_cntrl)
+{
+	return 0;
+}
+
+/**
  * mhi_get_channel_db_base - retrieve the channel doorbell base address
  * @mhi_dev: Device associated with the channels
  * @value: Pointer to an address value which will be populated
@@ -572,6 +649,36 @@ int mhi_get_remote_time(struct mhi_device *mhi_dev,
 int mhi_force_reset(struct mhi_controller *mhi_cntrl)
 {
 	return -EINVAL;
+}
+
+/**
+ * mhi_controller_set_loglevel - API for controller to set a desired log level
+ * which will be set to VERBOSE or 0 by default
+ * @mhi_cntrl: MHI controller
+ * @lvl: Log level from MHI_DEBUG_LEVEL enumerator
+ */
+void mhi_controller_set_loglevel(struct mhi_controller *mhi_cntrl,
+				 enum MHI_DEBUG_LEVEL lvl)
+{
+}
+
+/**
+ * mhi_get_soc_info - Get SoC info before registering mhi controller
+ * @mhi_cntrl: MHI controller
+ */
+int mhi_get_soc_info(struct mhi_controller *mhi_cntrl)
+{
+	return -EINVAL;
+}
+
+/**
+ * mhi_host_notify_db_disable_trace - Host notification to ring channel DB
+ * to MHI device to stop tracing due SMMU fault
+ * @mhi_cntrl: MHI controller
+ */
+int mhi_host_notify_db_disable_trace(struct mhi_controller *mhi_cntrl)
+{
+	return -EPERM;
 }
 
 #endif /* CONFIG_MHI_BUS_MISC */

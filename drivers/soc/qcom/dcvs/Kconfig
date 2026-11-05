@@ -24,7 +24,6 @@ config QCOM_DCVS_FP
 
 config QCOM_DCVS
 	tristate "QCOM DCVS Driver"
-	select QCOM_DCVS_FP
 	select INTERCONNECT
 	default n
 	help
@@ -40,7 +39,8 @@ config QCOM_MEMLAT
 	help
 	  This enables the QCOM Memlat driver which monitors CPU performance
 	  counters to identify memory latency bound workloads and vote for
-	  DCVS HW (memory) frequencies through the QCOM DCVS framework.
+	  DCVS HW (memory) frequencies through the QCOM DCVS framework. This
+	  driver also configures epss memlat if enabled.
 
 config QCOM_BWMON
 	tristate "QCOM BWMON Driver"
@@ -49,7 +49,8 @@ config QCOM_BWMON
 	help
 	  This enables the QCOM BWMON driver which monitors bandwidth counters
 	  to identify memory bandwidth bound workloads and vote for DCVS HW
-	  (memory) frequencies through the QCOM DCVS framework.
+	  (memory) frequencies through the QCOM DCVS framework. This driver
+	  handles voting for DDR and LLCC.
 
 config QCOM_BWPROF
 	tristate "QCOM BWPROF Driver"
@@ -63,88 +64,6 @@ config QCOM_BWPROF
 	  at regular intervals, providing the userspace clients with a detailed
 	  view of the current state of the system.
 
-config QCOM_BWPROF_SCMI
-	tristate "QCOM BWPROF SCMI Driver"
-	depends on ARCH_QCOM
-	default n
-	help
-	  This enables the QCOM BWPROF driver which monitors bandwidth counters
-	  and provides them to userspace clients at different time intervals for
-	  the intention of bandwidth profiling and DDR and LLCC frequency
-	  monitoring. The purpose of the driver is to enable the monitoring of
-	  the bandwidth usage at regular intervals, providing the userspace clients
-	  with a detailed view of the current state of the system.
-
-config QTI_HW_BWPROF_SCMI_CLIENT
-	tristate "Qualcomm Technologies Inc. SCMI client driver for BWPROF PROFILING"
-	depends on QCOM_BWPROF_SCMI && QTI_SCMI_BWPROF_PROTOCOL
-	default n
-	help
-	  SCMI client driver registers itself with SCMI framework for bandwidth
-	  vendor protocol, and also registers with the bandwidth interface driver
-	  This driver delivers the bandwidth vendor protocol handle to interface
-	  driver, and interface driver will use this handle to communicate with
-	  bandwidth profiling.
-
-config QCOM_BUS_LAT
-	tristate "QCOM BUS_latency Driver"
-	depends on ARCH_QCOM
-	default n
-	help
-	  This enables the QCOM Bus latency driver which exposes bus latency stats
-	  to userspace clients at modest time intervals for the intention of
-	  profiling. The purpose of the driver is to enable the monitoring of the
-	  memory latency at regular intervals, providing the userspace clients with
-	  a detailed view of the current state of the system.
-
-config QTI_HW_MEMLAT_SCMI_CLIENT
-	tristate "Qualcomm Technologies Inc. SCMI client driver for HW MEMLAT"
-	depends on QCOM_MEMLAT && QTI_SCMI_MEMLAT_PROTOCOL
-	default n
-	help
-	  SCMI client driver registers itself with SCMI framework for memlat
-	  vendor protocol, and also registers with the memlat interface
-	  driver.
-
-	  This driver delivers the memlat vendor protocol handle to interface
-	  driver, and interface driver will use this handle to communicate with
-	  memlat HW.
-
-config QCOM_LLCC_MISS
-	tristate "Qualcomm Technologies Inc. LLCC_MISS_STATS Driver"
-	depends on ARCH_QCOM && QCOM_BUS_PROF
-	default n
-	help
-	  This enables the QCOM LLCC miss stats driver which exposes LLCC miss
-	  stats to user space clients at modest time intervals for the intention
-	  of profiling.
-
-	  The purpose of the driver is to enable the monitoring of LLCC misses
-	  at regular intervals and providing the miss rate data to the user
-	  space clients upon read.
-
-config QCOM_BUS_PROF
-	tristate "Qualcomm Technologies Inc. BUS_PROF Driver"
-	depends on ARCH_QCOM
-	default n
-	help
-	  This enables the QCOM bus profiling common framework and ftraces,
-	  which provide support for a variety of features. These features
-	  include memory latency, LLCC miss, and LLCC occupancy, all of
-	  which are supported on certain Qualcomm Technologies, Inc.
-	  (QTI) chipsets.
-
-config QCOM_LLCC_OCCUPANCY
-	tristate "QCOM LLCC_OCCUPANCY Driver"
-	depends on ARCH_QCOM && QCOM_LLCC && QCOM_BUS_PROF
-	default n
-	help
-	  This enables the QCOM LLCC occupancy driver which exposes LLCC occupancy stats
-	  to userspace clients at modest time intervals for the intention of
-	  profiling. The purpose of the driver is to enable the monitoring of the
-	  LLCC occupancy at regular intervals, providing the userspace clients with
-	  a detailed view of the current state of the system.
-
 config QTI_PMU_SCMI_CLIENT
 	tristate "Qualcomm Technologies Inc. SCMI client driver for PMU"
 	depends on QTI_SCMI_PMU_PROTOCOL && QCOM_PMU_LIB
@@ -155,7 +74,18 @@ config QTI_PMU_SCMI_CLIENT
 
 	  This driver delivers the pmu vendor protocol handle to interface
 	  driver, and interface driver will use this handle to communicate with
-	  rimps.
+	  cpucp.
+
+config QTI_QCOM_SCMI_CLIENT
+	tristate "Qualcomm Technologies Inc. SCMI client driver"
+	depends on QTI_SCMI_VENDOR_PROTOCOL
+	default n
+	help
+	  SCMI client driver registers for Qcom vendor protocol.
+
+	  This driver delivers the qcom vendor protocol handle to interface
+	  driver, and interface driver will use this handle to communicate with
+	  cpucp.
 
 config QTI_C1DCVS_SCMI_CLIENT
 	tristate "Qualcomm Technologies Inc. SCMI client driver for cpudcvs"
@@ -169,14 +99,46 @@ config QTI_C1DCVS_SCMI_CLIENT
 	  driver, and interface driver will use this handle to communicate with
 	  cpucp.
 
-config QTI_CPUFREQ_STATS_SCMI_CLIENT
-	tristate "Qualcomm Technologies Inc. SCMI client driver for cpufreq stats"
-	depends on QTI_SCMI_CPUFREQ_STATS_PROTOCOL
+config QTI_C1DCVS_SCMI_V2
+	tristate "Qualcomm Technologies Inc. SCMI client driver for C1 DCVS"
+	depends on QTI_SCMI_VENDOR_PROTOCOL
+	help
+	  C1 DCVS driver to expose sysfs node to user space and
+	  register with SCMI framework.
+
+	  This driver is used to expose sysfs  interface to communicate
+	  with cpucp for C1 DCVS based on SCMI consolidation.
+
+config QTI_CPUFREQ_STATS_SCMI_V2
+	tristate "Qualcomm Technologies Inc. SCMI client driver for CPU and L3 cpu freq stats"
+	depends on QTI_SCMI_VENDOR_PROTOCOL
 	default n
 	help
-	  SCMI client driver registers itself with SCMI framework for cpufreq stats
-	  vendor protocol.
+	  Driver to expose CPU freq stats debugfs nodes to user space.
 
-	  This driver delivers the cpufreq stats protocol handle to interface
-	  driver, and interface driver will use this handle to communicate with
-	  cpucp.
+	  This driver is used to expose debugfs interface to communicate
+	  with cpucp for CPU freq stats based on SCMI consolidation protocol.
+	  It is intended to be used by clients to get CPU and L3 residency data.
+
+config QTI_CPUFREQ_STATS_SCMI_V3
+	tristate "Qualcomm Technologies Inc. SCMI client driver for CPU and L3 cpu freq stats"
+	depends on ARM_SCMI_PROTOCOL
+	default n
+	help
+	  Driver to expose CPU freq stats debugfs nodes to user space.
+
+	  This driver is used to expose debugfs interface to communicate
+	  with cpucp for CPU freq stats based on SCMI perf protocol.
+	  It is intended to be used by clients to get CPU and L3 residency data.
+
+config QTI_DYNPF_SCMI
+	tristate "Qualcomm Technologies Inc. SCMI client driver for DYNPF"
+	depends on QTI_SCMI_VENDOR_PROTOCOL
+	default n
+	help
+	  Driver to expose DYNPF configuration APIs to userspace via sysfs.
+
+	  This driver gathers DYNPF configuration parameters from sysfs
+	  userspace and relays them to CPUCP via SCMI communication.
+	  It is intended to be used by clients familiar with modifying
+	  the DYNPF settings.

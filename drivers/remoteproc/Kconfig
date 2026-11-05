@@ -24,11 +24,24 @@ config REMOTEPROC_CDEV
 	  It's safe to say N if you don't want to use this interface.
 
 config IMX_REMOTEPROC
-	tristate "IMX6/7 remoteproc support"
+	tristate "i.MX remoteproc support"
 	depends on ARCH_MXC
+	depends on HAVE_ARM_SMCCC
+	select MAILBOX
 	help
-	  Say y here to support iMX's remote processors (Cortex M4
-	  on iMX7D) via the remote processor framework.
+	  Say y here to support iMX's remote processors via the remote
+	  processor framework.
+
+	  It's safe to say N here.
+
+config IMX_DSP_REMOTEPROC
+	tristate "i.MX DSP remoteproc support"
+	depends on ARCH_MXC
+	depends on HAVE_ARM_SMCCC
+	select MAILBOX
+	help
+	  Say y here to support iMX's DSP remote processors via the remote
+	  processor framework.
 
 	  It's safe to say N here.
 
@@ -125,6 +138,29 @@ config KEYSTONE_REMOTEPROC
 	  It's safe to say N here if you're not interested in the Keystone
 	  DSPs or just want to use a bare minimum kernel.
 
+config MESON_MX_AO_ARC_REMOTEPROC
+	tristate "Amlogic Meson6/8/8b/8m2 AO ARC remote processor support"
+	depends on HAS_IOMEM
+	depends on (ARM && ARCH_MESON) || COMPILE_TEST
+	select GENERIC_ALLOCATOR
+	help
+	  Say m or y here to have support for the AO ARC remote processor
+	  on Amlogic Meson6/Meson8/Meson8b/Meson8m2 SoCs. This is
+	  typically used for system suspend.
+	  If unsure say N.
+
+config PRU_REMOTEPROC
+	tristate "TI PRU remoteproc support"
+	depends on TI_PRUSS
+	default TI_PRUSS
+	help
+	  Support for TI PRU remote processors present within a PRU-ICSS
+	  subsystem via the remote processor framework.
+
+	  Say Y or M here to support the Programmable Realtime Unit (PRU)
+	  processors on various TI SoCs. It's safe to say N here if you're
+	  not interested in the PRU or if you are unsure.
+
 config QCOM_PIL_INFO
 	tristate
 
@@ -140,9 +176,11 @@ config QCOM_Q6V5_ADSP
 	tristate "Qualcomm Technology Inc ADSP Peripheral Image Loader"
 	depends on OF && ARCH_QCOM
 	depends on QCOM_SMEM
-	depends on RPMSG_QCOM_SMD || (COMPILE_TEST && RPMSG_QCOM_SMD=n)
+	depends on RPMSG_QCOM_SMD || RPMSG_QCOM_SMD=n
 	depends on RPMSG_QCOM_GLINK_SMEM || RPMSG_QCOM_GLINK_SMEM=n
 	depends on QCOM_SYSMON || QCOM_SYSMON=n
+	depends on RPMSG_QCOM_GLINK || RPMSG_QCOM_GLINK=n
+	depends on QCOM_AOSS_QMP || QCOM_AOSS_QMP=n
 	select MFD_SYSCON
 	select QCOM_PIL_INFO
 	select QCOM_MDT_LOADER
@@ -150,15 +188,19 @@ config QCOM_Q6V5_ADSP
 	select QCOM_RPROC_COMMON
 	help
 	  Say y here to support the Peripheral Image Loader
-	  for the Qualcomm Technology Inc. ADSP remote processors.
+	  for the non-TrustZone part of Qualcomm Technology Inc. ADSP and CDSP
+	  remote processors. The TrustZone part is handled by QCOM_Q6V5_PAS
+	  driver.
 
 config QCOM_Q6V5_MSS
 	tristate "Qualcomm Hexagon V5 self-authenticating modem subsystem support"
 	depends on OF && ARCH_QCOM
 	depends on QCOM_SMEM
-	depends on RPMSG_QCOM_SMD || (COMPILE_TEST && RPMSG_QCOM_SMD=n)
+	depends on RPMSG_QCOM_SMD || RPMSG_QCOM_SMD=n
 	depends on RPMSG_QCOM_GLINK_SMEM || RPMSG_QCOM_GLINK_SMEM=n
 	depends on QCOM_SYSMON || QCOM_SYSMON=n
+	depends on RPMSG_QCOM_GLINK || RPMSG_QCOM_GLINK=n
+	depends on QCOM_AOSS_QMP || QCOM_AOSS_QMP=n
 	select MFD_SYSCON
 	select QCOM_MDT_LOADER
 	select QCOM_PIL_INFO
@@ -167,15 +209,18 @@ config QCOM_Q6V5_MSS
 	select QCOM_SCM
 	help
 	  Say y here to support the Qualcomm self-authenticating modem
-	  subsystem based on Hexagon V5.
+	  subsystem based on Hexagon V5. The TrustZone based system is
+	  handled by QCOM_Q6V5_PAS driver.
 
 config QCOM_Q6V5_PAS
 	tristate "Qualcomm Hexagon v5 Peripheral Authentication Service support"
 	depends on OF && ARCH_QCOM
 	depends on QCOM_SMEM
-	depends on RPMSG_QCOM_SMD || (COMPILE_TEST && RPMSG_QCOM_SMD=n)
+	depends on RPMSG_QCOM_SMD || RPMSG_QCOM_SMD=n
 	depends on RPMSG_QCOM_GLINK_SMEM || RPMSG_QCOM_GLINK_SMEM=n
 	depends on QCOM_SYSMON || QCOM_SYSMON=n
+	depends on RPMSG_QCOM_GLINK || RPMSG_QCOM_GLINK=n
+	depends on QCOM_AOSS_QMP || QCOM_AOSS_QMP=n
 	select MFD_SYSCON
 	select QCOM_PIL_INFO
 	select QCOM_MDT_LOADER
@@ -183,9 +228,11 @@ config QCOM_Q6V5_PAS
 	select QCOM_RPROC_COMMON
 	select QCOM_SCM
 	help
-	  Say y here to support the TrustZone based Peripherial Image Loader
+	  Say y here to support the TrustZone based Peripheral Image Loader
 	  for the Qualcomm Hexagon v5 based remote processors. This is commonly
-	  used to control subsystems such as ADSP, Compute and Sensor.
+	  used to control subsystems such as ADSP (Audio DSP),
+	  CDSP (Compute DSP), MPSS (Modem Peripheral SubSystem), and
+	  SLPI (Sensor Low Power Island).
 
 config QCOM_SPSS
 	tristate "QTI Secure Subsystem Peripheral loading support"
@@ -205,79 +252,25 @@ config QCOM_SPSS
 	  remote processor. This also supports remote processors that
 	  are booted before kernel comes up.
 
-config QCOM_ESOC
-	tristate "External SOCs Control"
+config QCOM_SPSS_AC_RESTRICTION
+	bool "Enable support for Secure Subsystem's access-control restriction"
+	depends on QCOM_SPSS
+	default n
 	help
-	  External SOCs can be powered on and monitored by user
-	  space or kernel drivers. Additionally they can be controlled
-	  to respond to control commands. This framework provides an
-	  interface to track events related to the external slave socs.
-
-config QCOM_ESOC_DEV
-	tristate "ESOC userspace interface"
-	help
-	  Say yes here to enable a userspace representation of the control
-	  link. Userspace can register a request engine or a command engine
-	  for the external soc. It can receive event notifications from the
-	  control link.
-
-config QCOM_ESOC_CLIENT
-	tristate "ESOC client interface"
-	depends on OF
-	help
-	  Say yes here to enable client interface for external socs.
-	  Clients can specify the external soc that they are interested in
-	  by using device tree phandles. Based on this, clients can register
-	  for notifications from a specific soc.
-
-config QCOM_ESOC_DEBUG
-	tristate "ESOC debug support"
-	help
-	  Say yes here to enable debugging support in the ESOC framework
-	  and individual esoc drivers. The config basically adds extra
-	  logging information such that, in the event of a bug, this
-	  logging information could be helpful to trace it.
-
-config QCOM_ESOC_MDM_4X
-	tristate "Add support for external modems"
-	help
-	  In some Qualcomm Technologies, Inc. boards, an external modem such
-	  as mdm9x55 or sdx50m is connected to a primary msm. The primary soc
-	  can control/monitor the modem via gpios. The data communication
-	  with such modems can occur over PCIE or HSIC.
-
-config QCOM_ESOC_MDM_DRV
-	tristate "Command engine for 4x series external modems"
-	help
-	  Provides a command engine to control the behavior of an external
-	  modems (such as mdm9x55 or sdx50m). That is, it extends the SSR
-	  framework to power-off, power-on or handle crash scenarios. It
-	  also listens for events on the external modem.
-
-config QCOM_ESOC_DBG_ENG
-	tristate "debug engine for 4x series external modems"
-	depends on QCOM_ESOC_MDM_DRV
-	help
-	  Mainly used as a debug interface to probe the modem against various
-	  scenarios. It basically provides a user interface to mask out certain
-	  commands sent by command engine to the external modem. It also allows
-	  masking of certain notifications being sent to the external modem.
-
-config QCOM_ESOC_DBG_REQ_ENG
-	bool "manual request engine for 4x series external modems"
-	depends on QCOM_ESOC_DBG_ENG
-	help
-	  Provides a user interface to handle incoming requests from
-	  the external modem. Allows for debugging of IPC mechanism
-	  between the external modem and the primary soc.
+	  Say y here to enable support for when access-control does not allow the
+	  Secure Subsystem remote processor driver to write to shared registers in
+	  SP_CNOC_SP_SCSR_XPU4's resource-group-1. Support must be enabled also in
+	  Secure Subsystem remote processor.
 
 config QCOM_Q6V5_WCSS
 	tristate "Qualcomm Hexagon based WCSS Peripheral Image Loader"
 	depends on OF && ARCH_QCOM
 	depends on QCOM_SMEM
-	depends on RPMSG_QCOM_SMD || (COMPILE_TEST && RPMSG_QCOM_SMD=n)
+	depends on RPMSG_QCOM_SMD || RPMSG_QCOM_SMD=n
 	depends on RPMSG_QCOM_GLINK_SMEM || RPMSG_QCOM_GLINK_SMEM=n
 	depends on QCOM_SYSMON || QCOM_SYSMON=n
+	depends on RPMSG_QCOM_GLINK || RPMSG_QCOM_GLINK=n
+	depends on QCOM_AOSS_QMP || QCOM_AOSS_QMP=n
 	select MFD_SYSCON
 	select QCOM_MDT_LOADER
 	select QCOM_PIL_INFO
@@ -286,7 +279,8 @@ config QCOM_Q6V5_WCSS
 	select QCOM_SCM
 	help
 	  Say y here to support the Qualcomm Peripheral Image Loader for the
-	  Hexagon V5 based WCSS remote processors.
+	  Hexagon V5 based WCSS remote processors on e.g. IPQ8074.  This is
+	  a non-TrustZone wireless subsystem.
 
 config QCOM_SYSMON
 	tristate "Qualcomm sysmon driver"
@@ -306,17 +300,31 @@ config QCOM_SYSMON
 config QCOM_WCNSS_PIL
 	tristate "Qualcomm WCNSS Peripheral Image Loader"
 	depends on OF && ARCH_QCOM
-	depends on RPMSG_QCOM_SMD || (COMPILE_TEST && RPMSG_QCOM_SMD=n)
+	depends on RPMSG_QCOM_SMD || RPMSG_QCOM_SMD=n
 	depends on RPMSG_QCOM_GLINK_SMEM || RPMSG_QCOM_GLINK_SMEM=n
 	depends on QCOM_SMEM
 	depends on QCOM_SYSMON || QCOM_SYSMON=n
+	depends on RPMSG_QCOM_GLINK || RPMSG_QCOM_GLINK=n
 	select QCOM_MDT_LOADER
 	select QCOM_PIL_INFO
 	select QCOM_RPROC_COMMON
 	select QCOM_SCM
 	help
-	  Say y here to support the Peripheral Image Loader for the Qualcomm
-	  Wireless Connectivity Subsystem.
+	  Say y here to support the Peripheral Image Loader for loading WCNSS
+	  firmware and boot the core on e.g. MSM8974, MSM8916. The firmware is
+	  verified and booted with the help of the Peripheral Authentication
+	  System (PAS) in TrustZone.
+
+config RCAR_REMOTEPROC
+	tristate "Renesas R-Car Gen3 remoteproc support"
+	depends on ARCH_RENESAS || COMPILE_TEST
+	help
+	  Say y here to support R-Car realtime processor via the
+	  remote processor framework. An ELF firmware can be loaded
+	  thanks to sysfs remoteproc entries. The remote processor
+	  can be started and stopped.
+	  This can be either built-in or a loadable module.
+	  If compiled as module (M), the module name is rcar_rproc.
 
 config QCOM_PANIC_ON_NOTIF_TIMEOUT
 	bool "Trigger kernel panic when notification timeout expires"
@@ -337,6 +345,18 @@ config RPROC_SYSMON_NOTIF_TIMEOUT
 	  the start and end of sysmon notifications, before a warning
 	  is emitted.
 
+config RPROC_SYSMON_SHUTDOWN_NOTIF_TIMEOUT
+	int "Sysmon notifications timeout in ms"
+	default 10000
+	help
+	  This is a debug feature where a kernel panic is triggered when
+	  there is no acknowledgment there from the subsystem shutdown
+	  request.
+
+	  The amount of time, in milliseconds, that should elapse between
+	  the start and end of sysmon notifications, before a warning
+	  is emitted.
+
 config RPROC_SSR_NOTIF_TIMEOUT
 	int "SSR notifier timeout in ms"
 	default 10000
@@ -344,6 +364,14 @@ config RPROC_SSR_NOTIF_TIMEOUT
 	  The amount of time, in milliseconds, that should elapse between
 	  the start and end of SSR notifications through the subsystem
 	  notifier, before a warning is emitted.
+
+config QCOM_RPROC_BOTH_DUMPS
+	bool "Collect both minidump and fulldump for subsystem crash"
+	help
+	  Say y here to allow dumping both fulldump and minidump for the
+	  case where subsystem minidump is enabled by policy and the feature
+	  is enabled for a client. The case where minidump is not enabled,
+	  and fulldump is collected by default remains unaffected.
 
 config ST_REMOTEPROC
 	tristate "ST remoteproc support"
@@ -360,7 +388,7 @@ config ST_SLIM_REMOTEPROC
 
 config STM32_RPROC
 	tristate "STM32 remoteproc support"
-	depends on ARCH_STM32
+	depends on ARCH_STM32 || COMPILE_TEST
 	depends on REMOTEPROC
 	select MAILBOX
 	help
@@ -399,29 +427,32 @@ config TI_K3_R5_REMOTEPROC
 	  It's safe to say N here if you're not interested in utilizing
 	  a slave processor.
 
-config QCOM_SPSS_AC_RESTRICTION
-	bool "Enable support for Secure Subsystem's access-control restriction"
-	depends on QCOM_SPSS
-	default n
+config XLNX_R5_REMOTEPROC
+	tristate "Xilinx R5 remoteproc support"
+	depends on PM && ARCH_ZYNQMP
+	select ZYNQMP_FIRMWARE
+	select RPMSG_VIRTIO
+	select MAILBOX
+	select ZYNQMP_IPI_MBOX
 	help
-	  Say y here to enable support for when access-control does not allow the
-	  Secure Subsystem remote processor driver to write to shared registers in
-	  SP_CNOC_SP_SCSR_XPU4's resource-group-1. Support must be enabled also in
-	  Secure Subsystem remote processor.
+	  Say y or m here to support Xilinx R5 remote processors via the remote
+	  processor framework.
 
-config QCOM_RPROC_HELIOS
-    tristate "QCOM Helios remoteproc support"
-    depends on OF && ARCH_QCOM
-    depends on QCOM_SMEM
-    depends on QCOM_SYSMON || QCOM_SYSMON=n
-    select MFD_SYSCON
-    select QCOM_PIL_INFO
-    select QCOM_MDT_LOADER
-    select QCOM_RPROC_COMMON
-    select QCOM_SCM
-    help
-      Say y here to support the TrustZone based Peripheral Image Loader
-      for the QCOM Helios.
+	  It's safe to say N if not interested in using RPU r5f cores.
+
+config QCOM_RPROC_SLATE
+	tristate "QCOM Slate remoteproc support"
+	depends on OF && ARCH_QCOM
+	select QCOM_PIL_INFO
+	select QCOM_MDT_LOADER
+	select QCOM_RPROC_COMMON
+	select QCOM_SCM
+	help
+	  Say y here to support the TrustZone based Peripheral Image Loader
+	  for the QCOM Slate.
+
+	  It's safe to say N here if you're not intereseted in utilizing
+	  a aon processor slate.
 
 endif # REMOTEPROC
 

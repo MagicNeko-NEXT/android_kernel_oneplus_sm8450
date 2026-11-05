@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2014,2017-2018 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014, The Linux Foundation. All rights reserved.
  */
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -32,33 +32,42 @@ static bool range_in_range(unsigned long start, unsigned long size,
 		size <= range_end - start;
 }
 
+/*
+ * This function assumes that the range is mapped with PAGE_SIZE pages.
+ */
+static int __change_memory_common(unsigned long start, unsigned long size,
+				pgprot_t set_mask, pgprot_t clear_mask)
+{
+	struct page_change_data data;
+	int ret;
+
+	data.set_mask = set_mask;
+	data.clear_mask = clear_mask;
+
+	ret = apply_to_page_range(&init_mm, start, size, change_page_range,
+				  &data);
+
+	flush_tlb_kernel_range(start, start + size);
+	return ret;
+}
+
 static int change_memory_common(unsigned long addr, int numpages,
 				pgprot_t set_mask, pgprot_t clear_mask)
 {
 	unsigned long start = addr & PAGE_MASK;
 	unsigned long end = PAGE_ALIGN(addr) + numpages * PAGE_SIZE;
 	unsigned long size = end - start;
-	int ret;
-	struct page_change_data data;
 
 	WARN_ON_ONCE(start != addr);
 
 	if (!size)
 		return 0;
 
-	if (!IS_ENABLED(CONFIG_FORCE_PAGES) &&
-	    !range_in_range(start, size, MODULES_VADDR, MODULES_END) &&
+	if (!range_in_range(start, size, MODULES_VADDR, MODULES_END) &&
 	    !range_in_range(start, size, VMALLOC_START, VMALLOC_END))
 		return -EINVAL;
 
-	data.set_mask = set_mask;
-	data.clear_mask = clear_mask;
-
-	ret = apply_to_page_range(&init_mm, start, size, change_page_range,
-					&data);
-
-	flush_tlb_kernel_range(start, end);
-	return ret;
+	return __change_memory_common(start, size, set_mask, clear_mask);
 }
 
 int set_memory_ro(unsigned long addr, int numpages)
@@ -89,18 +98,14 @@ int set_memory_x(unsigned long addr, int numpages)
 					__pgprot(L_PTE_XN));
 }
 
-#ifdef CONFIG_ARCH_SUPPORTS_DEBUG_PAGEALLOC
-void __kernel_map_pages(struct page *page, int numpages, int enable)
+int set_memory_valid(unsigned long addr, int numpages, int enable)
 {
-	unsigned long addr;
-
-	if (PageHighMem(page))
-		return;
-
-	addr = (unsigned long) page_address(page);
 	if (enable)
-		set_memory_rw(addr, numpages);
+		return __change_memory_common(addr, PAGE_SIZE * numpages,
+					      __pgprot(L_PTE_VALID),
+					      __pgprot(0));
 	else
-		set_memory_ro(addr, numpages);
+		return __change_memory_common(addr, PAGE_SIZE * numpages,
+					      __pgprot(0),
+					      __pgprot(L_PTE_VALID));
 }
-#endif

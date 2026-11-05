@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2018-2019, 2021 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/module.h>
 #include <linux/io.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_irq.h>
+#include <linux/interrupt.h>
+#include <linux/mailbox_client.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/sizes.h>
@@ -40,17 +44,31 @@ struct glink_spss_pipe {
 
 	void *fifo;
 
-	int remote_pid;
+	struct qcom_glink_spss *spss;
+};
+
+struct qcom_glink_spss {
+	struct device dev;
+
+	int irq;
+	char irqname[32];
+	struct qcom_glink *glink;
+
+	struct mbox_client mbox_client;
+	struct mbox_chan *mbox_chan;
+
+	struct glink_spss_pipe *tx_pipe;
+	struct glink_spss_pipe *rx_pipe;
+
+	u32 remote_pid;
 };
 
 #define to_spss_pipe(p) container_of(p, struct glink_spss_pipe, native)
 
-static void glink_spss_reset(struct qcom_glink_pipe *np)
+static void glink_spss_reset(struct glink_spss_pipe *np)
 {
-	struct glink_spss_pipe *pipe = to_spss_pipe(np);
-
-	*pipe->head = cpu_to_le32(0);
-	*pipe->tail = cpu_to_le32(0);
+	*np->head = cpu_to_le32(0);
+	*np->tail = cpu_to_le32(0);
 }
 
 static size_t glink_spss_rx_avail(struct qcom_glink_pipe *np)
@@ -68,7 +86,7 @@ static size_t glink_spss_rx_avail(struct qcom_glink_pipe *np)
 		return head - tail;
 }
 
-static void glink_spss_rx_peak(struct qcom_glink_pipe *np,
+static void glink_spss_rx_peek(struct qcom_glink_pipe *np,
 			       void *data, unsigned int offset, size_t count)
 {
 	struct glink_spss_pipe *pipe = to_spss_pipe(np);
@@ -169,9 +187,29 @@ static void glink_spss_tx_write(struct qcom_glink_pipe *glink_pipe,
 	*pipe->head = cpu_to_le32(head);
 }
 
+static void glink_spss_tx_kick(struct qcom_glink_pipe *glink_pipe)
+{
+	struct glink_spss_pipe *pipe = to_spss_pipe(glink_pipe);
+	struct qcom_glink_spss *spss = pipe->spss;
+
+	mbox_send_message(spss->mbox_chan, NULL);
+	mbox_client_txdone(spss->mbox_chan, 0);
+}
+
+static irqreturn_t qcom_glink_spss_intr(int irq, void *data)
+{
+	struct qcom_glink_spss *spss = data;
+
+	qcom_glink_native_rx(spss->glink);
+
+	return IRQ_HANDLED;
+}
+
 static void qcom_glink_spss_release(struct device *dev)
 {
-	kfree(dev);
+	struct qcom_glink_spss *spss = container_of(dev, struct qcom_glink_spss, dev);
+
+	kfree(spss);
 }
 
 static int glink_spss_advertise_cfg(struct device *dev,
@@ -219,11 +257,12 @@ static int glink_spss_advertise_cfg(struct device *dev,
 	return 0;
 }
 
-struct qcom_glink *qcom_glink_spss_register(struct device *parent,
-					    struct device_node *node)
+struct qcom_glink_spss *qcom_glink_spss_register(struct device *parent,
+						 struct device_node *node)
 {
 	struct glink_spss_pipe *rx_pipe;
 	struct glink_spss_pipe *tx_pipe;
+	struct qcom_glink_spss *spss;
 	struct glink_spss_cfg *cfg;
 	struct qcom_glink *glink;
 	struct device *dev;
@@ -233,17 +272,21 @@ struct qcom_glink *qcom_glink_spss_register(struct device *parent,
 	size_t size;
 	int ret;
 
-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
-	if (!dev)
+
+	spss = kzalloc(sizeof(*spss), GFP_KERNEL);
+	if (!spss)
 		return ERR_PTR(-ENOMEM);
+
+	dev = &spss->dev;
 
 	dev->parent = parent;
 	dev->of_node = node;
 	dev->release = qcom_glink_spss_release;
-	dev_set_name(dev, "%s:%s", node->parent->name, node->name);
+	dev_set_name(dev, "%s:%pOFn", dev_name(parent->parent), node);
 	ret = device_register(dev);
 	if (ret) {
-		pr_err("failed to register glink edge %s\n", node->name);
+		pr_err("failed to register glink edge\n");
+		put_device(dev);
 		return ERR_PTR(ret);
 	}
 
@@ -253,6 +296,8 @@ struct qcom_glink *qcom_glink_spss_register(struct device *parent,
 		dev_err(dev, "failed to parse qcom,remote-pid\n");
 		goto err_put_dev;
 	}
+
+	spss->remote_pid = remote_pid;
 
 	rx_pipe = devm_kzalloc(dev, sizeof(*rx_pipe), GFP_KERNEL);
 	tx_pipe = devm_kzalloc(dev, sizeof(*tx_pipe), GFP_KERNEL);
@@ -283,36 +328,57 @@ struct qcom_glink *qcom_glink_spss_register(struct device *parent,
 		ret = -EINVAL;
 		goto err_put_dev;
 	}
+
+	scnprintf(spss->irqname, 32, "glink-native-%u", remote_pid);
+	spss->irq = of_irq_get(spss->dev.of_node, 0);
+	ret = devm_request_irq(&spss->dev, spss->irq, qcom_glink_spss_intr,
+			       IRQF_NO_SUSPEND | IRQF_NO_AUTOEN,
+			       spss->irqname, spss);
+	if (ret) {
+		dev_err(&spss->dev, "failed to request IRQ\n");
+		goto err_put_dev;
+	}
+
+	spss->mbox_client.dev = &spss->dev;
+	spss->mbox_client.knows_txdone = true;
+	spss->mbox_chan = mbox_request_channel(&spss->mbox_client, 0);
+	if (IS_ERR(spss->mbox_chan)) {
+		ret = dev_err_probe(&spss->dev, PTR_ERR(spss->mbox_chan),
+				    "failed to acquire IPC channel\n");
+		goto err_put_dev;
+	}
+
 	cfg->tx_fifo_size = cpu_to_le32(tx_size);
 	cfg->rx_fifo_size = cpu_to_le32(rx_size);
 
+	tx_pipe->spss = spss;
+	spss->tx_pipe = tx_pipe;
 	tx_pipe->tail = &cfg->tx_tail;
 	tx_pipe->head = &cfg->tx_head;
 	tx_pipe->native.length = tx_size;
 	tx_pipe->fifo = (u8 *)cfg + sizeof(*cfg);
 
+	rx_pipe->spss = spss;
+	spss->rx_pipe = rx_pipe;
 	rx_pipe->tail = &cfg->rx_tail;
 	rx_pipe->head = &cfg->rx_head;
 	rx_pipe->native.length = rx_size;
 	rx_pipe->fifo = (u8 *)cfg + sizeof(*cfg) + tx_size;
 
 	rx_pipe->native.avail = glink_spss_rx_avail;
-	rx_pipe->native.peak = glink_spss_rx_peak;
+	rx_pipe->native.peek = glink_spss_rx_peek;
 	rx_pipe->native.advance = glink_spss_rx_advance;
-	rx_pipe->native.reset = glink_spss_reset;
-	rx_pipe->remote_pid = remote_pid;
 
 	tx_pipe->native.avail = glink_spss_tx_avail;
 	tx_pipe->native.write = glink_spss_tx_write;
-	tx_pipe->native.reset = glink_spss_reset;
-	tx_pipe->remote_pid = remote_pid;
+	tx_pipe->native.kick = glink_spss_tx_kick;
 
 	*rx_pipe->tail = 0;
 	*tx_pipe->head = 0;
 
 	ret = glink_spss_advertise_cfg(dev, size, qcom_smem_virt_to_phys(cfg));
 	if (ret)
-		goto err_put_dev;
+		goto err_free_mbox;
 
 	glink = qcom_glink_native_probe(dev,
 					GLINK_FEATURE_INTENT_REUSE,
@@ -320,31 +386,46 @@ struct qcom_glink *qcom_glink_spss_register(struct device *parent,
 					false);
 	if (IS_ERR(glink)) {
 		ret = PTR_ERR(glink);
-		goto err_put_dev;
+		goto err_free_mbox;
 	}
+
+	spss->glink = glink;
+
+	enable_irq(spss->irq);
 
 	ret = qcom_glink_native_start(glink);
 	if (ret)
-		goto err_put_dev;
+		goto err_free_mbox;
 
-	return glink;
+	return spss;
+
+err_free_mbox:
+	mbox_free_channel(spss->mbox_chan);
 
 err_put_dev:
 	put_device(dev);
 
 	return ERR_PTR(ret);
 }
-EXPORT_SYMBOL(qcom_glink_spss_register);
+EXPORT_SYMBOL_GPL(qcom_glink_spss_register);
 
-void qcom_glink_spss_unregister(struct qcom_glink *glink)
+void qcom_glink_spss_unregister(struct qcom_glink_spss *spss)
 {
-	if (!glink)
+	if (!spss)
 		return;
 
-	qcom_glink_native_remove(glink);
-	qcom_glink_native_unregister(glink);
+	disable_irq(spss->irq);
+
+	qcom_glink_native_remove(spss->glink);
+
+	mbox_free_channel(spss->mbox_chan);
+
+	glink_spss_reset(spss->tx_pipe);
+	glink_spss_reset(spss->rx_pipe);
+
+	device_unregister(&spss->dev);
 }
-EXPORT_SYMBOL(qcom_glink_spss_unregister);
+EXPORT_SYMBOL_GPL(qcom_glink_spss_unregister);
 
 MODULE_DESCRIPTION("QTI GLINK SPSS driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

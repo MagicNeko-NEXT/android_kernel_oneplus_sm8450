@@ -7,8 +7,11 @@
 #include <linux/vmalloc.h>
 #include <linux/kmemleak.h>
 #include <linux/page_owner.h>
+#include <linux/page_pinner.h>
 #include <linux/page_idle.h>
+#include <linux/page_table_check.h>
 #include <linux/rcupdate.h>
+
 /*
  * struct page extension
  *
@@ -34,7 +37,7 @@
  *
  * The need callback is used to decide whether extended memory allocation is
  * needed or not. Sometimes users want to deactivate some features in this
- * boot and extra memory would be unneccessary. In this case, to avoid
+ * boot and extra memory would be unnecessary. In this case, to avoid
  * allocating huge chunk of memory, each clients represent their need of
  * extra memory through the need callback. If one of the need callbacks
  * returns true, it means that someone needs extra memory so that
@@ -67,12 +70,13 @@ static bool need_page_idle(void)
 {
 	return true;
 }
-struct page_ext_operations page_idle_ops = {
+static struct page_ext_operations page_idle_ops __initdata = {
 	.need = need_page_idle,
+	.need_shared_flags = true,
 };
 #endif
 
-static struct page_ext_operations *page_ext_ops[] = {
+static struct page_ext_operations *page_ext_ops[] __initdata = {
 #ifdef CONFIG_PAGE_OWNER
 	&page_owner_ops,
 #endif
@@ -82,11 +86,22 @@ static struct page_ext_operations *page_ext_ops[] = {
 #ifdef CONFIG_PAGE_PINNER
 	&page_pinner_ops,
 #endif
+#ifdef CONFIG_PAGE_TABLE_CHECK
+	&page_table_check_ops,
+#endif
 };
 
-unsigned long page_ext_size = sizeof(struct page_ext);
+unsigned long page_ext_size;
 
 static unsigned long total_usage;
+
+bool early_page_ext __meminitdata;
+static int __init setup_early_page_ext(char *str)
+{
+	early_page_ext = true;
+	return 0;
+}
+early_param("early_page_ext", setup_early_page_ext);
 
 static bool __init invoke_need_callbacks(void)
 {
@@ -95,7 +110,16 @@ static bool __init invoke_need_callbacks(void)
 	bool need = false;
 
 	for (i = 0; i < entries; i++) {
-		if (page_ext_ops[i]->need && page_ext_ops[i]->need()) {
+		if (page_ext_ops[i]->need()) {
+			if (page_ext_ops[i]->need_shared_flags) {
+				page_ext_size = sizeof(struct page_ext);
+				break;
+			}
+		}
+	}
+
+	for (i = 0; i < entries; i++) {
+		if (page_ext_ops[i]->need()) {
 			page_ext_ops[i]->offset = page_ext_size;
 			page_ext_size += page_ext_ops[i]->size;
 			need = true;
@@ -121,58 +145,18 @@ static inline struct page_ext *get_entry(void *base, unsigned long index)
 	return base + page_ext_size * index;
 }
 
-/**
- * page_ext_get() - Get the extended information for a page.
- * @page: The page we're interested in.
- *
- * Ensures that the page_ext will remain valid until page_ext_put()
- * is called.
- *
- * Return: NULL if no page_ext exists for this page.
- * Context: Any context.  Caller may not sleep until they have called
- * page_ext_put().
- */
-struct page_ext *page_ext_get(struct page *page)
+#ifndef CONFIG_SPARSEMEM
+void __init page_ext_init_flatmem_late(void)
 {
-	struct page_ext *page_ext;
-
-	rcu_read_lock();
-	page_ext = lookup_page_ext(page);
-	if (!page_ext) {
-		rcu_read_unlock();
-		return NULL;
-	}
-
-	return page_ext;
+	invoke_init_callbacks();
 }
-
-/**
- * page_ext_put() - Working with page extended information is done.
- * @page_ext: Page extended information received from page_ext_get().
- *
- * The page extended information of the page may not be valid after this
- * function is called.
- *
- * Return: None.
- * Context: Any context with corresponding page_ext_get() is called.
- */
-void page_ext_put(struct page_ext *page_ext)
-{
-	if (unlikely(!page_ext))
-		return;
-
-	rcu_read_unlock();
-}
-
-#if !defined(CONFIG_SPARSEMEM)
-
 
 void __meminit pgdat_page_ext_init(struct pglist_data *pgdat)
 {
 	pgdat->node_page_ext = NULL;
 }
 
-struct page_ext *lookup_page_ext(const struct page *page)
+static struct page_ext *lookup_page_ext(const struct page *page)
 {
 	unsigned long pfn = page_to_pfn(page);
 	unsigned long index;
@@ -192,7 +176,6 @@ struct page_ext *lookup_page_ext(const struct page *page)
 					MAX_ORDER_NR_PAGES);
 	return get_entry(base, index);
 }
-EXPORT_SYMBOL_GPL(lookup_page_ext);
 
 static int __init alloc_node_page_ext(int nid)
 {
@@ -239,7 +222,6 @@ void __init page_ext_init_flatmem(void)
 			goto fail;
 	}
 	pr_info("allocated %ld bytes of page_ext\n", total_usage);
-	invoke_init_callbacks();
 	return;
 
 fail:
@@ -247,13 +229,13 @@ fail:
 	panic("Out of memory");
 }
 
-#else /* CONFIG_FLAT_NODE_MEM_MAP */
+#else /* CONFIG_SPARSEMEM */
 static bool page_ext_invalid(struct page_ext *page_ext)
 {
 	return !page_ext || (((unsigned long)page_ext & PAGE_EXT_INVALID) == PAGE_EXT_INVALID);
 }
 
-struct page_ext *lookup_page_ext(const struct page *page)
+static struct page_ext *lookup_page_ext(const struct page *page)
 {
 	unsigned long pfn = page_to_pfn(page);
 	struct mem_section *section = __pfn_to_section(pfn);
@@ -270,7 +252,6 @@ struct page_ext *lookup_page_ext(const struct page *page)
 		return NULL;
 	return get_entry(page_ext, pfn);
 }
-EXPORT_SYMBOL_GPL(lookup_page_ext);
 
 static void *__meminit alloc_page_ext(size_t size, int nid)
 {
@@ -323,7 +304,7 @@ static int __meminit init_section_page_ext(unsigned long pfn, int nid)
 	total_usage += table_size;
 	return 0;
 }
-#ifdef CONFIG_MEMORY_HOTPLUG
+
 static void free_page_ext(void *addr)
 {
 	if (is_vmalloc_addr(addr)) {
@@ -391,7 +372,7 @@ static int __meminit online_page_ext(unsigned long start_pfn,
 		 * online__pages(), and start_pfn should exist.
 		 */
 		nid = pfn_to_nid(start_pfn);
-		VM_BUG_ON(!node_state(nid, N_ONLINE));
+		VM_BUG_ON(!node_online(nid));
 	}
 
 	for (pfn = start; !fail && pfn < end; pfn += PAGES_PER_SECTION)
@@ -400,14 +381,15 @@ static int __meminit online_page_ext(unsigned long start_pfn,
 		return 0;
 
 	/* rollback */
+	end = pfn - PAGES_PER_SECTION;
 	for (pfn = start; pfn < end; pfn += PAGES_PER_SECTION)
 		__free_page_ext(pfn);
 
 	return -ENOMEM;
 }
 
-static int __meminit offline_page_ext(unsigned long start_pfn,
-				unsigned long nr_pages, int nid)
+static void __meminit offline_page_ext(unsigned long start_pfn,
+				unsigned long nr_pages)
 {
 	unsigned long start, end, pfn;
 
@@ -430,8 +412,6 @@ static int __meminit offline_page_ext(unsigned long start_pfn,
 
 	for (pfn = start; pfn < end; pfn += PAGES_PER_SECTION)
 		__free_page_ext(pfn);
-	return 0;
-
 }
 
 static int __meminit page_ext_callback(struct notifier_block *self,
@@ -447,11 +427,11 @@ static int __meminit page_ext_callback(struct notifier_block *self,
 		break;
 	case MEM_OFFLINE:
 		offline_page_ext(mn->start_pfn,
-				mn->nr_pages, mn->status_change_nid);
+				mn->nr_pages);
 		break;
 	case MEM_CANCEL_ONLINE:
 		offline_page_ext(mn->start_pfn,
-				mn->nr_pages, mn->status_change_nid);
+				mn->nr_pages);
 		break;
 	case MEM_GOING_OFFLINE:
 		break;
@@ -462,8 +442,6 @@ static int __meminit page_ext_callback(struct notifier_block *self,
 
 	return notifier_from_errno(ret);
 }
-
-#endif
 
 void __init page_ext_init(void)
 {
@@ -501,7 +479,7 @@ void __init page_ext_init(void)
 			cond_resched();
 		}
 	}
-	hotplug_memory_notifier(page_ext_callback, 0);
+	hotplug_memory_notifier(page_ext_callback, DEFAULT_CALLBACK_PRI);
 	pr_info("allocated %ld bytes of page_ext\n", total_usage);
 	invoke_init_callbacks();
 	return;
@@ -515,3 +493,48 @@ void __meminit pgdat_page_ext_init(struct pglist_data *pgdat)
 }
 
 #endif
+
+/**
+ * page_ext_get() - Get the extended information for a page.
+ * @page: The page we're interested in.
+ *
+ * Ensures that the page_ext will remain valid until page_ext_put()
+ * is called.
+ *
+ * Return: NULL if no page_ext exists for this page.
+ * Context: Any context.  Caller may not sleep until they have called
+ * page_ext_put().
+ */
+struct page_ext *page_ext_get(struct page *page)
+{
+	struct page_ext *page_ext;
+
+	rcu_read_lock();
+	page_ext = lookup_page_ext(page);
+	if (!page_ext) {
+		rcu_read_unlock();
+		return NULL;
+	}
+
+	return page_ext;
+}
+EXPORT_SYMBOL_NS_GPL(page_ext_get, MINIDUMP);
+
+/**
+ * page_ext_put() - Working with page extended information is done.
+ * @page_ext: Page extended information received from page_ext_get().
+ *
+ * The page extended information of the page may not be valid after this
+ * function is called.
+ *
+ * Return: None.
+ * Context: Any context with corresponding page_ext_get() is called.
+ */
+void page_ext_put(struct page_ext *page_ext)
+{
+	if (unlikely(!page_ext))
+		return;
+
+	rcu_read_unlock();
+}
+EXPORT_SYMBOL_NS_GPL(page_ext_put, MINIDUMP);

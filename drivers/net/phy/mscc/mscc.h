@@ -140,6 +140,10 @@ enum rgmii_clock_delay {
 #define MSCC_PHY_PAGE_1588		  0x1588 /* PTP (1588) */
 #define MSCC_PHY_PAGE_TEST		  0x2a30 /* Test reg */
 #define MSCC_PHY_PAGE_TR		  0x52b5 /* Token ring registers */
+#define MSCC_PHY_GPIO_CONTROL_2           14
+
+#define MSCC_PHY_COMA_MODE		  0x2000 /* input(1) / output(0) */
+#define MSCC_PHY_COMA_OUTPUT		  0x1000 /* value to output */
 
 /* Extended Page 1 Registers */
 #define MSCC_PHY_CU_MEDIA_CRC_VALID_CNT	  18
@@ -273,6 +277,7 @@ enum rgmii_clock_delay {
 /* Microsemi PHY ID's
  *   Code assumes lowest nibble is 0
  */
+#define PHY_ID_VSC8501			  0x00070530
 #define PHY_ID_VSC8502			  0x00070630
 #define PHY_ID_VSC8504			  0x000704c0
 #define PHY_ID_VSC8514			  0x00070670
@@ -281,12 +286,13 @@ enum rgmii_clock_delay {
 #define PHY_ID_VSC8540			  0x00070760
 #define PHY_ID_VSC8541			  0x00070770
 #define PHY_ID_VSC8552			  0x000704e0
-#define PHY_ID_VSC856X			  0x000707e0
+#define PHY_ID_VSC856X			  0x000707e1
 #define PHY_ID_VSC8572			  0x000704d0
 #define PHY_ID_VSC8574			  0x000704a0
-#define PHY_ID_VSC8575			  0x000707d0
-#define PHY_ID_VSC8582			  0x000707b0
-#define PHY_ID_VSC8584			  0x000707c0
+#define PHY_ID_VSC8575			  0x000707d1
+#define PHY_ID_VSC8582			  0x000707b1
+#define PHY_ID_VSC8584			  0x000707c1
+#define PHY_VENDOR_MSCC			0x00070400
 
 #define MSCC_VDDMAC_1500		  1500
 #define MSCC_VDDMAC_1800		  1800
@@ -340,6 +346,10 @@ enum rgmii_clock_delay {
 #define VSC8584_REVB				0x0001
 #define MSCC_DEV_REV_MASK			GENMASK(3, 0)
 
+#define MSCC_ROM_TRAP_SERDES_6G_CFG		0x1E48
+#define MSCC_RAM_TRAP_SERDES_6G_CFG		0x1E4F
+#define PATCH_VEC_ZERO_EN			0x0100
+
 struct reg_val {
 	u16	reg;
 	u32	val;
@@ -351,6 +361,13 @@ struct vsc85xx_hw_stat {
 	u16 page;
 	u16 mask;
 };
+
+struct vsc8531_skb_cb {
+	u32 ns;
+};
+
+#define VSC8531_SKB_CB(skb) \
+	((struct vsc8531_skb_cb *)((skb)->cb))
 
 struct vsc8531_private {
 	int rate_magic;
@@ -400,6 +417,11 @@ struct vsc8531_private {
 	 */
 	struct mutex ts_lock;
 	struct mutex phc_lock;
+
+	/* list of skbs that were received and need timestamp information but it
+	 * didn't received it yet
+	 */
+	struct sk_buff_head rx_skbs_list;
 };
 
 /* Shared structure between the PHYs of the same package.
@@ -420,6 +442,18 @@ struct vsc8531_edge_rate_table {
 enum csr_target {
 	MACRO_CTRL  = 0x07,
 };
+
+u32 vsc85xx_csr_read(struct phy_device *phydev,
+		     enum csr_target target, u32 reg);
+
+int vsc85xx_csr_write(struct phy_device *phydev,
+		      enum csr_target target, u32 reg, u32 val);
+
+int phy_base_write(struct phy_device *phydev, u32 regnum, u16 val);
+int phy_base_read(struct phy_device *phydev, u32 regnum);
+int phy_update_mcb_s6g(struct phy_device *phydev, u32 reg, u8 mcb);
+int phy_commit_mcb_s6g(struct phy_device *phydev, u32 reg, u8 mcb);
+int vsc8584_cmd(struct phy_device *phydev, u16 val);
 
 #if IS_ENABLED(CONFIG_MACSEC)
 int vsc8584_macsec_init(struct phy_device *phydev);
@@ -442,6 +476,7 @@ static inline void vsc8584_config_macsec_intr(struct phy_device *phydev)
 void vsc85xx_link_change_notify(struct phy_device *phydev);
 void vsc8584_config_ts_intr(struct phy_device *phydev);
 int vsc8584_ptp_init(struct phy_device *phydev);
+void vsc8584_ptp_deinit(struct phy_device *phydev);
 int vsc8584_ptp_probe_once(struct phy_device *phydev);
 int vsc8584_ptp_probe(struct phy_device *phydev);
 irqreturn_t vsc8584_handle_ts_interrupt(struct phy_device *phydev);
@@ -455,6 +490,9 @@ static inline void vsc8584_config_ts_intr(struct phy_device *phydev)
 static inline int vsc8584_ptp_init(struct phy_device *phydev)
 {
 	return 0;
+}
+static inline void vsc8584_ptp_deinit(struct phy_device *phydev)
+{
 }
 static inline int vsc8584_ptp_probe_once(struct phy_device *phydev)
 {

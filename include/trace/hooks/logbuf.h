@@ -7,16 +7,14 @@
 #if !defined(_TRACE_HOOK_LOGBUF_H) || defined(TRACE_HEADER_MULTI_READ)
 #define _TRACE_HOOK_LOGBUF_H
 
-#include <linux/tracepoint.h>
 #include <trace/hooks/vendor_hooks.h>
 
-#if defined(__GENKSYMS__) || !IS_ENABLED(CONFIG_PRINTK)
-struct printk_record;
 struct printk_ringbuffer;
-#else
-/* struct printk_record, struct printk_ringbuffer */
-#include <../kernel/printk/printk_ringbuffer.h>
-#endif /* __GENKSYMS__ */
+struct printk_record;
+
+DECLARE_RESTRICTED_HOOK(android_rvh_logbuf,
+	TP_PROTO(struct printk_ringbuffer *rb, struct printk_record *r),
+	TP_ARGS(rb, r), true)
 
 DECLARE_HOOK(android_vh_logbuf,
 	TP_PROTO(struct printk_ringbuffer *rb, struct printk_record *r),

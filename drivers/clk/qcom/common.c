@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2013-2014, 2017-2021, The Linux Foundation.
- * All rights reserved.
- * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2013-2014, 2017-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/export.h>
@@ -17,6 +16,7 @@
 #include <linux/interconnect.h>
 #include <linux/pm_clock.h>
 #include <linux/pm_runtime.h>
+#include <linux/mfd/syscon.h>
 
 #include "common.h"
 #include "clk-opp.h"
@@ -34,6 +34,80 @@ struct qcom_cc {
 	struct clk_hw **clk_hws;
 	size_t num_clk_hws;
 };
+
+int qcom_clk_crm_init(struct device *dev, struct clk_crm *crm)
+{
+	char prop_name[32];
+
+	if (!crm)
+		return -EINVAL;
+
+	if (!crm->initialized) {
+		snprintf(prop_name, sizeof(prop_name), "qcom,%s-crmc", crm->name);
+
+		if (of_find_property(dev->of_node, prop_name, NULL)) {
+			crm->regmap_crmc =
+				syscon_regmap_lookup_by_phandle(dev->of_node,
+								prop_name);
+			if (IS_ERR(crm->regmap_crmc)) {
+				dev_err(dev, "%s regmap error\n", prop_name);
+				return PTR_ERR(crm->regmap_crmc);
+			}
+		}
+
+		if (crm->name) {
+			crm->dev = crm_get_device(crm->name);
+			if (IS_ERR(crm->dev)) {
+				pr_err("%s Failed to get crm dev=%s, ret=%ld\n",
+				       __func__, crm->name, PTR_ERR(crm->dev));
+				return PTR_ERR(crm->dev);
+			}
+		}
+
+		/*
+		 * Until all targets and instances have updated to explicitly
+		 * specify this, use the most common default value by default.
+		 */
+		if (!crm->num_perf_ol)
+			crm->num_perf_ol = 8;
+
+		crm->initialized = true;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL(qcom_clk_crm_init);
+
+static int qcom_find_freq_index(const struct freq_tbl *f, unsigned long rate)
+{
+	int index;
+
+	for (index = 0; f->freq; f++, index++) {
+		if (rate <= f->freq)
+			return index;
+	}
+
+	return index - 1;
+}
+
+int qcom_find_crm_freq_index(const struct freq_tbl *f, unsigned long rate)
+{
+	if (!f || !f->freq)
+		return -EINVAL;
+
+	/*
+	 * If rate is 0 return PERF_OL 0 index
+	 */
+	if (!rate)
+		return 0;
+
+	/*
+	 * Return PERF_OL index + 1 as PERF_OL 0 is
+	 * treated as CLK OFF as per LUT population
+	 */
+	return qcom_find_freq_index(f, rate) + 1;
+}
+EXPORT_SYMBOL(qcom_find_crm_freq_index);
 
 const
 struct freq_tbl *qcom_find_freq(const struct freq_tbl *f, unsigned long rate)
@@ -97,11 +171,9 @@ struct regmap *
 qcom_cc_map(struct platform_device *pdev, const struct qcom_cc_desc *desc)
 {
 	void __iomem *base;
-	struct resource *res;
 	struct device *dev = &pdev->dev;
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	base = devm_ioremap_resource(dev, res);
+	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
 		return ERR_CAST(base);
 
@@ -254,26 +326,29 @@ static void qcom_cc_set_critical(struct device *dev, struct qcom_cc *cc)
 	}
 
 	of_property_for_each_u32(dev->of_node, "qcom,critical-devices", prop, p, i) {
-		np = of_find_node_by_phandle(i);
-		if (!np)
-			continue;
-
-		cnt = of_count_phandle_with_args(np, "clocks", "#clock-cells");
-
-		for (i = 0; i < cnt; i++) {
-			of_parse_phandle_with_args(np, "clocks", "#clock-cells",
-						   i, &args);
-			clock_idx = args.args[0];
-
-			if (args.np != dev->of_node || clock_idx >= cc->num_rclks)
+		for (np = of_find_node_by_phandle(i); np; np = of_get_parent(np)) {
+			if (!of_property_read_bool(np, "clocks")) {
+				of_node_put(np);
 				continue;
+			}
 
-			if (cc->rclks[clock_idx])
-				cc->rclks[clock_idx]->flags |= QCOM_CLK_IS_CRITICAL;
-			of_node_put(args.np);
+			cnt = of_count_phandle_with_args(np, "clocks", "#clock-cells");
+
+			for (i = 0; i < cnt; i++) {
+				of_parse_phandle_with_args(np, "clocks", "#clock-cells",
+							   i, &args);
+				clock_idx = args.args[0];
+
+				if (args.np != dev->of_node || clock_idx >= cc->num_rclks)
+					continue;
+
+				if (cc->rclks[clock_idx])
+					cc->rclks[clock_idx]->flags |= QCOM_CLK_IS_CRITICAL;
+				of_node_put(args.np);
+			}
+
+			of_node_put(np);
 		}
-
-		of_node_put(np);
 	}
 }
 
@@ -312,6 +387,7 @@ int qcom_cc_really_probe(struct platform_device *pdev,
 		return -ENOMEM;
 
 	reset = &cc->reset;
+	reset->dev = dev;
 	reset->rcdev.of_node = dev->of_node;
 	reset->rcdev.ops = &qcom_reset_ops;
 	reset->rcdev.owner = dev->driver->owner;
@@ -417,13 +493,11 @@ int qcom_cc_probe_by_index(struct platform_device *pdev, int index,
 			   const struct qcom_cc_desc *desc)
 {
 	struct regmap *regmap;
-	struct resource *res;
 	void __iomem *base;
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, index);
-	base = devm_ioremap_resource(&pdev->dev, res);
+	base = devm_platform_ioremap_resource(pdev, index);
 	if (IS_ERR(base))
-		return -ENOMEM;
+		return PTR_ERR(base);
 
 	regmap = devm_regmap_init_mmio(&pdev->dev, base, desc->config);
 	if (IS_ERR(regmap))
@@ -435,12 +509,71 @@ EXPORT_SYMBOL_GPL(qcom_cc_probe_by_index);
 
 void qcom_cc_sync_state(struct device *dev, const struct qcom_cc_desc *desc)
 {
-	dev_info(dev, "sync-state\n");
+	dev_info(dev, "sync_state\n");
 	clk_sync_state(dev);
 
 	clk_vdd_proxy_unvote(dev, desc);
 }
 EXPORT_SYMBOL(qcom_cc_sync_state);
+
+int qcom_clk_crm_set_rate(struct clk *clk,
+			  enum crm_drv_type client_type, u32 client_idx,
+			  u32 pwr_st, unsigned long rate)
+{
+	struct clk_hw *hw;
+	int ret;
+
+	if (!clk)
+		return -EINVAL;
+
+	do {
+		hw = __clk_get_hw(clk);
+
+		if (clk_is_regmap_clk(hw)) {
+			struct clk_regmap *rclk = to_clk_regmap(hw);
+
+			if (rclk->ops && rclk->ops->set_crm_rate) {
+				ret = rclk->ops->set_crm_rate(hw, client_type,
+							      client_idx, pwr_st, rate);
+				return ret;
+			}
+		}
+
+	} while ((clk = clk_get_parent(hw->clk)));
+
+	return -EINVAL;
+}
+EXPORT_SYMBOL(qcom_clk_crm_set_rate);
+
+int qcom_clk_crmb_set_rate(struct clk *clk,
+			   enum crm_drv_type client_type, u32 client_idx,
+			   u32 resource_idx, u32 pwr_st, u32 ab_rate, u32 ib_rate)
+{
+	struct clk_hw *hw;
+	int ret;
+
+	if (!clk)
+		return -EINVAL;
+
+	do {
+		hw = __clk_get_hw(clk);
+
+		if (clk_is_regmap_clk(hw)) {
+			struct clk_regmap *rclk = to_clk_regmap(hw);
+
+			if (rclk->ops && rclk->ops->set_crmb_rate) {
+				ret = rclk->ops->set_crmb_rate(hw, client_type,
+							      client_idx, resource_idx, pwr_st,
+							      ab_rate, ib_rate);
+				return ret;
+			}
+		}
+
+	} while ((clk = clk_get_parent(hw->clk)));
+
+	return -EINVAL;
+}
+EXPORT_SYMBOL_GPL(qcom_clk_crmb_set_rate);
 
 int qcom_clk_get_voltage(struct clk *clk, unsigned long rate)
 {
@@ -604,12 +737,6 @@ int qcom_cc_runtime_suspend(struct device *dev)
 	return 0;
 }
 EXPORT_SYMBOL(qcom_cc_runtime_suspend);
-
-static int __init qcom_clk_init(void)
-{
-	return clk_debug_init();
-}
-subsys_initcall(qcom_clk_init);
 
 static void __exit qcom_clk_exit(void)
 {

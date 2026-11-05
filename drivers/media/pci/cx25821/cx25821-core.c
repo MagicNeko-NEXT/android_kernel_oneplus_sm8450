@@ -337,13 +337,6 @@ static int cx25821_risc_decode(u32 risc)
 	return incr[risc >> 28] ? incr[risc >> 28] : 1;
 }
 
-static inline int i2c_slave_did_ack(struct i2c_adapter *i2c_adap)
-{
-	struct cx25821_i2c *bus = i2c_adap->algo_data;
-	struct cx25821_dev *dev = bus->dev;
-	return cx_read(bus->reg_stat) & 0x01;
-}
-
 static void cx25821_registers_init(struct cx25821_dev *dev)
 {
 	u32 tmp;
@@ -915,6 +908,7 @@ static int cx25821_dev_setup(struct cx25821_dev *dev)
 
 	if (!dev->lmmio) {
 		CX25821_ERR("ioremap failed, maybe increasing __VMALLOC_RESERVE in page.h\n");
+		release_mem_region(dev->base_io_addr, pci_resource_len(dev->pci, 0));
 		cx25821_iounmap(dev);
 		return -ENOMEM;
 	}
@@ -977,11 +971,11 @@ int cx25821_riscmem_alloc(struct pci_dev *pci,
 	dma_addr_t dma = 0;
 
 	if (risc->cpu && risc->size < size) {
-		pci_free_consistent(pci, risc->size, risc->cpu, risc->dma);
+		dma_free_coherent(&pci->dev, risc->size, risc->cpu, risc->dma);
 		risc->cpu = NULL;
 	}
 	if (NULL == risc->cpu) {
-		cpu = pci_zalloc_consistent(pci, size, &dma);
+		cpu = dma_alloc_coherent(&pci->dev, size, &dma, GFP_KERNEL);
 		if (NULL == cpu)
 			return -ENOMEM;
 		risc->cpu  = cpu;
@@ -1200,11 +1194,10 @@ EXPORT_SYMBOL(cx25821_risc_databuffer_audio);
 
 void cx25821_free_buffer(struct cx25821_dev *dev, struct cx25821_buffer *buf)
 {
-	BUG_ON(in_interrupt());
 	if (WARN_ON(buf->risc.size == 0))
 		return;
-	pci_free_consistent(dev->pci,
-			buf->risc.size, buf->risc.cpu, buf->risc.dma);
+	dma_free_coherent(&dev->pci->dev, buf->risc.size, buf->risc.cpu,
+			  buf->risc.dma);
 	memset(&buf->risc, 0, sizeof(buf->risc));
 }
 
@@ -1303,7 +1296,7 @@ static int cx25821_initdev(struct pci_dev *pci_dev,
 		dev->pci_lat, (unsigned long long)dev->base_io_addr);
 
 	pci_set_master(pci_dev);
-	err = pci_set_dma_mask(pci_dev, 0xffffffff);
+	err = dma_set_mask(&pci_dev->dev, 0xffffffff);
 	if (err) {
 		pr_err("%s/0: Oops: no 32bit PCI DMA ???\n", dev->name);
 		err = -EIO;

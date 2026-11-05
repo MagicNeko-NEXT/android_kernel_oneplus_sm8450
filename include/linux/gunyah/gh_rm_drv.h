@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  */
 
@@ -10,6 +11,9 @@
 #include <linux/types.h>
 #include <linux/notifier.h>
 #include <linux/fwnode.h>
+#include <linux/gunyah.h>
+#include <linux/range.h>
+#include <linux/firmware/qcom/qcom_scm.h>
 
 #include "gh_common.h"
 
@@ -37,11 +41,19 @@
 #define GH_RM_MEM_ACCEPT_VALIDATE_ACL_ATTRS	BIT(1)
 #define GH_RM_MEM_ACCEPT_VALIDATE_LABEL		BIT(2)
 #define GH_RM_MEM_ACCEPT_MAP_IPA_CONTIGUOUS	BIT(4)
+#define GH_RM_MEM_ACCEPT_SANITIZE_ON_RELEASE	BIT(5)
 #define GH_RM_MEM_ACCEPT_DONE			BIT(7)
+/* linux driver flag - not passed to gunyah */
+#define GH_RM_MEM_ACCEPT_NO_SANITIZE_ON_RELEASE	BIT(31)
 
 #define GH_RM_MEM_SHARE_SANITIZE		BIT(0)
+#define GH_RM_MEM_SHARE_APPEND			BIT(1)
 #define GH_RM_MEM_LEND_SANITIZE			BIT(0)
+#define GH_RM_MEM_LEND_APPEND			BIT(1)
 #define GH_RM_MEM_DONATE_SANITIZE		BIT(0)
+#define GH_RM_MEM_DONATE_APPEND			BIT(1)
+
+#define GH_RM_MEM_APPEND_END			BIT(0)
 
 #define GH_RM_MEM_NOTIFY_RECIPIENT_SHARED	BIT(0)
 #define GH_RM_MEM_NOTIFY_RECIPIENT	GH_RM_MEM_NOTIFY_RECIPIENT_SHARED
@@ -49,11 +61,22 @@
 #define GH_RM_MEM_NOTIFY_OWNER		GH_RM_MEM_NOTIFY_OWNER_RELEASED
 #define GH_RM_MEM_NOTIFY_OWNER_ACCEPTED		BIT(2)
 
-#define MAX_EXIT_REASON_SIZE			4
+/* Support may vary across hardware platforms */
+#define GH_RM_IPA_RESERVE_ECC			BIT(0)
+#define GH_RM_IPA_RESERVE_MEMTAG		BIT(1)
+#define GH_RM_IPA_RESERVE_NORMAL		BIT(2)
+#define GH_RM_IPA_RESERVE_IO			BIT(3)
+/* BIT(4) and BIT(5) reserved */
+/* The calling VM's default memory type */
+#define GH_RM_IPA_RESERVE_DEFAULT		BIT(6)
+#define GH_RM_IPA_RESERVE_VALID_FLAGS		(GENMASK(3, 0) | BIT(6))
 
-struct gh_rm_mem_shared_acl_entry;
-struct gh_rm_mem_shared_sgl_entry;
-struct gh_rm_mem_shared_attr_entry;
+#define GH_RM_IPA_RESERVE_PLATFORM_ENCRYPTED		BIT(0)
+#define GH_RM_IPA_RESERVE_PLATFORM_AUTHENTICATED	BIT(1)
+#define GH_RM_IPA_RESERVE_PLATFORM_ANTI_ROLLBACK	BIT(2)
+#define GH_RM_IPA_RESERVE_PLATFORM_VALID_FLAGS		GENMASK(2, 0)
+
+#define MAX_EXIT_REASON_SIZE			4
 
 struct gh_rm_notif_mem_shared_payload {
 	u32 mem_handle;
@@ -68,20 +91,11 @@ struct gh_rm_notif_mem_shared_payload {
 	/* TODO: How to arrange multiple variable length struct arrays? */
 } __packed;
 
-struct gh_rm_mem_shared_acl_entry {
-	u16 acl_vmid;
-	u8 acl_rights;
-	u8 reserved;
-} __packed;
-
-struct gh_rm_mem_shared_sgl_entry {
-	u32 sgl_size_low;
-	u32 sgl_size_high;
-} __packed;
-
-struct gh_rm_mem_shared_attr_entry {
-	u16 attributes;
-	u16 attributes_vmid;
+/* Compared with gh_sgl_desc, ipa_base field is not present */
+struct gh_rm_notif_mem_shared_sgl_desc {
+	u16 n_sgl_entries;
+	u16 reserved;
+	u64 size[];
 } __packed;
 
 struct gh_rm_notif_mem_released_payload {
@@ -120,10 +134,10 @@ struct gh_acl_desc {
 } __packed;
 
 struct gh_sgl_desc {
-	u16 n_sgl_entries;
+	u32 n_sgl_entries;
 	u16 reserved;
 	struct gh_sgl_entry sgl_entries[];
-} __packed;
+};
 
 struct gh_mem_attr_desc {
 	u16 n_mem_attr_entries;
@@ -150,16 +164,27 @@ struct gh_notify_vmid_desc {
 #define GH_RM_NOTIF_VM_IRQ_RELEASED	0x56100012
 #define GH_RM_NOTIF_VM_IRQ_ACCEPTED	0x56100013
 
+/* AUTH mechanisms */
+#define GH_VM_UNAUTH			0
+#define GH_VM_AUTH_PIL_ELF		1
+#define GH_VM_AUTH_ANDROID_PVM		2
+
+/* AUTH_PARAM_TYPE mechanisms */
+#define GH_VM_AUTH_PARAM_PAS_ID		0 /* Used to pass peripheral auth id */
+
 #define GH_RM_VM_STATUS_NO_STATE	0
 #define GH_RM_VM_STATUS_INIT		1
 #define GH_RM_VM_STATUS_READY		2
 #define GH_RM_VM_STATUS_RUNNING		3
 #define GH_RM_VM_STATUS_PAUSED		4
-/* 5, 6 and 7 are deprecated */
+#define GH_RM_VM_STATUS_LOAD		5
+#define GH_RM_VM_STATUS_AUTH		6
+/* 7 is reserved */
 #define GH_RM_VM_STATUS_INIT_FAILED	8
 #define GH_RM_VM_STATUS_EXITED		9
 #define GH_RM_VM_STATUS_RESETTING	10
 #define GH_RM_VM_STATUS_RESET		11
+#define GH_RM_VM_STATUS_RESET_FAILED	12
 
 #define GH_RM_OS_STATUS_NONE		0
 #define GH_RM_OS_STATUS_EARLY_BOOT	1
@@ -201,6 +226,12 @@ struct gh_vm_exit_reason_vm_exit {
 	u8 reserved;
 } __packed;
 
+/* Reasons for VM_STOP */
+#define GH_VM_STOP_SHUTDOWN					0
+#define GH_VM_STOP_RESTART					1
+#define GH_VM_STOP_CRASH					2
+#define GH_VM_STOP_FORCE_STOP					3
+#define GH_VM_STOP_MAX						4
 struct gh_rm_notif_vm_exited_payload {
 	gh_vmid_t vmid;
 	u16 exit_type;
@@ -233,6 +264,11 @@ struct gh_rm_notif_vm_irq_released_payload {
 
 struct gh_rm_notif_vm_irq_accepted_payload {
 	gh_virq_handle_t virq_handle;
+} __packed;
+
+struct gh_vm_auth_param_entry {
+	u32 auth_param_type;
+	u32 auth_param;
 } __packed;
 
 /* Arch specific APIs */
@@ -277,21 +313,24 @@ struct gh_rm_notif_vm_console_chars {
 	u8 bytes[0];
 } __packed;
 
-struct notifier_block;
-
-typedef int (*gh_virtio_mmio_cb_t)(gh_vmid_t peer, const char *vm_name,
-	gh_label_t label, gh_capid_t cap_id, int linux_irq, u64 base, u64 size);
-typedef int (*gh_vcpu_affinity_set_cb_t)(gh_vmid_t vmid, gh_label_t label, gh_capid_t cap_id);
-typedef int (*gh_vcpu_affinity_reset_cb_t)(gh_vmid_t vmid, gh_label_t label);
-typedef int (*gh_vpm_grp_set_cb_t)(gh_vmid_t vmid, gh_capid_t cap_id, int linux_irq);
-typedef int (*gh_vpm_grp_reset_cb_t)(gh_vmid_t vmid, int *linux_irq);
-
-/* Client APIs for VM Services */
 struct gh_vm_status {
 	u8 vm_status;
 	u8 os_status;
 	u16 app_status;
 } __packed;
+
+struct notifier_block;
+
+typedef int (*gh_virtio_mmio_cb_t)(gh_vmid_t peer, const char *vm_name,
+	gh_label_t label, gh_capid_t cap_id, int linux_irq, u64 base, u64 size);
+typedef int (*gh_wdog_manage_cb_t)(gh_vmid_t vmid, gh_capid_t cap_id, bool populate);
+typedef int (*gh_vcpu_affinity_set_cb_t)(gh_vmid_t vmid, gh_label_t label,
+						gh_capid_t cap_id, int linux_irq);
+typedef int (*gh_vcpu_affinity_reset_cb_t)(gh_vmid_t vmid, gh_label_t label,
+						gh_capid_t cap_id, int *linux_irq);
+typedef int (*gh_vpm_grp_set_cb_t)(gh_vmid_t vmid, gh_capid_t cap_id, int linux_irq);
+typedef int (*gh_vpm_grp_reset_cb_t)(gh_vmid_t vmid, int *linux_irq);
+typedef void (*gh_all_res_populated_cb_t)(gh_vmid_t vmid, bool res_populated);
 
 #if IS_ENABLED(CONFIG_GH_RM_DRV)
 /* RM client registration APIs */
@@ -317,32 +356,38 @@ int gh_rm_vm_irq_reclaim(gh_virq_handle_t virq_handle);
 
 int gh_rm_set_virtio_mmio_cb(gh_virtio_mmio_cb_t fnptr);
 void gh_rm_unset_virtio_mmio_cb(void);
-int gh_rm_set_vcpu_affinity_cb(enum gh_vm_names vm_name_index,
-			       gh_vcpu_affinity_set_cb_t fnptr);
-int gh_rm_reset_vcpu_affinity_cb(enum gh_vm_names vm_name_index,
-				 gh_vcpu_affinity_reset_cb_t fnptr);
-int gh_rm_set_vpm_grp_cb(enum gh_vm_names vm_name_index,
-			 gh_vpm_grp_set_cb_t fnptr);
-int gh_rm_reset_vpm_grp_cb(enum gh_vm_names vm_name_index,
-			   gh_vpm_grp_reset_cb_t fnptr);
+int gh_rm_set_wdog_manage_cb(gh_wdog_manage_cb_t fnptr);
+int gh_rm_set_vcpu_affinity_cb(gh_vcpu_affinity_set_cb_t fnptr);
+int gh_rm_reset_vcpu_affinity_cb(gh_vcpu_affinity_reset_cb_t fnptr);
+int gh_rm_set_vpm_grp_cb(gh_vpm_grp_set_cb_t fnptr);
+int gh_rm_reset_vpm_grp_cb(gh_vpm_grp_reset_cb_t fnptr);
+int gh_rm_all_res_populated_cb(gh_all_res_populated_cb_t fnptr);
 
 /* Client APIs for VM management */
 int gh_rm_vm_alloc_vmid(enum gh_vm_names vm_name, int *vmid);
 int gh_rm_vm_dealloc_vmid(gh_vmid_t vmid);
-int gh_rm_get_vmid(enum gh_vm_names vm_name, gh_vmid_t *vmid);
+int gh_rm_vm_config_image(gh_vmid_t vmid, u16 auth_mech, u32 mem_handle,
+	u64 image_offset, u64 image_size, u64 dtb_offset, u64 dtb_size);
+int gh_rm_vm_auth_image(gh_vmid_t vmid, ssize_t n_entries,
+				struct gh_vm_auth_param_entry *entry);
+bool gh_firmware_is_legacy(void);
+int ghd_rm_vm_init(gh_vmid_t vmid);
+int ghd_rm_get_vmid(enum gh_vm_names vm_name, gh_vmid_t *vmid);
 int gh_rm_get_vm_id_info(gh_vmid_t vmid);
 int gh_rm_get_vm_name(gh_vmid_t vmid, enum gh_vm_names *vm_name);
 int gh_rm_get_vminfo(enum gh_vm_names vm_name, struct gh_vminfo *vminfo);
-int gh_rm_vm_start(int vmid);
+int ghd_rm_vm_start(int vmid);
 enum gh_vm_names gh_get_image_name(const char *str);
 enum gh_vm_names gh_get_vm_name(const char *str);
-int gh_rm_vm_stop(gh_vmid_t vmid, u32 stop_reason, u8 flags);
-int gh_rm_vm_reset(gh_vmid_t vmid);
+int gh_rm_get_this_vmid(gh_vmid_t *vmid);
+int ghd_rm_vm_stop(gh_vmid_t vmid, u32 stop_reason, u8 flags);
+int ghd_rm_vm_reset(gh_vmid_t vmid);
 
 /* Client APIs for VM query */
 int gh_rm_populate_hyp_res(gh_vmid_t vmid, const char *vm_name);
 int gh_rm_unpopulate_hyp_res(gh_vmid_t vmid, const char *vm_name);
 
+/* Client APIs for VM Services */
 struct gh_vm_status *gh_rm_vm_get_status(gh_vmid_t vmid);
 int gh_rm_vm_set_status(struct gh_vm_status gh_vm_status);
 int gh_rm_vm_set_vm_status(u8 vm_status);
@@ -358,18 +403,18 @@ int gh_rm_mem_qcom_lookup_sgl(u8 mem_type, gh_label_t label,
 			      struct gh_mem_attr_desc *mem_attr_desc,
 			      gh_memparcel_handle_t *handle);
 int gh_rm_mem_release(gh_memparcel_handle_t handle, u8 flags);
-int gh_rm_mem_reclaim(gh_memparcel_handle_t handle, u8 flags);
+int ghd_rm_mem_reclaim(gh_memparcel_handle_t handle, u8 flags);
 struct gh_sgl_desc *gh_rm_mem_accept(gh_memparcel_handle_t handle, u8 mem_type,
-				     u8 trans_type, u8 flags, gh_label_t label,
+				     u8 trans_type, u32 flags, gh_label_t label,
 				     struct gh_acl_desc *acl_desc,
 				     struct gh_sgl_desc *sgl_desc,
 				     struct gh_mem_attr_desc *mem_attr_desc,
 				     u16 map_vmid);
-int gh_rm_mem_share(u8 mem_type, u8 flags, gh_label_t label,
+int ghd_rm_mem_share(u8 mem_type, u8 flags, gh_label_t label,
 		    struct gh_acl_desc *acl_desc, struct gh_sgl_desc *sgl_desc,
 		    struct gh_mem_attr_desc *mem_attr_desc,
 		    gh_memparcel_handle_t *handle);
-int gh_rm_mem_lend(u8 mem_type, u8 flags, gh_label_t label,
+int ghd_rm_mem_lend(u8 mem_type, u8 flags, gh_label_t label,
 		   struct gh_acl_desc *acl_desc, struct gh_sgl_desc *sgl_desc,
 		   struct gh_mem_attr_desc *mem_attr_desc,
 		   gh_memparcel_handle_t *handle);
@@ -380,7 +425,26 @@ int gh_rm_mem_donate(u8 mem_type, u8 flags, gh_label_t label,
 int gh_rm_mem_notify(gh_memparcel_handle_t handle, u8 flags,
 		     gh_label_t mem_info_tag,
 		     struct gh_notify_vmid_desc *vmid_desc);
+int gh_rm_ipa_reserve(u64 size, u64 align, struct range limits, u32 generic_constraints,
+		      u32 platform_constraints, u64 *ipa);
 
+/* API to set time base */
+int gh_rm_vm_set_time_base(gh_vmid_t vmid);
+
+/* API to set debug */
+int gh_rm_vm_set_debug(gh_vmid_t vmid);
+
+/* API for minidump support */
+int gh_rm_minidump_get_info(void);
+int gh_rm_minidump_register_range(phys_addr_t base_ipa, size_t region_size,
+				  const char *name, size_t name_size);
+int gh_rm_minidump_deregister_slot(uint16_t slot_num);
+int gh_rm_minidump_get_slot_from_name(uint16_t starting_slot, const char *name,
+				      size_t name_size);
+bool gh_rm_needs_scm_assign(u64 *src, const struct qcom_scm_vmperm *newvm,
+				unsigned int dest_cnt);
+bool gh_rm_needs_hyp_assign(u32 *src_vm_list, int source_nelems,
+				int *dst_vm_list, int dst_nelems);
 #else
 /* RM client register notifications APIs */
 static inline int gh_rm_register_notifier(struct notifier_block *nb)
@@ -457,7 +521,30 @@ static inline int gh_rm_vm_dealloc_vmid(gh_vmid_t vmid)
 	return -EINVAL;
 }
 
-static inline int gh_rm_get_vmid(enum gh_vm_names vm_name, gh_vmid_t *vmid)
+static inline int gh_rm_vm_config_image(gh_vmid_t vmid, u16 auth_mech,
+		u32 mem_handle, u64 image_offset, u64 image_size,
+		u64 dtb_offset, u64 dtb_size)
+{
+	return -EINVAL;
+}
+
+static inline int gh_rm_vm_auth_image(gh_vmid_t vmid, ssize_t n_entries,
+				struct gh_vm_auth_param_entry *entry)
+{
+	return -EINVAL;
+}
+
+static inline bool gh_firmware_is_legacy(void)
+{
+	return false;
+}
+
+static inline int ghd_rm_vm_init(gh_vmid_t vmid)
+{
+	return -EINVAL;
+}
+
+static inline int ghd_rm_get_vmid(enum gh_vm_names vm_name, gh_vmid_t *vmid)
 {
 	return -EINVAL;
 }
@@ -467,12 +554,17 @@ static inline int gh_rm_get_vm_name(gh_vmid_t vmid, enum gh_vm_names *vm_name)
 	return -EINVAL;
 }
 
+static inline int gh_rm_get_this_vmid(gh_vmid_t *vmid)
+{
+	return -EINVAL;
+}
+
 static inline int gh_rm_get_vminfo(enum gh_vm_names vm_name, struct gh_vminfo *vminfo)
 {
 	return -EINVAL;
 }
 
-static inline int gh_rm_vm_start(int vmid)
+static inline int ghd_rm_vm_start(int vmid)
 {
 	return -EINVAL;
 }
@@ -482,18 +574,23 @@ static inline int gh_rm_get_vm_id_info(gh_vmid_t vmid)
 	return -EINVAL;
 }
 
-static inline int gh_rm_vm_stop(gh_vmid_t vmid, u32 stop_reason, u8 flags)
+static inline int ghd_rm_vm_stop(gh_vmid_t vmid, u32 stop_reason, u8 flags)
 {
 	return -EINVAL;
 }
 
-static inline int gh_rm_vm_reset(gh_vmid_t vmid)
+static inline int ghd_rm_vm_reset(gh_vmid_t vmid)
 {
 	return -EINVAL;
 }
 
 /* Client APIs for VM query */
 static inline int gh_rm_populate_hyp_res(gh_vmid_t vmid, const char *vm_name)
+{
+	return -EINVAL;
+}
+
+static inline int gh_rm_unpopulate_hyp_res(gh_vmid_t vmid, const char *vm_name)
 {
 	return -EINVAL;
 }
@@ -559,14 +656,14 @@ static inline int gh_rm_mem_release(gh_memparcel_handle_t handle, u8 flags)
 	return -EINVAL;
 }
 
-static inline int gh_rm_mem_reclaim(gh_memparcel_handle_t handle, u8 flags)
+static inline int ghd_rm_mem_reclaim(gh_memparcel_handle_t handle, u8 flags)
 {
 	return -EINVAL;
 }
 
 static inline struct gh_sgl_desc *gh_rm_mem_accept(gh_memparcel_handle_t handle,
 				     u8 mem_type,
-				     u8 trans_type, u8 flags, gh_label_t label,
+				     u8 trans_type, u32 flags, gh_label_t label,
 				     struct gh_acl_desc *acl_desc,
 				     struct gh_sgl_desc *sgl_desc,
 				     struct gh_mem_attr_desc *mem_attr_desc,
@@ -575,7 +672,7 @@ static inline struct gh_sgl_desc *gh_rm_mem_accept(gh_memparcel_handle_t handle,
 	return ERR_PTR(-EINVAL);
 }
 
-static inline int gh_rm_mem_share(u8 mem_type, u8 flags, gh_label_t label,
+static inline int ghd_rm_mem_share(u8 mem_type, u8 flags, gh_label_t label,
 		    struct gh_acl_desc *acl_desc, struct gh_sgl_desc *sgl_desc,
 		    struct gh_mem_attr_desc *mem_attr_desc,
 		    gh_memparcel_handle_t *handle)
@@ -583,7 +680,15 @@ static inline int gh_rm_mem_share(u8 mem_type, u8 flags, gh_label_t label,
 	return -EINVAL;
 }
 
-static inline int gh_rm_mem_lend(u8 mem_type, u8 flags, gh_label_t label,
+static inline int ghd_rm_mem_lend(u8 mem_type, u8 flags, gh_label_t label,
+		   struct gh_acl_desc *acl_desc, struct gh_sgl_desc *sgl_desc,
+		   struct gh_mem_attr_desc *mem_attr_desc,
+		   gh_memparcel_handle_t *handle)
+{
+	return -EINVAL;
+}
+
+static inline int gh_rm_mem_donate(u8 mem_type, u8 flags, gh_label_t label,
 		   struct gh_acl_desc *acl_desc, struct gh_sgl_desc *sgl_desc,
 		   struct gh_mem_attr_desc *mem_attr_desc,
 		   gh_memparcel_handle_t *handle)
@@ -608,6 +713,11 @@ static inline void gh_rm_unset_virtio_mmio_cb(void)
 
 }
 
+static inline int gh_rm_set_wdog_manage_cb(gh_wdog_manage_cb_t fnptr)
+{
+	return -EINVAL;
+}
+
 static inline int gh_rm_set_vcpu_affinity_cb(gh_vcpu_affinity_set_cb_t fnptr)
 {
 	return -EINVAL;
@@ -626,6 +736,66 @@ static inline int gh_rm_set_vpm_grp_cb(gh_vpm_grp_set_cb_t fnptr)
 static inline int gh_rm_reset_vpm_grp_cb(gh_vpm_grp_reset_cb_t fnptr)
 {
 	return -EINVAL;
+}
+
+static inline int gh_rm_all_res_populated_cb(gh_all_res_populated_cb_t fnptr)
+{
+	return -EINVAL;
+}
+
+/* API to set time base */
+static inline int gh_rm_vm_set_time_base(gh_vmid_t vmid)
+{
+	return -EINVAL;
+}
+
+/* API to set debug */
+static inline int gh_rm_vm_set_debug(gh_vmid_t vmid)
+{
+	return -EINVAL;
+}
+
+/* API for minidump support */
+static inline int gh_rm_minidump_get_info(void)
+{
+	return -EINVAL;
+}
+
+static inline int gh_rm_minidump_register_range(phys_addr_t base_ipa,
+					 size_t region_size, const char *name,
+					 size_t name_size)
+{
+	return -EINVAL;
+}
+
+static inline int gh_rm_minidump_deregister_slot(uint16_t slot_num)
+{
+	return -EINVAL;
+}
+
+static inline int gh_rm_minidump_get_slot_from_name(uint16_t starting_slot,
+						    const char *name,
+						    size_t name_size)
+{
+	return -EINVAL;
+}
+
+static inline int gh_rm_ipa_reserve(u64 size, u64 align, struct range limits,
+				    u32 generic_constraints, u32 platform_constraints,
+				    u64 *ipa)
+{
+	return -EINVAL;
+}
+
+static inline bool gh_rm_needs_scm_assign(u64 *src, const struct qcom_scm_vmperm *newvm,
+				unsigned int dest_cnt)
+{
+	return true;
+}
+static inline bool gh_rm_needs_hyp_assign(u32 *src_vm_list, int source_nelems,
+				int *dst_vm_list, int dst_nelems)
+{
+	return true;
 }
 #endif
 #endif

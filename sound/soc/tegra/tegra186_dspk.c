@@ -327,7 +327,7 @@ static struct snd_soc_dai_driver tegra186_dspk_dais[] = {
 			   SNDRV_PCM_FMTBIT_S32_LE,
 	    },
 	    .ops = &tegra186_dspk_dai_ops,
-	    .symmetric_rates = 1,
+	    .symmetric_rate = 1,
 	},
 };
 
@@ -422,7 +422,7 @@ static bool tegra186_dspk_wr_reg(struct device *dev, unsigned int reg)
 		return true;
 	default:
 		return false;
-	};
+	}
 }
 
 static bool tegra186_dspk_rd_reg(struct device *dev, unsigned int reg)
@@ -438,7 +438,7 @@ static bool tegra186_dspk_rd_reg(struct device *dev, unsigned int reg)
 		return true;
 	default:
 		return false;
-	};
+	}
 }
 
 static bool tegra186_dspk_volatile_reg(struct device *dev, unsigned int reg)
@@ -451,7 +451,7 @@ static bool tegra186_dspk_volatile_reg(struct device *dev, unsigned int reg)
 		return true;
 	default:
 		return false;
-	};
+	}
 }
 
 static const struct regmap_config tegra186_dspk_regmap = {
@@ -523,11 +523,9 @@ static int tegra186_dspk_platform_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int tegra186_dspk_platform_remove(struct platform_device *pdev)
+static void tegra186_dspk_platform_remove(struct platform_device *pdev)
 {
 	pm_runtime_disable(&pdev->dev);
-
-	return 0;
 }
 
 static const struct dev_pm_ops tegra186_dspk_pm_ops = {
@@ -544,7 +542,7 @@ static struct platform_driver tegra186_dspk_driver = {
 		.pm = &tegra186_dspk_pm_ops,
 	},
 	.probe = tegra186_dspk_platform_probe,
-	.remove = tegra186_dspk_platform_remove,
+	.remove_new = tegra186_dspk_platform_remove,
 };
 module_platform_driver(tegra186_dspk_driver);
 

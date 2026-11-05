@@ -2,7 +2,8 @@
 /*
  * SCMI Vendor Protocols header
  *
- * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef _SCMI_PLH_VENDOR_H
@@ -12,26 +13,25 @@
 #include <linux/device.h>
 #include <linux/types.h>
 
-
 #define SCMI_PROTOCOL_PLH      0x81
 
 enum plh_features {
 	PERF_LOCK_SCROLL,
 	PERF_LOCK_LAUNCH,
-	PERF_LOCK_DRAG
 };
 
 struct scmi_protocol_handle;
+extern struct scmi_device *get_plh_scmi_device(void);
 
 /**
  * struct scmi_plh_vendor_ops - represents the various operations provided
  *	by SCMI PLH Protocol
  *
- * @init_plh_ipc_freq_tbl: initialize plh ipc freq voting table in rimps
- * @start_plh: starts plh in rimps
- * @stop_plh: stops plh in rimps
- * @set_plh_sample_ms: configure the sampling duration of plh in rimps
- * @set_plh_log_level: configure the supported log_level of plh in rimps
+ * @init_plh_ipc_freq_tbl: initialize plh ipc freq voting table in cpucp
+ * @start_plh: starts plh in cpucp
+ * @stop_plh: stops plh in cpucp
+ * @set_plh_sample_ms: configure the sampling duration of plh in cpucp
+ * @set_plh_log_level: configure the supported log_level of plh in cpucp
  */
 struct scmi_plh_vendor_ops {
 	int (*init_plh_ipc_freq_tbl)(const struct scmi_protocol_handle *ph,

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  *
  */
 
@@ -17,6 +18,17 @@ enum gh_msgq_label {
 	GH_MSGQ_LABEL_MEMBUF,
 	GH_MSGQ_LABEL_DISPLAY,
 	GH_MSGQ_LABEL_VSOCK,
+	GH_MSGQ_LABEL_TEST_TUIVM,
+	GH_MSGQ_LABEL_TEST_OEMVM,
+	GH_MSGQ_LABEL_MMRM,
+	GH_MSGQ_LABEL_EVA,
+	GH_MSGQ_VCPU_SCHED_TEST,
+	GH_MSGQ_VCPU_SCHED_TEST_OEMVM,
+	GH_MSGQ_LABEL_SMMU_PROXY,
+	GH_MSGQ_LABEL_RESOURCE_REQUEST,
+	GH_MSGQ_LABEL_MEMBUF_OEMVM,
+	GH_MSGQ_LABEL_DMABUF_TEST_TUIVM,
+	GH_MSGQ_LABEL_DMABUF_TEST_OEMVM,
 	GH_MSGQ_LABEL_MAX
 };
 
@@ -35,6 +47,9 @@ int gh_msgq_unregister(void *msgq_client_desc);
 int gh_msgq_send(void *msgq_client_desc,
 			void *buff, size_t size, unsigned long flags);
 int gh_msgq_recv(void *msgq_client_desc,
+			void *buff, size_t buff_size,
+			size_t *recv_size, unsigned long flags);
+int gh_msgq_recv_killable(void *msgq_client_desc,
 			void *buff, size_t buff_size,
 			size_t *recv_size, unsigned long flags);
 
@@ -60,6 +75,13 @@ static inline int gh_msgq_send(void *msgq_client_desc,
 }
 
 static inline int gh_msgq_recv(void *msgq_client_desc,
+			void *buff, size_t buff_size,
+			size_t *recv_size, unsigned long flags)
+{
+	return -EINVAL;
+}
+
+static inline int gh_msgq_recv_killable(void *msgq_client_desc,
 			void *buff, size_t buff_size,
 			size_t *recv_size, unsigned long flags)
 {

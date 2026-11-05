@@ -210,13 +210,13 @@ static const struct sysfs_ops bwprof_sysfs_ops = {
 	.store	= attr_store,
 };
 
-static struct kobj_type bwprof_ktype = {
+static const struct kobj_type bwprof_ktype = {
 	.sysfs_ops	= &bwprof_sysfs_ops,
 	.default_attrs	= bwprof_attr,
 
 };
 
-static struct kobj_type mon_ktype = {
+static const struct kobj_type mon_ktype = {
 	.sysfs_ops	= &bwprof_sysfs_ops,
 	.default_attrs	= mon_attr,
 

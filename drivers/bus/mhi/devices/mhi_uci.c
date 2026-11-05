@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.*/
+// Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
 
 #include <linux/cdev.h>
 #include <linux/device.h>
@@ -791,7 +791,7 @@ static int mhi_uci_init(void)
 		return ret;
 
 	mhi_uci_drv.major = ret;
-	mhi_uci_drv.class = class_create(THIS_MODULE, MHI_UCI_DRIVER_NAME);
+	mhi_uci_drv.class = class_create(MHI_UCI_DRIVER_NAME);
 	if (IS_ERR(mhi_uci_drv.class))
 		return -ENODEV;
 
@@ -820,6 +820,6 @@ static void __exit mhi_uci_exit(void)
 }
 module_exit(mhi_uci_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_ALIAS("MHI_UCI");
 MODULE_DESCRIPTION("MHI UCI Driver");

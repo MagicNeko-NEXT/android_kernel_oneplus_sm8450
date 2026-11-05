@@ -40,6 +40,12 @@ static const struct k3_soc_id {
 	{ 0xBB5A, "AM65X" },
 	{ 0xBB64, "J721E" },
 	{ 0xBB6D, "J7200" },
+	{ 0xBB38, "AM64X" },
+	{ 0xBB75, "J721S2"},
+	{ 0xBB7E, "AM62X" },
+	{ 0xBB80, "J784S4" },
+	{ 0xBB8D, "AM62AX" },
+	{ 0xBB9D, "AM62PX" },
 };
 
 static int
@@ -81,7 +87,7 @@ static int k3_chipinfo_probe(struct platform_device *pdev)
 	if (IS_ERR(base))
 		return PTR_ERR(base);
 
-	regmap = regmap_init_mmio(dev, base, &k3_chipinfo_regmap_cfg);
+	regmap = devm_regmap_init_mmio(dev, base, &k3_chipinfo_regmap_cfg);
 	if (IS_ERR(regmap))
 		return PTR_ERR(regmap);
 

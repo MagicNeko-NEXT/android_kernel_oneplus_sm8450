@@ -45,17 +45,17 @@ config CPU_IDLE_GOV_HALTPOLL
 	  Some virtualized workloads benefit from using it.
 
 config CPU_IDLE_GOV_QCOM_LPM
-	tristate "Qualcomm Technologies, Inc. CPU and Cluster governor"
-	depends on ARCH_QCOM
-	depends on ARM_PSCI_CPUIDLE
-	help
-	  This governor implements effective cpu and cluster idle state
-	  selection with help of scheduler inputs, cpu idle state prediction
-	  and cluster idle state prediction algorithms.
+    tristate "Qualcomm Technologies, Inc. CPU and Cluster governor"
+    depends on ARCH_QCOM
+    depends on ARM_PSCI_CPUIDLE
+    help
+      This governor implements effective cpu and cluster idle state
+      selection with help of scheduler inputs, cpu idle state prediction
+      and cluster idle state prediction algorithms.
 
-	  The predicted sleep time, latency requirement for the
-	  CPU and the idle state chosen based on the parameters are all
-	  logged in the trace.
+      The predicted sleep time, latency requirement for the
+      CPU and the idle state chosen based on the parameters are all
+      logged in the trace.
 
 config CPU_IDLE_SIMPLE_GOV_QCOM_LPM
 	tristate "Qualcomm Technologies, Inc. CPU and Cluster simple governor"
@@ -69,6 +69,10 @@ config CPU_IDLE_SIMPLE_GOV_QCOM_LPM
 	  allow or restrict particular Idle state more aggressively.
 
 config DT_IDLE_STATES
+	bool
+
+config DT_IDLE_GENPD
+	depends on PM_GENERIC_DOMAINS_OF
 	bool
 
 menu "ARM CPU Idle Drivers"
@@ -86,9 +90,15 @@ depends on PPC
 source "drivers/cpuidle/Kconfig.powerpc"
 endmenu
 
+menu "RISC-V CPU Idle Drivers"
+depends on RISCV
+source "drivers/cpuidle/Kconfig.riscv"
+endmenu
+
 config HALTPOLL_CPUIDLE
 	tristate "Halt poll cpuidle driver"
 	depends on X86 && KVM_GUEST
+	select CPU_IDLE_GOV_HALTPOLL
 	default y
 	help
 	 This option enables halt poll cpuidle driver, which allows to poll

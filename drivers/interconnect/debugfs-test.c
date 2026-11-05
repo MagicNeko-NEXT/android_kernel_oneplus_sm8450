@@ -110,6 +110,6 @@ static int __init icc_test_init(void)
 
 module_init(icc_test_init);
 module_exit(icc_test_exit);
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 
 #endif

@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (c) 2015-2021, The Linux Foundation. All rights reserved.*/
-/* Copyright (c) 2024-2025 Qualcomm Innovation Center, Inc. All rights reserved.*/
+//Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
 
 #ifndef __MHI_H
 #define __MHI_H
@@ -8,8 +7,8 @@
 #include <linux/msm_ep_pcie.h>
 #include <linux/ipc_logging.h>
 #include <linux/msm_mhi_dev.h>
-#include <linux/sched.h>
-#include <linux/smp.h>
+#include <linux/mhi_dma.h>
+
 
 /**
  * MHI control data structures alloted by the host, including
@@ -58,6 +57,7 @@ enum mhi_dev_ring_element_type_id {
 	MHI_DEV_RING_EL_CMD_COMPLETION_EVT = 33,
 	MHI_DEV_RING_EL_TRANSFER_COMPLETION_EVENT = 34,
 	MHI_DEV_RING_EL_EE_STATE_CHANGE_NOTIFY = 64,
+	MHI_DEV_RING_EL_CH_STATE_CHANGE_NOTIFY = 65,
 	MHI_DEV_RING_EL_UNDEF
 };
 
@@ -123,8 +123,8 @@ struct mhi_dev_gen_ctx {
 /* Transfer ring element */
 struct mhi_dev_transfer_ring_element {
 	uint64_t				data_buf_ptr;
-	uint32_t				len:24;
-	uint32_t				res1:8;
+	uint32_t				len:16;
+	uint32_t				res1:16;
 	uint32_t				chain:1;
 	uint32_t				res2:7;
 	uint32_t				ieob:1;
@@ -188,7 +188,8 @@ enum mhi_dev_cmd_completion_code {
 /* Transfer completion event */
 struct mhi_dev_event_ring_transfer_completion {
 	uint64_t				ptr;
-	uint32_t				len:24;
+	uint32_t				len:16;
+	uint32_t				res1:8;
 	enum mhi_dev_cmd_completion_code	code:8;
 	uint32_t				res2:16;
 	enum mhi_dev_ring_element_type_id	type:8;
@@ -232,6 +233,14 @@ enum mhi_dev_execenv {
 	MHI_DEV_UNRESERVED
 };
 
+enum mhi_dev_channel_id {
+	IPA_CLIENT_MHI_PROD = 100,
+	IPA_CLIENT_MHI_CONS = 101,
+	IPA_CLIENT_MHI_DPL_CONS = 102,
+	IPA_CLIENT_MHI2_PROD = 105,
+	IPA_CLIENT_MHI2_CONS = 106,
+};
+
 /* EE state change event */
 struct mhi_dev_event_ring_ee_state_change {
 	uint64_t				ptr;
@@ -264,23 +273,17 @@ struct mhi_config {
 
 #define NUM_CHANNELS			128
 #define HW_CHANNEL_BASE			100
-#define NUM_HW_CHANNELS			15
-#define HW_CHANNEL_END			110
+#define NUM_HW_CHANNELS			28
+#define HW_CHANNEL_END			127
 #define MHI_ENV_VALUE			2
 #define MHI_MASK_ROWS_CH_EV_DB		4
 #define TRB_MAX_DATA_SIZE		8192
+#define TRB_MAX_DATA_SIZE_16K		16384
 #define MHI_CTRL_STATE			100
-#define MHI_CAP_ID_MASK			GENMASK(31, 24)
-#define MHI_NEXT_PTR_MASK		GENMASK(23, 12)
-#define TIME_CFG_OFFSET			4
-#define PER_CAPABILITY_OFFSET		0x10
-#define MAX_TRB_LEN_BITS		24
-#define MAX_TRB_LEN			((0x1 << MAX_TRB_LEN_BITS) - 1)
-#define MAX_TRB_LEN_CFG_OFFS		0x4
-
-/* Returns the offset from BAR address to the MHI register */
-#define MHI_BAR_OFFSET(x)		(x - 0x100)
-#define MHI_ABS_OFFSET(x)		(x + 0x100)
+#define MHI_MAX_NUM_INSTANCES		17 /* 1PF and 16 VFs */
+#define MHI_DEFAULT_ERROR_LOG_ID	255
+#define MHI_DEV_WAKE_DB_CHAN		127
+#define PCIE_EP_TIMER_US		10000000
 
 /* maximum transfer completion events buffer */
 #define NUM_TR_EVENTS_DEFAULT			128
@@ -336,12 +339,11 @@ struct mhi_meminfo {
 
 struct mhi_addr {
 	uint64_t	host_pa;
-	size_t	device_pa;
-	size_t	device_va;
+	uint64_t	device_pa;
+	uint64_t	device_va;
 	size_t		size;
 	dma_addr_t	phy_addr;
 	void		*virt_addr;
-	bool		use_ipa_dma;
 };
 
 struct mhi_interrupt_state {
@@ -376,15 +378,6 @@ enum mhi_dev_tr_compl_evt_type {
 enum mhi_dev_transfer_type {
 	MHI_DEV_DMA_SYNC,
 	MHI_DEV_DMA_ASYNC,
-};
-
-enum mhi_dev_cap_id {
-	MHI_DEV_INTX_CAP_ID = 1,
-	MHI_DEV_QTIMER_TIME_SYNC_CAP_ID,
-	MHI_DEV_BW_SCALE_CAP_ID,
-	MHI_DEV_TSC_TIME_SYNC_CAP_ID,
-	MHI_DEV_MAX_TRB_LEN_CAP_ID,
-	MHI_DEV_MHI_CAP_MAX_RES,
 };
 
 struct msi_buf_cb_data {
@@ -464,16 +457,11 @@ struct event_req {
 	u32			num_events;
 	dma_addr_t		dma;
 	u32			dma_len;
-	dma_addr_t		event_rd_dma;
 	void			*context;
 	enum mhi_dev_tr_compl_evt_type event_type;
-	u32			event_ring;
-	void			(*client_cb)(void *req);
-	void			(*rd_offset_cb)(void *req);
-	void			(*msi_cb)(void *req);
 	struct list_head	list;
 	u32			flush_num;
-	u32			snd_cmpl;
+	bool			snd_cmpl;
 	bool		is_cmd_cpl;
 	bool		is_stale;
 };
@@ -511,7 +499,7 @@ struct mhi_dev_channel {
 	uint32_t			evt_buf_size;
 	/*
 	 * Pointer to a block of event request structs used to temporarily
-	 * store completion events and meta data before sending them to host
+	 * store completion events and data before sending them to host
 	 */
 	struct event_req		*ereqs;
 	/* Linked list head for event request structs */
@@ -539,39 +527,22 @@ struct mhi_dev_channel {
 	bool				reset_pending;
 };
 
-/* Structure for mhi device operations */
-struct mhi_dev_ops {
-	int	(*register_state_cb)(void (*mhi_state_cb)
-			(struct mhi_dev_client_cb_data *cb_data),
-			void *data, enum mhi_client_channel channel);
-	int	(*ctrl_state_info)(uint32_t idx, uint32_t *info);
-	int	(*open_channel)(uint32_t chan_id,
-			struct mhi_dev_client **handle,
-			void (*mhi_dev_client_cb_reason)
-				(struct mhi_dev_client_cb_reason *cb));
-	void	(*close_channel)(struct mhi_dev_client *handle);
-	int	(*write_channel)(struct mhi_req *mreq);
-	int	(*read_channel)(struct mhi_req *mreq);
-	int	(*is_channel_empty)(struct mhi_dev_client *handle);
-	bool	(*channel_write_pending)(struct mhi_dev_client *handle);
-};
-
 /* Structure device for mhi dev */
 struct mhi_dev {
-	struct platform_device		*pdev;
-	struct device			*dev;
+	/*MHI device details*/
+	struct mhi_dma_function_params mhi_dma_fun_params;
+
 	/* MHI MMIO related members */
 	phys_addr_t			mmio_base_pa_addr;
 	void				*mmio_base_addr;
-	phys_addr_t			ipa_uc_mbox_crdb;
-	phys_addr_t			ipa_uc_mbox_erdb;
+	phys_addr_t			mhi_dma_uc_mbox_crdb;
+	phys_addr_t			mhi_dma_uc_mbox_erdb;
 
 	uint32_t			*mmio_backup;
 	struct mhi_config		cfg;
 	u32				msi_data;
 	u32				msi_lower;
 	spinlock_t			msi_lock;
-	bool				mmio_initialized;
 
 	spinlock_t			lock;
 	/* Host control base information */
@@ -588,9 +559,9 @@ struct mhi_dev {
 	struct mhi_addr			cmd_ctx_shadow;
 	struct mhi_dev_ch_ctx		*cmd_ctx_cache;
 	dma_addr_t			cmd_ctx_cache_dma_handle;
-	struct mhi_dev_ring		*ring;
+	struct mhi_dev_ring		**ring;
 	int				mhi_irq;
-	struct mhi_dev_channel		*ch;
+	struct mhi_dev_channel		**ch;
 	struct mhi_cmd_cmpl_ctx			*cmd_ctx;
 
 	int				ctrl_int;
@@ -616,48 +587,37 @@ struct mhi_dev {
 	size_t			ev_ring_start;
 	size_t			ch_ring_start;
 
-	/* IPA Handles */
-	u32				ipa_clnt_hndl[NUM_HW_CHANNELS];
+	/* MHI DMA Handles */
+	u32				dma_clnt_hndl[NUM_HW_CHANNELS];
 	struct workqueue_struct		*ring_init_wq;
 	struct work_struct		ring_init_cb_work;
 	struct work_struct		re_init;
-
-	/* EP PCIe registration */
-	struct workqueue_struct		*pcie_event_wq;
-	struct ep_pcie_register_event	event_reg;
-	u32                             ifc_id;
-	struct ep_pcie_hw               *phandle;
-	struct work_struct		pcie_event;
 
 	atomic_t			write_active;
 	atomic_t			is_suspended;
 	atomic_t			mhi_dev_wake;
 	atomic_t			re_init_done;
 	struct mutex			mhi_write_test;
-	u32				device_local_pa_base;
+	u64				device_local_pa_base;
 	u32				mhi_ep_msi_num;
 	u32				mhi_version;
-	void				*dma_cache;
-	void				*read_handle;
-	void				*write_handle;
+	u32				mhi_chan_hw_base;
+	u32				mhi_num_ipc_pages_dev_fac;
 	/* Physical scratch buffer for writing control data to the host */
-	dma_addr_t			cache_dma_handle;
-	/*
-	 * Physical scratch buffer address used when picking host data
-	 * from the host used in mhi_read()
-	 */
-	dma_addr_t			read_dma_handle;
-	/*
-	 * Physical scratch buffer address used when writing to the host
-	 * region from device used in mhi_write()
-	 */
-	dma_addr_t			write_dma_handle;
-
-	/* Use IPA DMA for Software channel data transfer */
-	bool				use_ipa;
+	bool				mhi_dma_ready;
 
 	/* Use  PCI eDMA for data transfer */
 	bool				use_edma;
+
+	/* Use  MHI DMA for Software channel data transfer */
+	bool				use_mhi_dma;
+
+	/* Denotes if the MHI instance is physcial or virtual */
+	bool				is_mhi_pf;
+
+	bool				is_flashless;
+
+	bool				mhi_has_smmu;
 
 	/* iATU is required to map control and data region */
 	bool				config_iatu;
@@ -675,14 +635,28 @@ struct mhi_dev {
 	/* Enable M2 autonomous mode from MHI */
 	bool				enable_m2;
 
+	/* Status of device wake doorbell */
+	bool				wake_db_status;
+
 	/* Dont timeout waiting for M0 */
 	bool				no_m0_timeout;
 
+	bool				stop_polling_m0;
+	bool				msi_disable;
+
 	/* Registered client callback list */
 	struct list_head		client_cb_list;
-	/* Tx, Rx DMA channels */
-	struct dma_chan			*tx_dma_chan;
-	struct dma_chan			*rx_dma_chan;
+
+	/* EP PCIe registration */
+	struct workqueue_struct		*pcie_event_wq;
+	struct work_struct		pcie_event;
+
+	struct mhi_dev_ctx		*mhi_hw_ctx;
+	struct mhi_sm_dev		*mhi_sm_ctx;
+	/* MHI VF number */
+	uint32_t			vf_id;
+
+	bool				no_path_from_ipa_to_pcie;
 
 	int (*device_to_host)(uint64_t dst_pa, void *src, uint32_t len,
 				struct mhi_dev *mhi, struct mhi_req *req);
@@ -696,10 +670,33 @@ struct mhi_dev {
 
 	void (*read_from_host)(struct mhi_dev *mhi,
 				struct mhi_addr *mhi_transfer);
-
-	struct kobj_uevent_env		kobj_env;
 };
 
+/* Structure device for mhi dev */
+struct mhi_dev_ctx {
+	struct platform_device		*pdev;
+	struct device			*dev;
+
+	struct ep_pcie_register_event	event_reg;
+	u32				ifc_id;
+	struct ep_pcie_hw		*phandle;
+
+	struct mhi_dev			*mhi_dev[MHI_MAX_NUM_INSTANCES];
+
+	/* Tx, Rx DMA channels */
+	struct dma_chan			*tx_dma_chan;
+	struct dma_chan			*rx_dma_chan;
+
+	struct ep_pcie_notify		*notify;
+	struct mhi_dma_ops		mhi_dma_fun_ops;
+	struct ep_pcie_cap		ep_cap;
+};
+
+enum mhi_id {
+	MHI_DEV_PHY_FUN,
+	MHI_DEV_VIRT_0,
+	MHI_DEV_VIRT_1,
+};
 
 enum mhi_msg_level {
 	MHI_MSG_VERBOSE = 0x0,
@@ -711,28 +708,62 @@ enum mhi_msg_level {
 	MHI_MSG_reserved = 0x80000000
 };
 
+
+/* Structure for mhi device operations */
+struct mhi_dev_ops {
+	int	(*register_state_cb)(void (*mhi_state_cb)
+			(struct mhi_dev_client_cb_data *cb_data),
+			void *data, enum mhi_client_channel channel, uint32_t vf_id);
+	int	(*ctrl_state_info)(uint32_t vf_id, uint32_t idx, uint32_t *info);
+	int	(*open_channel)(uint32_t vf_id, uint32_t chan_id,
+			struct mhi_dev_client **handle,
+			void (*mhi_dev_client_cb_reason)
+				(struct mhi_dev_client_cb_reason *cb));
+	void	(*close_channel)(struct mhi_dev_client *handle);
+	int	(*write_channel)(struct mhi_req *mreq);
+	int	(*read_channel)(struct mhi_req *mreq);
+	int	(*is_channel_empty)(struct mhi_dev_client *handle);
+};
+
 extern uint32_t bhi_imgtxdb;
 extern enum mhi_msg_level mhi_msg_lvl;
 extern enum mhi_msg_level mhi_ipc_msg_lvl;
-extern void *mhi_ipc_log;
+extern enum mhi_msg_level mhi_ipc_err_msg_lvl;
+extern void *mhi_ipc_err_log;
+extern void *mhi_ipc_vf_log[MHI_MAX_NUM_INSTANCES];
+extern void *mhi_ipc_default_err_log;
 
-#define mhi_log(_msg_lvl, _msg, ...) do { \
+#define mhi_log(vf_id, _msg_lvl, _msg, ...) do { \
 	if (_msg_lvl >= mhi_msg_lvl) { \
-		pr_err("[0x%x %s][CPU:%d][%s] "_msg, bhi_imgtxdb, \
-				__func__, smp_processor_id(), current->comm, ##__VA_ARGS__);\
+		pr_err_ratelimited("[0x%x %s] "_msg, bhi_imgtxdb, \
+				__func__, ##__VA_ARGS__); \
 	} \
-	if (mhi_ipc_log && (_msg_lvl >= mhi_ipc_msg_lvl)) { \
-		ipc_log_string(mhi_ipc_log,                     \
-		"[0x%x %s][CPU:%d][%s] " _msg, bhi_imgtxdb, __func__,\
-		smp_processor_id(), current->comm, ##__VA_ARGS__);\
+	if (vf_id < MHI_MAX_NUM_INSTANCES && mhi_ipc_vf_log[vf_id] &&    \
+			(_msg_lvl >= mhi_ipc_msg_lvl)) { \
+		ipc_log_string(mhi_ipc_vf_log[vf_id],                     \
+		"[0x%x %s] " _msg, bhi_imgtxdb, __func__, ##__VA_ARGS__); \
+	} \
+	if (vf_id == MHI_DEFAULT_ERROR_LOG_ID && mhi_ipc_default_err_log &&       \
+			(_msg_lvl >= mhi_ipc_err_msg_lvl)) { \
+		ipc_log_string(mhi_ipc_default_err_log,                     \
+		"[0x%x %s] " _msg, bhi_imgtxdb, __func__, ##__VA_ARGS__); \
+	} \
+	else if (mhi_ipc_err_log && (_msg_lvl >= mhi_ipc_err_msg_lvl)) { \
+		if (vf_id == 0) {				\
+			ipc_log_string(mhi_ipc_err_log,			\
+			"[0x%x %s] PF = %x  " _msg, bhi_imgtxdb, __func__, vf_id, ##__VA_ARGS__); \
+		} \
+		if (vf_id != 0) { \
+			ipc_log_string(mhi_ipc_err_log,                 \
+			"[0x%x %s] VF = %x  " _msg, bhi_imgtxdb, __func__, vf_id, ##__VA_ARGS__); \
+		} \
 	} \
 } while (0)
-
 
 /* Use ID 0 for legacy /dev/mhi_ctrl. Channel 0 used for internal only */
 #define MHI_DEV_UEVENT_CTRL	0
 
-#define MHI_USE_DMA(mhi) (mhi->use_ipa || mhi->use_edma)
+#define MHI_USE_DMA(mhi) (mhi->use_mhi_dma || mhi->use_edma)
 
 struct mhi_dev_uevent_info {
 	enum mhi_client_channel	channel;
@@ -778,7 +809,7 @@ int mhi_ring_start(struct mhi_dev_ring *ring,
 /**
  * mhi_dev_cache_ring() - Cache the data for the corresponding ring locally.
  * @ring:	Ring for the respective context - Channel/Event/Command.
- * @wr_offset:	Cache the TRE's upto the write offset value.
+ * @wr_offset:	Cache the TRE's up to the write offset value.
  */
 int mhi_dev_cache_ring(struct mhi_dev_ring *ring, size_t wr_offset);
 
@@ -1084,36 +1115,6 @@ int mhi_dev_mmio_get_mhi_state(struct mhi_dev *dev, enum mhi_dev_state *state,
 int mhi_dev_mmio_init(struct mhi_dev *dev);
 
 /**
- * mhi_dev_is_cap_populated - If MISCOFF register contains expected value,
- * capabilities are already exposed by the bootloader. Otherwise, HLOS should
- * program the needed capabilities. This implementation is based on the fact
- * that Qtimer capability is present on all the targets as the first capability.
- *
- * @dev:	MHI Dev structure.
- * @mhi_first_cap_offs: First capability offset
- * @cap_id:	Capability ID.
- */
-bool mhi_dev_is_cap_populated(struct mhi_dev *dev, u32 mhi_first_cap_offs,
-			      enum mhi_dev_cap_id cap_id);
-
-/**
- * mhi_dev_configure_time_sync_cap - Configure timesync capability, if not
- * programmed by bootloader
- *
- * @dev:	MHI Dev structure.
- * @mhi_first_cap_offs: First capability offset
- */
-void mhi_dev_configure_time_sync_cap(struct mhi_dev *dev, u32 mhi_first_cap_offs);
-
-/**
- * mhi_dev_configure_max_trb_len - Configure max TRB length, if not programmed
- * by PBL.
- *
- * @dev:	MHI Dev structure.
- */
-void mhi_dev_configure_max_trb_len(struct mhi_dev *dev);
-
-/**
  * mhi_dev_update_ner() - Update the number of event rings (NER) programmed by
  *		the host.
  * @dev:	MHI device structure.
@@ -1176,6 +1177,13 @@ int mhi_dev_syserr(struct mhi_dev *mhi);
 int mhi_dev_suspend(struct mhi_dev *mhi);
 
 /**
+ * mhi_channel_error_notif() - Send state change event to the host for channel e
+				error notification
+ * @dev:	MHI device structure.
+ */
+int mhi_channel_error_notif(struct mhi_dev *mhi);
+
+/**
  * mhi_dev_resume() - MHI device resume to update the channel state to running.
  * @dev:	MHI device structure.
  */
@@ -1190,7 +1198,7 @@ int mhi_dev_trigger_hw_acc_wakeup(struct mhi_dev *mhi);
 
 /**
  * mhi_pcie_config_db_routing() - Configure Doorbell for Event and Channel
- *		context with IPA when performing a MHI resume.
+ *		context with MHI DMA when performing a MHI resume.
  * @dev:	MHI device structure.
  */
 int mhi_pcie_config_db_routing(struct mhi_dev *mhi);
@@ -1200,15 +1208,7 @@ int mhi_pcie_config_db_routing(struct mhi_dev *mhi);
  *		exposes device nodes for the supported MHI software
  *		channels.
  */
-int mhi_uci_init(struct mhi_dev_ops *dev_ops);
-
-/**
- * mhi_dev_net_interface_init() - Initializes the mhi device network interface
- *		which exposes the virtual network interface (mhi_dev_net0).
- *		data packets will transfer between MHI host interface (mhi_swip)
- *		and mhi_dev_net interface using software path
- */
-int mhi_dev_net_interface_init(struct mhi_dev_ops *dev_ops);
+int mhi_uci_init(void);
 
 void mhi_dev_notify_a7_event(struct mhi_dev *mhi);
 
@@ -1226,11 +1226,40 @@ void mhi_uci_chan_state_notify_all(struct mhi_dev *mhi,
 void mhi_uci_chan_state_notify(struct mhi_dev *mhi,
 		enum mhi_client_channel ch_id, enum mhi_ctrl_info ch_state);
 
-void mhi_dev_pm_relax(void);
+/**
+ * mhi_dev_configure_inactivity_timer() - Configure inactive timer.
+ * @mhi:        MHI dev structure
+ * @enable:     Flag to enable or disable timer
+ */
+int mhi_dev_configure_inactivity_timer(struct mhi_dev *mhi, bool enable);
+
+void mhi_dev_pm_relax(struct mhi_dev *mhi_ctx);
+void mhi_dev_resume_init_with_link_up(struct ep_pcie_notify *notify);
 
 int  mhi_edma_release(void);
 
 int  mhi_edma_status(void);
 
 int mhi_edma_init(struct device *dev);
+void free_coherent(struct mhi_dev *mhi, size_t size, void *virt,
+		   dma_addr_t phys);
+void *alloc_coherent(struct mhi_dev *mhi, size_t size, dma_addr_t *phys,
+		     gfp_t gfp);
+/**
+ * mhi_dev_net_interface_init() - Initializes the mhi device network interface
+ *		which exposes the virtual network interface (mhi_dev_net0).
+ *		data packets will transfer between MHI host interface (mhi_swip)
+ *		and mhi_dev_net interface using software path.
+ * @dev_ops	MHI dev function pointers
+ * @vf_id       MHI instance (physical or virtual) id.
+ * @num_vfs     Total number of vutual MHI instances supported on this target.
+ */
+#if IS_ENABLED(CONFIG_MSM_MHI_NET_DEV)
+int mhi_dev_net_interface_init(struct mhi_dev_ops *dev_ops, u32 vf_id, u32 num_vfs);
+#else
+static inline int mhi_dev_net_interface_init(struct mhi_dev_ops *dev_ops, u32 vf_id, u32 num_vfs)
+{
+	return -EINVAL;
+}
+#endif
 #endif /* _MHI_H */

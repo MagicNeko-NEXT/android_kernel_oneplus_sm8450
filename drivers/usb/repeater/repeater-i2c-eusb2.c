@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2021, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/debugfs.h>
@@ -19,13 +19,7 @@
 #include <linux/types.h>
 #include <linux/usb/repeater.h>
 
-#define EUSB2_3P0_VOL_MIN			3075000 /* uV */
-#define EUSB2_3P0_VOL_MAX			3300000 /* uV */
-#define EUSB2_3P0_HPM_LOAD			3500	/* uA */
-
-#define EUSB2_1P8_VOL_MIN			1800000 /* uV */
-#define EUSB2_1P8_VOL_MAX			1800000 /* uV */
-#define EUSB2_1P8_HPM_LOAD			32000	/* uA */
+#define NUM_SUPPLIES			2
 
 /* NXP eUSB2 repeater registers */
 #define RESET_CONTROL			0x01
@@ -82,17 +76,12 @@ struct eusb2_repeater {
 	struct regmap			*regmap;
 	const struct i2c_repeater_chip	*chip;
 	u16				reg_base;
-	struct regulator		*vdd18;
-	struct regulator		*vdd3;
+	struct regulator_bulk_data	*supplies;
 	bool				power_enabled;
 
 	struct gpio_desc		*reset_gpiod;
 	u32				*param_override_seq;
 	u8				param_override_seq_cnt;
-#ifdef OPLUS_FEATURE_CHG_BASIC
-	u32			        *param_override_seq_host;
-	u8			        param_override_seq_cnt_host;
-#endif
 };
 
 static const struct regmap_config eusb2_i2c_regmap = {
@@ -156,92 +145,26 @@ static int eusb2_repeater_power(struct eusb2_repeater *er, bool on)
 		return 0;
 	}
 
-	if (!on)
-		goto disable_vdd3;
+	if (!on) {
+		ret = regulator_bulk_disable(NUM_SUPPLIES, er->supplies);
+		if (ret < 0) {
+			dev_err(er->ur.dev, "Unable to turn off regulators:%d\n", ret);
+			return ret;
+		}
 
-	ret = regulator_set_load(er->vdd18, EUSB2_1P8_HPM_LOAD);
+		er->power_enabled = false;
+		pr_debug("%s(): eUSB2 repeater regulators are turned OFF.\n", __func__);
+		return ret;
+	}
+
+	ret = regulator_bulk_enable(NUM_SUPPLIES, er->supplies);
 	if (ret < 0) {
-		dev_err(er->ur.dev, "Unable to set HPM of vdd12:%d\n", ret);
-		goto err_vdd18;
-	}
-
-	ret = regulator_set_voltage(er->vdd18, EUSB2_1P8_VOL_MIN,
-						EUSB2_1P8_VOL_MAX);
-	if (ret) {
-		dev_err(er->ur.dev,
-				"Unable to set voltage for vdd18:%d\n", ret);
-		goto put_vdd18_lpm;
-	}
-
-	ret = regulator_enable(er->vdd18);
-	if (ret) {
-		dev_err(er->ur.dev, "Unable to enable vdd18:%d\n", ret);
-		goto unset_vdd18;
-	}
-
-	ret = regulator_set_load(er->vdd3, EUSB2_3P0_HPM_LOAD);
-	if (ret < 0) {
-		dev_err(er->ur.dev, "Unable to set HPM of vdd3:%d\n", ret);
-		goto disable_vdd18;
-	}
-
-	ret = regulator_set_voltage(er->vdd3, EUSB2_3P0_VOL_MIN,
-						EUSB2_3P0_VOL_MAX);
-	if (ret) {
-		dev_err(er->ur.dev,
-				"Unable to set voltage for vdd3:%d\n", ret);
-		goto put_vdd3_lpm;
-	}
-
-	ret = regulator_enable(er->vdd3);
-	if (ret) {
-		dev_err(er->ur.dev, "Unable to enable vdd3:%d\n", ret);
-		goto unset_vdd3;
+		dev_err(er->ur.dev, "Unable to turn on regulators:%d\n", ret);
+		return ret;
 	}
 
 	er->power_enabled = true;
 	pr_debug("%s(): eUSB2 repeater egulators are turned ON.\n", __func__);
-	return ret;
-
-disable_vdd3:
-	ret = regulator_disable(er->vdd3);
-	if (ret)
-		dev_err(er->ur.dev, "Unable to disable vdd3:%d\n", ret);
-
-unset_vdd3:
-	ret = regulator_set_voltage(er->vdd3, 0, EUSB2_3P0_VOL_MAX);
-	if (ret)
-		dev_err(er->ur.dev,
-			"Unable to set (0) voltage for vdd3:%d\n", ret);
-
-put_vdd3_lpm:
-	ret = regulator_set_load(er->vdd3, 0);
-	if (ret < 0)
-		dev_err(er->ur.dev, "Unable to set (0) HPM of vdd3\n");
-
-disable_vdd18:
-	ret = regulator_disable(er->vdd18);
-	if (ret)
-		dev_err(er->ur.dev, "Unable to disable vdd18:%d\n", ret);
-
-unset_vdd18:
-	ret = regulator_set_voltage(er->vdd18, 0, EUSB2_1P8_VOL_MAX);
-	if (ret)
-		dev_err(er->ur.dev,
-			"Unable to set (0) voltage for vdd18:%d\n", ret);
-
-put_vdd18_lpm:
-	ret = regulator_set_load(er->vdd18, 0);
-	if (ret < 0)
-		dev_err(er->ur.dev, "Unable to set LPM of vdd18\n");
-
-	/* case handling when regulator turning on failed */
-	if (!er->power_enabled)
-		return -EINVAL;
-
-err_vdd18:
-	er->power_enabled = false;
-	dev_dbg(er->ur.dev, "eUSB2 repeater's regulators are turned OFF.\n");
 	return ret;
 }
 
@@ -264,42 +187,20 @@ static int eusb2_repeater_init(struct usb_repeater *ur)
 		break;
 	default:
 		dev_err(er->ur.dev, "Invalid repeater\n");
+		return -EINVAL;
 	}
 
-	dev_info(er->ur.dev, "eUSB2 repeater version = 0x%x ur->flags:0x%x\n", reg_val, ur->flags);
+	dev_dbg(er->ur.dev, "eUSB2 repeater version = 0x%x ur->flags:0x%x\n", reg_val, ur->flags);
 
 	/* override init sequence using devicetree based values */
 	if (er->param_override_seq_cnt)
 		eusb2_repeater_update_seq(er, er->param_override_seq,
 					er->param_override_seq_cnt);
 
-	dev_info(er->ur.dev, "eUSB2 repeater init\n");
+	dev_dbg(er->ur.dev, "eUSB2 repeater init\n");
 
 	return 0;
 }
-
-#ifdef OPLUS_FEATURE_CHG_BASIC
-static int eusb2_repeater_init_with_mode(struct usb_repeater *ur, int param)
-{
-	struct eusb2_repeater *er =
-			container_of(ur, struct eusb2_repeater, ur);
-
-	/* override init sequence using devicetree based values */
-	if (er->param_override_seq_cnt && param == OPLUS_REPEATER_PARAM_DEVICE) {
-		eusb2_repeater_update_seq(er, er->param_override_seq,
-					er->param_override_seq_cnt);
-	}
-
-	if (er->param_override_seq_cnt_host && param == OPLUS_REPEATER_PARAM_HOST) {
-		eusb2_repeater_update_seq(er, er->param_override_seq_host,
-					er->param_override_seq_cnt_host);
-	}
-
-	dev_info(er->ur.dev, "eUSB2 repeater init with param :%d\n", param);
-
-	return 0;
-}
-#endif
 
 static int eusb2_repeater_reset(struct usb_repeater *ur, bool bring_out_of_reset)
 {
@@ -328,6 +229,16 @@ static int eusb2_repeater_powerdown(struct usb_repeater *ur)
 	return eusb2_repeater_power(er, false);
 }
 
+static const struct regulator_bulk_data eusb2_repeater_supplies[NUM_SUPPLIES] = {
+	{
+		.supply = "vdd3v3",
+		.init_load_uA = 3500,
+	}, {
+		.supply = "vdd1v8",
+		.init_load_uA = 32000,
+	}
+};
+
 static struct i2c_repeater_chip repeater_chip[] = {
 	[NXP_REPEATER] = {
 		.repeater_type = NXP_REPEATER,
@@ -346,7 +257,7 @@ static const struct of_device_id eusb2_repeater_id_table[] = {
 		.compatible = "ti,eusb2-repeater",
 		.data = &repeater_chip[TI_REPEATER]
 	},
-	{ },
+	{ }
 };
 MODULE_DEVICE_TABLE(of, eusb2_repeater_id_table);
 
@@ -355,147 +266,83 @@ static int eusb2_repeater_i2c_probe(struct i2c_client *client)
 	struct eusb2_repeater *er;
 	struct device *dev = &client->dev;
 	const struct of_device_id *match;
-	int ret = 0, num_elem;
+	int ret, num_elem;
 
 	er = devm_kzalloc(dev, sizeof(*er), GFP_KERNEL);
-	if (!er) {
-		ret = -ENOMEM;
-		goto err_probe;
-	}
+	if (!er)
+		return -ENOMEM;
 
 	er->dev = dev;
 	match = of_match_node(eusb2_repeater_id_table, dev->of_node);
+	if (!match)
+		return -ENODEV;
+
 	er->chip = match->data;
 
 	er->regmap = devm_regmap_init_i2c(client, &eusb2_i2c_regmap);
-	if (!er->regmap) {
-		dev_err(dev, "failed to allocate register map\n");
-		ret = -EINVAL;
-		goto err_probe;
-	}
+	if (IS_ERR(er->regmap))
+		return dev_err_probe(dev, PTR_ERR(er->regmap),
+					"failed to allocate register map\n");
 
 	devm_regmap_qti_debugfs_register(er->dev, er->regmap);
 	i2c_set_clientdata(client, er);
 
 	ret = of_property_read_u16(dev->of_node, "reg", &er->reg_base);
-	if (ret < 0) {
-		dev_err(dev, "failed to get reg base address:%d\n", ret);
-		goto err_probe;
-	}
+	if (ret < 0)
+		return dev_err_probe(dev, ret, "failed to get reg base address\n");
 
-	er->vdd3 = devm_regulator_get(dev, "vdd3");
-	if (IS_ERR(er->vdd3)) {
-		dev_err(dev, "unable to get vdd3 supply\n");
-		ret = PTR_ERR(er->vdd3);
-		goto err_probe;
-	}
-
-	er->vdd18 = devm_regulator_get(dev, "vdd18");
-	if (IS_ERR(er->vdd18)) {
-		dev_err(dev, "unable to get vdd18 supply\n");
-		ret = PTR_ERR(er->vdd18);
-		goto err_probe;
-	}
+	ret = devm_regulator_bulk_get_const(dev, NUM_SUPPLIES,
+			eusb2_repeater_supplies, &er->supplies);
+	if (ret < 0)
+		return dev_err_probe(dev, ret, "unable to parse regulators from dt\n");
 
 	er->reset_gpiod = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
-	if (IS_ERR(er->reset_gpiod)) {
-		ret = PTR_ERR(er->reset_gpiod);
-		goto err_probe;
-	}
+	if (IS_ERR(er->reset_gpiod))
+		return PTR_ERR(er->reset_gpiod);
 
 	num_elem = of_property_count_elems_of_size(dev->of_node, "qcom,param-override-seq",
 				sizeof(*er->param_override_seq));
 	if (num_elem > 0) {
-		if (num_elem % 2) {
-			dev_err(dev, "invalid param_override_seq_len\n");
-			ret = -EINVAL;
-			goto err_probe;
-		}
+		if (num_elem % 2)
+			return dev_err_probe(dev, -EINVAL, "invalid param_override_seq_len\n");
 
 		er->param_override_seq_cnt = num_elem;
 		er->param_override_seq = devm_kcalloc(dev,
 				er->param_override_seq_cnt,
 				sizeof(*er->param_override_seq), GFP_KERNEL);
-		if (!er->param_override_seq) {
-			ret = -ENOMEM;
-			goto err_probe;
-		}
+		if (!er->param_override_seq)
+			return -ENOMEM;
 
 		ret = of_property_read_u32_array(dev->of_node,
 				"qcom,param-override-seq",
 				er->param_override_seq,
 				er->param_override_seq_cnt);
-		if (ret) {
-			dev_err(dev, "qcom,param-override-seq read failed %d\n",
-									ret);
-			goto err_probe;
-		}
+		if (ret)
+			return dev_err_probe(dev, ret,
+					"qcom,param-override-seq read failed\n");
 	}
 
-#ifdef OPLUS_FEATURE_CHG_BASIC
-	num_elem = of_property_count_elems_of_size(dev->of_node, "qcom,param-override-seq-host",
-		                sizeof(*er->param_override_seq));
-	if (num_elem > 0) {
-		if (num_elem % 2) {
-			dev_err(dev, "invalid param_override_seq_host_len\n");
-			ret = -EINVAL;
-			goto err_probe;
-		}
-
-		er->param_override_seq_cnt_host = num_elem;
-		er->param_override_seq_host = devm_kcalloc(dev,
-				er->param_override_seq_cnt_host,
-				sizeof(*er->param_override_seq_host), GFP_KERNEL);
-		if (!er->param_override_seq_host) {
-			ret = -ENOMEM;
-			goto err_probe;
-		}
-
-		ret = of_property_read_u32_array(dev->of_node,
-				"qcom,param-override-seq-host",
-				er->param_override_seq_host,
-				er->param_override_seq_cnt_host);
-		if (ret) {
-			dev_err(dev, "qcom,param-override-seq-host read failed %d\n", ret);
-			goto err_probe;
-	    }
-  }
-#endif
 
 	er->ur.dev = dev;
 
 	er->ur.init		= eusb2_repeater_init;
-#ifdef OPLUS_FEATURE_CHG_BASIC
-	er->ur.init_with_mode   = eusb2_repeater_init_with_mode;
-#endif
 	er->ur.reset		= eusb2_repeater_reset;
 	er->ur.powerup		= eusb2_repeater_powerup;
 	er->ur.powerdown	= eusb2_repeater_powerdown;
 
-	ret = usb_add_repeater_dev(&er->ur);
-	if (ret)
-		goto err_probe;
-
-	return 0;
-
-err_probe:
-	return ret;
+	return usb_add_repeater_dev(&er->ur);
 }
 
-static int eusb2_repeater_i2c_remove(struct i2c_client *client)
+static void eusb2_repeater_i2c_remove(struct i2c_client *client)
 {
 	struct eusb2_repeater *er = i2c_get_clientdata(client);
 
-	if (!er)
-		return 0;
-
 	usb_remove_repeater_dev(&er->ur);
 	eusb2_repeater_power(er, false);
-	return 0;
 }
 
 static struct i2c_driver eusb2_i2c_repeater_driver = {
-	.probe_new	= eusb2_repeater_i2c_probe,
+	.probe		= eusb2_repeater_i2c_probe,
 	.remove		= eusb2_repeater_i2c_remove,
 	.driver = {
 		.name	= "eusb2-repeater",
@@ -506,4 +353,4 @@ static struct i2c_driver eusb2_i2c_repeater_driver = {
 module_i2c_driver(eusb2_i2c_repeater_driver);
 
 MODULE_DESCRIPTION("eUSB2 i2c repeater driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

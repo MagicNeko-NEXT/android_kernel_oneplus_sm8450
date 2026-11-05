@@ -14,12 +14,12 @@
  * https://lore.kernel.org/lkml/20201017013255.43568-2-john.stultz@linaro.org/
  *
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/dma-heap.h>
-#include <linux/dma-map-ops.h>
 #include <linux/err.h>
 #include <linux/highmem.h>
 #include <linux/mm.h>
@@ -27,10 +27,31 @@
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
+#include <linux/of.h>
+#include <linux/dma-map-ops.h>
 #include <linux/qcom_dma_heap.h>
 #include <linux/msm_dma_iommu_mapping.h>
+#include <linux/qti-smmu-proxy-callbacks.h>
 
 #include "qcom_sg_ops.h"
+
+int proxy_invalid_map(struct device *dev, struct sg_table *table,
+		      struct dma_buf *dmabuf)
+{
+	WARN(1, "Trying to map with SMMU proxy driver when it has not fully probed!\n");
+	return -EINVAL;
+}
+
+void proxy_invalid_unmap(struct device *dev, struct sg_table *table,
+			 struct dma_buf *dmabuf)
+{
+	WARN(1, "Trying to unmap with SMMU proxy driver when it has not fully probed!\n");
+}
+
+static struct smmu_proxy_callbacks smmu_proxy_callback_ops = {
+	.map_sgtable = proxy_invalid_map,
+	.unmap_sgtable = proxy_invalid_unmap,
+};
 
 static struct sg_table *dup_sg_table(struct sg_table *table)
 {
@@ -57,8 +78,8 @@ static struct sg_table *dup_sg_table(struct sg_table *table)
 	return new_table;
 }
 
-static int qcom_sg_attach(struct dma_buf *dmabuf,
-			  struct dma_buf_attachment *attachment)
+int qcom_sg_attach(struct dma_buf *dmabuf,
+		   struct dma_buf_attachment *attachment)
 {
 	struct qcom_sg_buffer *buffer = dmabuf->priv;
 	struct dma_heap_attachment *a;
@@ -87,9 +108,10 @@ static int qcom_sg_attach(struct dma_buf *dmabuf,
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(qcom_sg_attach);
 
-static void qcom_sg_detach(struct dma_buf *dmabuf,
-			   struct dma_buf_attachment *attachment)
+void qcom_sg_detach(struct dma_buf *dmabuf,
+		    struct dma_buf_attachment *attachment)
 {
 	struct qcom_sg_buffer *buffer = dmabuf->priv;
 	struct dma_heap_attachment *a = attachment->priv;
@@ -102,9 +124,10 @@ static void qcom_sg_detach(struct dma_buf *dmabuf,
 	kfree(a->table);
 	kfree(a);
 }
+EXPORT_SYMBOL_GPL(qcom_sg_detach);
 
-static struct sg_table *qcom_sg_map_dma_buf(struct dma_buf_attachment *attachment,
-					    enum dma_data_direction direction)
+struct sg_table *qcom_sg_map_dma_buf(struct dma_buf_attachment *attachment,
+				     enum dma_data_direction direction)
 {
 	struct dma_heap_attachment *a = attachment->priv;
 	struct sg_table *table = a->table;
@@ -116,6 +139,13 @@ static struct sg_table *qcom_sg_map_dma_buf(struct dma_buf_attachment *attachmen
 	buffer = attachment->dmabuf->priv;
 	vmperm = buffer->vmperm;
 
+	if (smmu_proxy_callback_ops.map_sgtable &&
+	    (attrs & DMA_ATTR_QTI_SMMU_PROXY_MAP)) {
+		ret = smmu_proxy_callback_ops.map_sgtable(attachment->dev, table,
+							  attachment->dmabuf);
+		return ret ? ERR_PTR(ret) : table;
+	}
+
 	/* Prevent map/unmap during begin/end_cpu_access */
 	mutex_lock(&buffer->lock);
 
@@ -124,14 +154,18 @@ static struct sg_table *qcom_sg_map_dma_buf(struct dma_buf_attachment *attachmen
 	if (buffer->uncached || !mem_buf_vmperm_can_cmo(vmperm))
 		attrs |= DMA_ATTR_SKIP_CPU_SYNC;
 
-	if (attrs & DMA_ATTR_DELAYED_UNMAP)
+	if (attrs & DMA_ATTR_DELAYED_UNMAP) {
 		ret = msm_dma_map_sgtable(attachment->dev, table, direction,
 					  attachment->dmabuf, attrs);
-	else
+	} else if (!a->mapped) {
 		ret = dma_map_sgtable(attachment->dev, table, direction, attrs);
+	} else {
+		dev_err(attachment->dev, "Error: Dma-buf is already mapped!\n");
+		ret = -EBUSY;
+	}
 
 	if (ret) {
-		table = ERR_PTR(-ENOMEM);
+		table = ERR_PTR(ret);
 		goto err_map_sgtable;
 	}
 
@@ -144,10 +178,11 @@ err_map_sgtable:
 	mutex_unlock(&buffer->lock);
 	return table;
 }
+EXPORT_SYMBOL_GPL(qcom_sg_map_dma_buf);
 
-static void qcom_sg_unmap_dma_buf(struct dma_buf_attachment *attachment,
-				  struct sg_table *table,
-				  enum dma_data_direction direction)
+void qcom_sg_unmap_dma_buf(struct dma_buf_attachment *attachment,
+			   struct sg_table *table,
+			   enum dma_data_direction direction)
 {
 	struct dma_heap_attachment *a = attachment->priv;
 	struct qcom_sg_buffer *buffer;
@@ -157,6 +192,13 @@ static void qcom_sg_unmap_dma_buf(struct dma_buf_attachment *attachment,
 	buffer = attachment->dmabuf->priv;
 	vmperm = buffer->vmperm;
 
+	if (smmu_proxy_callback_ops.unmap_sgtable &&
+	    (attrs & DMA_ATTR_QTI_SMMU_PROXY_MAP)) {
+		smmu_proxy_callback_ops.unmap_sgtable(attachment->dev, table,
+						      attachment->dmabuf);
+		return;
+	}
+
 	/* Prevent map/unmap during begin/end_cpu_access */
 	mutex_lock(&buffer->lock);
 
@@ -164,17 +206,20 @@ static void qcom_sg_unmap_dma_buf(struct dma_buf_attachment *attachment,
 		attrs |= DMA_ATTR_SKIP_CPU_SYNC;
 
 	a->mapped = false;
-	if (attrs & DMA_ATTR_DELAYED_UNMAP)
+
+	if (attrs & DMA_ATTR_DELAYED_UNMAP) {
 		msm_dma_unmap_sgtable(attachment->dev, table, direction,
 				      attachment->dmabuf, attrs);
-	else
+	} else {
 		dma_unmap_sgtable(attachment->dev, table, direction, attrs);
+	}
 	mem_buf_vmperm_unpin(vmperm);
 	mutex_unlock(&buffer->lock);
 }
+EXPORT_SYMBOL_GPL(qcom_sg_unmap_dma_buf);
 
-static int qcom_sg_dma_buf_begin_cpu_access(struct dma_buf *dmabuf,
-					    enum dma_data_direction direction)
+int qcom_sg_dma_buf_begin_cpu_access(struct dma_buf *dmabuf,
+				     enum dma_data_direction direction)
 {
 	struct qcom_sg_buffer *buffer = dmabuf->priv;
 	struct dma_heap_attachment *a;
@@ -203,9 +248,10 @@ static int qcom_sg_dma_buf_begin_cpu_access(struct dma_buf *dmabuf,
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(qcom_sg_dma_buf_begin_cpu_access);
 
-static int qcom_sg_dma_buf_end_cpu_access(struct dma_buf *dmabuf,
-					  enum dma_data_direction direction)
+int qcom_sg_dma_buf_end_cpu_access(struct dma_buf *dmabuf,
+				   enum dma_data_direction direction)
 {
 	struct qcom_sg_buffer *buffer = dmabuf->priv;
 	struct dma_heap_attachment *a;
@@ -233,6 +279,7 @@ static int qcom_sg_dma_buf_end_cpu_access(struct dma_buf *dmabuf,
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(qcom_sg_dma_buf_end_cpu_access);
 
 static int sgl_sync_range(struct device *dev, struct scatterlist *sgl,
 			  unsigned int nents, unsigned long offset,
@@ -293,10 +340,10 @@ static int sgl_sync_range(struct device *dev, struct scatterlist *sgl,
 	return 0;
 }
 
-static int qcom_sg_dma_buf_begin_cpu_access_partial(struct dma_buf *dmabuf,
-						    enum dma_data_direction dir,
-						    unsigned int offset,
-						    unsigned int len)
+int qcom_sg_dma_buf_begin_cpu_access_partial(struct dma_buf *dmabuf,
+					     enum dma_data_direction dir,
+					     unsigned int offset,
+					     unsigned int len)
 {
 	struct qcom_sg_buffer *buffer = dmabuf->priv;
 	struct dma_heap_attachment *a;
@@ -327,11 +374,12 @@ static int qcom_sg_dma_buf_begin_cpu_access_partial(struct dma_buf *dmabuf,
 
 	return ret;
 }
+EXPORT_SYMBOL_GPL(qcom_sg_dma_buf_begin_cpu_access_partial);
 
-static int qcom_sg_dma_buf_end_cpu_access_partial(struct dma_buf *dmabuf,
-					      enum dma_data_direction direction,
-					      unsigned int offset,
-					      unsigned int len)
+int qcom_sg_dma_buf_end_cpu_access_partial(struct dma_buf *dmabuf,
+					   enum dma_data_direction direction,
+					   unsigned int offset,
+					   unsigned int len)
 {
 	struct qcom_sg_buffer *buffer = dmabuf->priv;
 	struct dma_heap_attachment *a;
@@ -362,6 +410,7 @@ static int qcom_sg_dma_buf_end_cpu_access_partial(struct dma_buf *dmabuf,
 
 	return ret;
 }
+EXPORT_SYMBOL_GPL(qcom_sg_dma_buf_end_cpu_access_partial);
 
 static void qcom_sg_vm_ops_open(struct vm_area_struct *vma)
 {
@@ -382,7 +431,7 @@ static const struct vm_operations_struct qcom_sg_vm_ops = {
 	.close = qcom_sg_vm_ops_close,
 };
 
-static int qcom_sg_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
+int qcom_sg_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 {
 	struct qcom_sg_buffer *buffer = dmabuf->priv;
 	struct sg_table *table = &buffer->sg_table;
@@ -429,8 +478,9 @@ static int qcom_sg_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 	}
 	return 0;
 }
+EXPORT_SYMBOL_GPL(qcom_sg_mmap);
 
-static void *qcom_sg_do_vmap(struct qcom_sg_buffer *buffer)
+void *qcom_sg_do_vmap(struct qcom_sg_buffer *buffer)
 {
 	struct sg_table *table = &buffer->sg_table;
 	int npages = PAGE_ALIGN(buffer->len) / PAGE_SIZE;
@@ -460,39 +510,43 @@ static void *qcom_sg_do_vmap(struct qcom_sg_buffer *buffer)
 	return vaddr;
 }
 
-static void *qcom_sg_vmap(struct dma_buf *dmabuf)
+int qcom_sg_vmap(struct dma_buf *dmabuf, struct iosys_map *map)
 {
 	struct qcom_sg_buffer *buffer = dmabuf->priv;
 	void *vaddr;
+	int ret = 0;
 
 	mem_buf_vmperm_pin(buffer->vmperm);
 	if (!mem_buf_vmperm_can_vmap(buffer->vmperm)) {
 		mem_buf_vmperm_unpin(buffer->vmperm);
-		return ERR_PTR(-EPERM);
+		return -EPERM;
 	}
 
 	mutex_lock(&buffer->lock);
 	if (buffer->vmap_cnt) {
 		buffer->vmap_cnt++;
-		vaddr = buffer->vaddr;
+		iosys_map_set_vaddr(map, buffer->vaddr);
 		goto out;
 	}
 
 	vaddr = qcom_sg_do_vmap(buffer);
 	if (IS_ERR(vaddr)) {
+		ret = PTR_ERR(vaddr);
 		mem_buf_vmperm_unpin(buffer->vmperm);
 		goto out;
 	}
 
 	buffer->vaddr = vaddr;
 	buffer->vmap_cnt++;
+	iosys_map_set_vaddr(map, buffer->vaddr);
 out:
 	mutex_unlock(&buffer->lock);
 
-	return vaddr;
+	return ret;
 }
+EXPORT_SYMBOL_GPL(qcom_sg_vmap);
 
-static void qcom_sg_vunmap(struct dma_buf *dmabuf, void *vaddr)
+void qcom_sg_vunmap(struct dma_buf *dmabuf, struct iosys_map *map)
 {
 	struct qcom_sg_buffer *buffer = dmabuf->priv;
 
@@ -503,9 +557,11 @@ static void qcom_sg_vunmap(struct dma_buf *dmabuf, void *vaddr)
 	}
 	mem_buf_vmperm_unpin(buffer->vmperm);
 	mutex_unlock(&buffer->lock);
+	iosys_map_clear(map);
 }
+EXPORT_SYMBOL_GPL(qcom_sg_vunmap);
 
-static void qcom_sg_release(struct dma_buf *dmabuf)
+void qcom_sg_release(struct dma_buf *dmabuf)
 {
 	struct qcom_sg_buffer *buffer = dmabuf->priv;
 
@@ -513,27 +569,22 @@ static void qcom_sg_release(struct dma_buf *dmabuf)
 		return;
 
 	msm_dma_buf_freed(buffer);
-	buffer->free(buffer);
+	if (buffer->free)
+		buffer->free(buffer);
 }
+EXPORT_SYMBOL_GPL(qcom_sg_release);
 
-static struct mem_buf_vmperm *qcom_sg_lookup_vmperm(struct dma_buf *dmabuf)
+struct mem_buf_vmperm *qcom_sg_lookup_vmperm(struct dma_buf *dmabuf)
 {
 	struct qcom_sg_buffer *buffer = dmabuf->priv;
 
 	return buffer->vmperm;
 }
-
-static bool qcom_sg_uncached(struct dma_buf *dmabuf)
-{
-	struct qcom_sg_buffer *buffer = dmabuf->priv;
-
-	return buffer->uncached;
-}
+EXPORT_SYMBOL_GPL(qcom_sg_lookup_vmperm);
 
 struct mem_buf_dma_buf_ops qcom_sg_buf_ops = {
 	.attach = qcom_sg_attach,
 	.lookup = qcom_sg_lookup_vmperm,
-	.uncached = qcom_sg_uncached,
 	.dma_ops = {
 		.attach = NULL, /* Will be set by mem_buf_dma_buf_export */
 		.detach = qcom_sg_detach,
@@ -550,3 +601,13 @@ struct mem_buf_dma_buf_ops qcom_sg_buf_ops = {
 	}
 };
 EXPORT_SYMBOL(qcom_sg_buf_ops);
+
+int qti_smmu_proxy_register_callbacks(smmu_proxy_map_sgtable map_sgtable_fn_ptr,
+				      smmu_proxy_unmap_sgtable unmap_sgtable_fn_ptr)
+{
+	smmu_proxy_callback_ops.map_sgtable = map_sgtable_fn_ptr;
+	smmu_proxy_callback_ops.unmap_sgtable = unmap_sgtable_fn_ptr;
+
+	return 0;
+}
+EXPORT_SYMBOL(qti_smmu_proxy_register_callbacks);

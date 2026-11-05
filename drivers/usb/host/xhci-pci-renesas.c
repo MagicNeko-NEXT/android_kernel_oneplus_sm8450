@@ -121,7 +121,6 @@ static int renesas_fw_verify(const void *fw_data,
 			     size_t length)
 {
 	u16 fw_version_pointer;
-	u16 fw_version;
 
 	/*
 	 * The Firmware's Data Format is describe in
@@ -150,9 +149,6 @@ static int renesas_fw_verify(const void *fw_data,
 		pr_err("fw ver pointer is outside of the firmware image");
 		return -EINVAL;
 	}
-
-	fw_version = get_unaligned_le16(fw_data + fw_version_pointer);
-	pr_err("got firmware version: %02x.", fw_version);
 
 	return 0;
 }
@@ -198,7 +194,7 @@ static int renesas_check_rom_state(struct pci_dev *pdev)
 	if (err)
 		return pcibios_err_to_errno(err);
 
-	if (rom_state & BIT(15)) {
+	if (rom_state & RENESAS_ROM_STATUS_ROM_EXISTS) {
 		/* ROM exists */
 		dev_dbg(&pdev->dev, "ROM exists\n");
 
@@ -600,7 +596,7 @@ int renesas_xhci_check_request_fw(struct pci_dev *pdev,
 
 	err = renesas_fw_check_running(pdev);
 	/* Continue ahead, if the firmware is already running. */
-	if (err == 0)
+	if (!err)
 		return 0;
 
 	/* no firmware interface available */

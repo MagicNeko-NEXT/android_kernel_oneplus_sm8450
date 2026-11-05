@@ -25,6 +25,7 @@
 MODULE_AUTHOR("Tom Lendacky <thomas.lendacky@amd.com>");
 MODULE_AUTHOR("Gary R Hook <gary.hook@amd.com>");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
 MODULE_VERSION("1.1.0");
 MODULE_DESCRIPTION("AMD Secure Processor driver");
 
@@ -213,12 +214,8 @@ void sp_destroy(struct sp_device *sp)
 
 int sp_suspend(struct sp_device *sp)
 {
-	int ret;
-
 	if (sp->dev_vdata->ccp_vdata) {
-		ret = ccp_dev_suspend(sp);
-		if (ret)
-			return ret;
+		ccp_dev_suspend(sp);
 	}
 
 	return 0;
@@ -226,15 +223,23 @@ int sp_suspend(struct sp_device *sp)
 
 int sp_resume(struct sp_device *sp)
 {
-	int ret;
-
 	if (sp->dev_vdata->ccp_vdata) {
-		ret = ccp_dev_resume(sp);
+		ccp_dev_resume(sp);
+	}
+
+	return 0;
+}
+
+int sp_restore(struct sp_device *sp)
+{
+	if (sp->psp_data) {
+		int ret = psp_restore(sp);
+
 		if (ret)
 			return ret;
 	}
 
-	return 0;
+	return sp_resume(sp);
 }
 
 struct sp_device *sp_get_psp_master_device(void)

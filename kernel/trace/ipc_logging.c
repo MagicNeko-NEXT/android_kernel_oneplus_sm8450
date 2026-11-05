@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2012-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <asm/arch_timer.h>
@@ -32,7 +32,7 @@
 #define FEATURE_MASK 0x10000
 
 static int minidump_buf_cnt;
-static LIST_HEAD(ipc_log_context_list);
+static struct list_head *ipc_log_context_list;
 static DEFINE_RWLOCK(context_list_lock_lha1);
 static void *get_deserialization_func(struct ipc_log_context *ilctxt,
 				      int type);
@@ -831,9 +831,24 @@ void *ipc_log_context_create(int max_num_pages,
 	unsigned long flags;
 	int enable_minidump;
 
+	write_lock_irqsave(&context_list_lock_lha1, flags);
+	if (!ipc_log_context_list) {
+		ipc_log_context_list = kzalloc(sizeof(struct list_head), GFP_ATOMIC);
+		if (!ipc_log_context_list) {
+			write_unlock_irqrestore(&context_list_lock_lha1, flags);
+			pr_err("Failed to allocate memory for ipc_log_context_list\n");
+			return NULL;
+		}
+		INIT_LIST_HEAD(ipc_log_context_list);
+
+		register_minidump((u64)ipc_log_context_list, sizeof(struct list_head),
+				"ipc_log_ctxt_list", minidump_buf_cnt);
+	}
+	write_unlock_irqrestore(&context_list_lock_lha1, flags);
+
 	/* check if ipc ctxt already exists */
 	read_lock_irq(&context_list_lock_lha1);
-	list_for_each_entry(tmp, &ipc_log_context_list, list)
+	list_for_each_entry(tmp, ipc_log_context_list, list)
 		if (!strcmp(tmp->name, mod_name)) {
 			ctxt = tmp;
 			break;
@@ -886,7 +901,7 @@ void *ipc_log_context_create(int max_num_pages,
 
 	ctxt->log_id = (uint64_t)(uintptr_t)ctxt;
 	ctxt->version = IPC_LOG_VERSION;
-	strlcpy(ctxt->name, mod_name, IPC_LOG_MAX_CONTEXT_NAME_LEN);
+	strscpy(ctxt->name, mod_name, IPC_LOG_MAX_CONTEXT_NAME_LEN);
 	ctxt->user_version = feature_version & 0xffff;
 	ctxt->first_page = get_first_page(ctxt);
 	ctxt->last_page = pg;
@@ -898,16 +913,16 @@ void *ipc_log_context_create(int max_num_pages,
 	kref_init(&ctxt->refcount);
 	ctxt->destroyed = false;
 	create_ctx_debugfs(ctxt, mod_name);
-
+	ipc_log_cdev_create(ctxt, mod_name);
 	/* set magic last to signal context init is complete */
 	ctxt->magic = IPC_LOG_CONTEXT_MAGIC_NUM;
 	ctxt->nmagic = ~(IPC_LOG_CONTEXT_MAGIC_NUM);
 
 	write_lock_irqsave(&context_list_lock_lha1, flags);
 	if (enable_minidump  && (minidump_buf_cnt < MAX_MINIDUMP_BUFFERS))
-		list_add(&ctxt->list, &ipc_log_context_list);
+		list_add(&ctxt->list, ipc_log_context_list);
 	else
-		list_add_tail(&ctxt->list, &ipc_log_context_list);
+		list_add_tail(&ctxt->list, ipc_log_context_list);
 	write_unlock_irqrestore(&context_list_lock_lha1, flags);
 
 	return (void *)ctxt;
@@ -953,7 +968,7 @@ int ipc_log_context_destroy(void *ctxt)
 		return 0;
 
 	debugfs_remove_recursive(ilctxt->dent);
-
+	ipc_log_cdev_remove(ilctxt);
 	spin_lock(&ilctxt->context_lock_lhb1);
 	ilctxt->destroyed = true;
 	complete_all(&ilctxt->read_avail);
@@ -976,14 +991,18 @@ EXPORT_SYMBOL(ipc_log_context_destroy);
 static int __init ipc_logging_init(void)
 {
 	check_and_create_debugfs();
-
-	register_minidump((u64)&ipc_log_context_list, sizeof(struct list_head),
-			  "ipc_log_ctxt_list", minidump_buf_cnt);
+	ipc_log_cdev_init();
 
 	return 0;
 }
 
+static void __exit ipc_logging_exit(void)
+{
+	kfree(ipc_log_context_list);
+}
+
 module_init(ipc_logging_init);
+module_exit(ipc_logging_exit);
 
 MODULE_DESCRIPTION("ipc logging");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

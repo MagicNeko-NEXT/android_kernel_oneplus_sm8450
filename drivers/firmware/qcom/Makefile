@@ -1,2 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
-obj-$(CONFIG_QTI_TZ_LOG) += tz_log.o
+#
+# Makefile for the linux kernel.
+#
+
+obj-y += si_core/

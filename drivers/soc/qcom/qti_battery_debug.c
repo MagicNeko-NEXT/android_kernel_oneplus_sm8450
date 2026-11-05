@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt)	"BATTERY_DBG: %s: " fmt, __func__
@@ -12,7 +13,7 @@
 #include <linux/platform_device.h>
 #include <linux/rpmsg.h>
 #include <linux/slab.h>
-#include <linux/soc/qcom/pmic_glink.h>
+#include <linux/soc/qcom/qti_pmic_glink.h>
 
 /* owner/type/opcodes for battery debug */
 #define MSG_OWNER_BD			32781
@@ -135,7 +136,7 @@ static void handle_qbg_dump_message(struct battery_dbg_dev *bd,
 	u32 buf_len;
 
 	if (len > sizeof(bd->qbg_dump)) {
-		pr_err("Incorrect length received: %zu expected: %u\n", len,
+		pr_err("Incorrect length received: %zu expected: %zu\n", len,
 			sizeof(bd->qbg_dump));
 		return;
 	}
@@ -313,7 +314,7 @@ static int active_show(struct seq_file *s, void *unused)
 
 	voter_mask = v->data.active_voter_mask;
 
-	seq_printf(s, "%#x\n", voter_mask);
+	seq_printf(s, "%#lx\n", voter_mask);
 
 	return 0;
 }
@@ -639,12 +640,10 @@ static void battery_dbg_add_debugfs(struct battery_dbg_dev *bd)
 	return;
 error:
 	debugfs_remove_recursive(bd_dir);
-	return;
 }
 #else
 static void battery_dbg_add_debugfs(struct battery_dbg_dev *bd)
 {
-	return;
 }
 #endif
 
@@ -822,4 +821,4 @@ static struct platform_driver battery_dbg_driver = {
 module_platform_driver(battery_dbg_driver);
 
 MODULE_DESCRIPTION("QTI Glink battery debug driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

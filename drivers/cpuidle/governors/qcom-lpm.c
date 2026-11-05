@@ -15,7 +15,9 @@
 #include <linux/pm_runtime.h>
 #include <linux/pm_qos.h>
 #include <linux/sched/idle.h>
+#if IS_ENABLED(CONFIG_SCHED_WALT)
 #include <linux/sched/walt.h>
+#endif
 #include <linux/smp.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -60,8 +62,10 @@ static inline bool check_cpu_isactive(int cpu)
 
 static bool lpm_disallowed(s64 sleep_ns, int cpu)
 {
+#if IS_ENABLED(CONFIG_SCHED_WALT)
 	struct lpm_cpu *cpu_gov = per_cpu_ptr(&lpm_cpu_data, cpu);
 	uint64_t bias_time = 0;
+#endif
 
 	if (suspend_in_progress)
 		return true;
@@ -72,12 +76,13 @@ static bool lpm_disallowed(s64 sleep_ns, int cpu)
 	if ((sleep_disabled || sleep_ns < 0))
 		return true;
 
+#if IS_ENABLED(CONFIG_SCHED_WALT)
 	if (!sched_lpm_disallowed_time(cpu, &bias_time)) {
 		cpu_gov->last_idx = 0;
 		cpu_gov->bias = bias_time;
 		return true;
 	}
-
+#endif
 	return false;
 }
 
@@ -236,6 +241,7 @@ static void cpu_predict(struct lpm_cpu *cpu_gov, u64 duration_ns)
 	struct cpuidle_state *min_state = &drv->states[0];
 	struct history_lpm *lpm_history = &cpu_gov->lpm_history;
 	struct history_ipi *ipi_history = &cpu_gov->ipi_history;
+	unsigned long flags;
 
 	if (prediction_disabled)
 		return;
@@ -308,10 +314,12 @@ static void cpu_predict(struct lpm_cpu *cpu_gov, u64 duration_ns)
 	if (cpu_gov->predicted)
 		return;
 
+	spin_lock_irqsave(&cpu_gov->lock, flags);
 	cpu_gov->predicted = find_deviation(cpu_gov, ipi_history->interval,
 					    duration_ns);
 	if (cpu_gov->predicted)
 		cpu_gov->pred_type = LPM_PRED_IPI_PATTERN;
+	spin_unlock_irqrestore(&cpu_gov->lock, flags);
 }
 
 /**
@@ -438,6 +446,12 @@ static int lpm_offline_cpu(unsigned int cpu)
 	if (!dev || !cpu_gov)
 		return 0;
 
+	cpu_gov->next_wakeup = KTIME_MAX - 1;
+	cpu_gov->cpu_off_invoked = true;
+
+	if (cluster_gov_ops && cluster_gov_ops->select)
+		cluster_gov_ops->select(cpu_gov);
+
 	dev_pm_qos_remove_notifier(dev, &cpu_gov->nb,
 				   DEV_PM_QOS_RESUME_LATENCY);
 
@@ -452,6 +466,7 @@ static int lpm_online_cpu(unsigned int cpu)
 	if (!dev || !cpu_gov)
 		return 0;
 
+	cpu_gov->cpu_off_invoked = false;
 	cpu_gov->nb.notifier_call = lpm_cpu_qos_notify;
 	dev_pm_qos_add_notifier(dev, &cpu_gov->nb,
 				DEV_PM_QOS_RESUME_LATENCY);
@@ -464,20 +479,21 @@ static void ipi_raise(void *ignore, const struct cpumask *mask, const char *unus
 	int cpu;
 	struct lpm_cpu *cpu_gov;
 	unsigned long flags;
-	ktime_t now;
+
 	if (suspend_in_progress)
 		return;
 
-	now = ktime_get();
+	ktime_t now = ktime_get();
 	for_each_cpu(cpu, mask) {
 		cpu_gov = &(per_cpu(lpm_cpu_data, cpu));
 		if (!cpu_gov->enable)
 			return;
 
-		spin_lock_irqsave(&cpu_gov->lock, flags);
-		cpu_gov->ipi_pending = true;
-		update_ipi_history(cpu, now);
-		spin_unlock_irqrestore(&cpu_gov->lock, flags);
+		if (spin_trylock_irqsave(&cpu_gov->lock, flags)) {
+			cpu_gov->ipi_pending = true;
+			update_ipi_history(cpu, now);
+			spin_unlock_irqrestore(&cpu_gov->lock, flags);
+		}
 	}
 }
 
@@ -504,7 +520,7 @@ static void ipi_entry(void *ignore, const char *unused)
  * get_cpus_qos() - Returns the aggrigated PM QoS request.
  * @mask: cpumask of the cpus
  */
-static inline s64 get_cpus_qos(const struct cpumask *mask)
+s64 get_cpus_qos(const struct cpumask *mask)
 {
 	int cpu;
 	s64 n, latency = PM_QOS_CPU_LATENCY_DEFAULT_VALUE * NSEC_PER_USEC;
@@ -553,14 +569,6 @@ static int start_prediction_timer(struct lpm_cpu *cpu_gov, int duration_us)
 	return htime;
 }
 
-void unregister_cluster_governor_ops(struct cluster_governor *ops)
-{
-	if (ops != cluster_gov_ops)
-		return;
-
-	cluster_gov_ops = NULL;
-}
-
 void register_cluster_governor_ops(struct cluster_governor *ops)
 {
 	if (!ops)
@@ -588,6 +596,9 @@ static int lpm_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 	int i = 0;
 
 	if (!cpu_gov)
+		return 0;
+
+	if (cpu_gov->cpu_off_invoked)
 		return 0;
 
 	do_div(latency_req, NSEC_PER_USEC);
@@ -663,7 +674,10 @@ done:
  */
 static void lpm_reflect(struct cpuidle_device *dev, int state)
 {
+	struct lpm_cpu *cpu_gov = this_cpu_ptr(&lpm_cpu_data);
 
+	if (state && cluster_gov_ops && cluster_gov_ops->reflect)
+		cluster_gov_ops->reflect(cpu_gov);
 }
 
 /**
@@ -708,6 +722,28 @@ static void lpm_idle_exit(void *unused, int state, struct cpuidle_device *dev)
 		histtimer_cancel();
 		biastimer_cancel();
 	}
+}
+
+static int suspend_lpm_notify(struct notifier_block *nb,
+			      unsigned long mode, void *_unused)
+{
+	int cpu;
+
+	switch (mode) {
+	case PM_SUSPEND_PREPARE:
+		suspend_in_progress = true;
+		break;
+	case PM_POST_SUSPEND:
+		suspend_in_progress = false;
+		break;
+	default:
+		break;
+	}
+
+	for_each_online_cpu(cpu)
+		wake_up_if_idle(cpu);
+
+	return 0;
 }
 
 /**
@@ -834,6 +870,10 @@ static struct cpuidle_governor lpm_governor = {
 	.reflect =	lpm_reflect,
 };
 
+static struct notifier_block suspend_lpm_nb = {
+	.notifier_call = suspend_lpm_notify,
+};
+
 static int __init qcom_lpm_governor_init(void)
 {
 	int ret;
@@ -859,6 +899,8 @@ static int __init qcom_lpm_governor_init(void)
 	if (ret < 0)
 		goto cpuhp_setup_fail;
 
+	register_pm_notifier(&suspend_lpm_nb);
+
 	return 0;
 
 cpuhp_setup_fail:
@@ -873,4 +915,4 @@ sysfs_fail:
 module_init(qcom_lpm_governor_init);
 
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. cpuidle LPM governor");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

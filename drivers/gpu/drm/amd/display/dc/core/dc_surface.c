@@ -23,8 +23,6 @@
  *
  */
 
-#include <linux/mm.h>
-
 /* DC interface (public) */
 #include "dm_services.h"
 #include "dc.h"
@@ -60,6 +58,8 @@ static void dc_plane_construct(struct dc_context *ctx, struct dc_plane_state *pl
 	if (plane_state->blend_tf != NULL) {
 		plane_state->blend_tf->type = TF_TYPE_BYPASS;
 	}
+
+	plane_state->pre_multiplied_alpha = true;
 
 }
 
@@ -104,7 +104,7 @@ void enable_surface_flip_reporting(struct dc_plane_state *plane_state,
 struct dc_plane_state *dc_create_plane_state(struct dc *dc)
 {
 	struct dc_plane_state *plane_state = kvzalloc(sizeof(*plane_state),
-							GFP_KERNEL);
+							GFP_ATOMIC);
 
 	if (NULL == plane_state)
 		return NULL;
@@ -115,7 +115,7 @@ struct dc_plane_state *dc_create_plane_state(struct dc *dc)
 	return plane_state;
 }
 
-/**
+/*
  *****************************************************************************
  *  Function: dc_plane_get_status
  *

@@ -87,7 +87,7 @@ static u8 tpm2_ordinal_duration_index(u32 ordinal)
 		return TPM_MEDIUM;
 
 	case TPM2_CC_VERIFY_SIGNATURE:        /* 177 */
-		return TPM_LONG;
+		return TPM_LONG_LONG;
 
 	case TPM2_CC_PCR_EXTEND:              /* 182 */
 		return TPM_MEDIUM;
@@ -574,11 +574,9 @@ ssize_t tpm2_get_pcr_allocation(struct tpm_chip *chip)
 
 	nr_possible_banks = be32_to_cpup(
 		(__be32 *)&buf.data[TPM_HEADER_SIZE + 5]);
-
-	chip->allocated_banks = kcalloc(nr_possible_banks,
-					sizeof(*chip->allocated_banks),
-					GFP_KERNEL);
-	if (!chip->allocated_banks) {
+	if (nr_possible_banks > TPM2_MAX_PCR_BANKS) {
+		pr_err("tpm: out of bank capacity: %u > %u\n",
+		       nr_possible_banks, TPM2_MAX_PCR_BANKS);
 		rc = -ENOMEM;
 		goto out;
 	}
@@ -752,8 +750,24 @@ int tpm2_auto_startup(struct tpm_chip *chip)
 	}
 
 	rc = tpm2_get_cc_attrs_tbl(chip);
+	if (rc == TPM2_RC_FAILURE || (rc < 0 && rc != -ENOMEM)) {
+		dev_info(&chip->dev,
+			 "TPM in field failure mode, requires firmware upgrade\n");
+		chip->flags |= TPM_CHIP_FLAG_FIRMWARE_UPGRADE;
+		rc = 0;
+	}
 
 out:
+	/*
+	 * Infineon TPM in field upgrade mode will return no data for the number
+	 * of supported commands.
+	 */
+	if (rc == TPM2_RC_UPGRADE || rc == -ENODATA) {
+		dev_info(&chip->dev, "TPM in field upgrade mode, requires firmware upgrade\n");
+		chip->flags |= TPM_CHIP_FLAG_FIRMWARE_UPGRADE;
+		rc = 0;
+	}
+
 	if (rc > 0)
 		rc = -ENODEV;
 	return rc;
@@ -761,10 +775,12 @@ out:
 
 int tpm2_find_cc(struct tpm_chip *chip, u32 cc)
 {
+	u32 cc_mask;
 	int i;
 
+	cc_mask = 1 << TPM2_CC_ATTR_VENDOR | GENMASK(15, 0);
 	for (i = 0; i < chip->nr_commands; i++)
-		if (cc == (chip->cc_attrs_tbl[i] & GENMASK(15, 0)))
+		if (cc == (chip->cc_attrs_tbl[i] & cc_mask))
 			return i;
 
 	return -1;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  *
  */
 
@@ -1694,6 +1694,8 @@ static struct qcom_icc_node qns_mem_noc_hf = {
 	.id = SLAVE_MNOC_HF_MEM_NOC,
 	.channels = 2,
 	.buswidth = 32,
+	.init_peak = INT_MAX,
+	.init_avg  = INT_MAX,
 	.noc_ops = &qcom_qnoc4_ops,
 	.num_links = 1,
 	.links = { MASTER_MNOC_HF_MEM_NOC },
@@ -1886,18 +1888,17 @@ static struct qcom_icc_bcm bcm_mc0 = {
 static struct qcom_icc_bcm bcm_mm0 = {
 	.name = "MM0",
 	.voter_idx = 0,
-	.keepalive_early = true,
-	.num_nodes = 1,
-	.nodes = { &qns_mem_noc_hf },
+	.num_nodes = 2,
+	.nodes = { &qns_mem_noc_hf, &qnm_mdp },
 };
 
 static struct qcom_icc_bcm bcm_mm1 = {
 	.name = "MM1",
 	.voter_idx = 0,
 	.enable_mask = 0x1,
-	.num_nodes = 8,
+	.num_nodes = 7,
 	.nodes = { &qnm_camnoc_hf, &qnm_camnoc_icp,
-		   &qnm_camnoc_sf, &qnm_mdp,
+		   &qnm_camnoc_sf,
 		   &qnm_mnoc_cfg, &qnm_video0,
 		   &qnm_video_cpu, &qns_mem_noc_sf },
 };
@@ -2003,16 +2004,8 @@ static struct qcom_icc_bcm bcm_mc0_disp = {
 static struct qcom_icc_bcm bcm_mm0_disp = {
 	.name = "MM0",
 	.voter_idx = 1,
-	.num_nodes = 1,
-	.nodes = { &qns_mem_noc_hf_disp },
-};
-
-static struct qcom_icc_bcm bcm_mm1_disp = {
-	.name = "MM1",
-	.voter_idx = 1,
-	.enable_mask = 0x1,
-	.num_nodes = 1,
-	.nodes = { &qnm_mdp_disp },
+	.num_nodes = 2,
+	.nodes = { &qns_mem_noc_hf_disp, &qnm_mdp_disp },
 };
 
 static struct qcom_icc_bcm bcm_sh0_disp = {
@@ -2321,7 +2314,6 @@ static struct qcom_icc_bcm *mmss_noc_bcms[] = {
 	&bcm_mm0,
 	&bcm_mm1,
 	&bcm_mm0_disp,
-	&bcm_mm1_disp,
 };
 
 static struct qcom_icc_node *mmss_noc_nodes[] = {
@@ -2446,7 +2438,7 @@ static int qnoc_probe(struct platform_device *pdev)
 
 	ret = qcom_icc_rpmh_probe(pdev);
 	if (ret)
-		dev_err(&pdev->dev, "failed to register ICC provider\n");
+		dev_err_probe(&pdev->dev, ret, "failed to register ICC provider\n");
 	else
 		dev_info(&pdev->dev, "Registered PARROT ICC\n");
 
@@ -2488,7 +2480,7 @@ static struct platform_driver qnoc_driver = {
 	.driver = {
 		.name = "qnoc-parrot",
 		.of_match_table = qnoc_of_match,
-		.sync_state = qcom_icc_rpmh_sync_state,
+		.sync_state = icc_sync_state,
 	},
 };
 
@@ -2499,4 +2491,4 @@ static int __init qnoc_driver_init(void)
 core_initcall(qnoc_driver_init);
 
 MODULE_DESCRIPTION("Parrot NoC driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

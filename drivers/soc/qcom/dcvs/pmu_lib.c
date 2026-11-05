@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "qcom-pmu: " fmt
@@ -26,6 +26,7 @@
 #include <linux/spinlock.h>
 #include <linux/perf_event.h>
 #include <linux/cpuidle.h>
+#include <linux/cpu_phys_log_map.h>
 #include <trace/events/power.h>
 #include <trace/hooks/cpuidle.h>
 #include <soc/qcom/pmu_lib.h>
@@ -37,19 +38,25 @@
 static void __iomem *pmu_base;
 static uint32_t phys_cpu[NR_CPUS];
 
-struct evctrs_64 {
-	u64 evctrs[MAX_CPUCP_EVT];
-	u32 valid;
+#if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+#include <linux/qcom_scmi_vendor.h>
+#define MAX_NUM_CPUS		8
+#define PMUMAP_ALGO_STR 0x504D554D4150 /* "PMUMAP" */
+
+enum scmi_c1dcvs_protocol_cmd {
+	SET_PMU_MAP = 11,
+	SET_ENABLE_TRACE,
+	SET_ENABLE_CACHING,
 };
 
-struct evctrs_32 {
+struct pmu_map_msg {
+	uint8_t hw_cntrs[MAX_NUM_CPUS][MAX_CPUCP_EVT];
+};
+#endif
+
+struct cpucp_pmu_ctrs {
 	u32 evctrs[MAX_CPUCP_EVT];
 	u32 valid;
-};
-
-union cpucp_pmu_ctrs {
-	struct evctrs_64 evctrs_64;
-	struct evctrs_32 evctrs_32;
 };
 
 struct event_data {
@@ -81,13 +88,18 @@ static bool qcom_pmu_inited;
 static bool pmu_long_counter;
 static int cpuhp_state;
 static struct scmi_protocol_handle *ph;
-const static struct scmi_pmu_vendor_ops *ops;
+#if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+static const struct qcom_scmi_vendor_ops *ops;
+#else
+static const struct scmi_pmu_vendor_ops *ops;
+#endif
 static LIST_HEAD(idle_notif_list);
 static DEFINE_SPINLOCK(idle_list_lock);
 static struct cpucp_hlos_map cpucp_map[MAX_CPUCP_EVT];
 static struct kobject pmu_kobj;
 static bool pmu_counters_enabled = true;
 static unsigned int pmu_enable_trace;
+static bool llcc_ignore_setup;
 
 /*
  * is_amu_valid: Check if AMUs are supported and if the id corresponds to the
@@ -134,7 +146,7 @@ static inline u64 cached_count_value(struct event_data *ev, u64 event_cached_cou
 	if (amu)
 		return event_cached_count;
 
-	if (cpu_pmu->pmuver >= ID_AA64DFR0_PMUVER_8_5)
+	if (cpu_pmu->pmuver >= ID_AA64DFR0_EL1_PMUVer_V3P5)
 		event_cached_count |= (pmu_long_counter ? BIT(63) : GENMASK(63, 31));
 	else {
 		if (ev->event_id == CYCLE_COUNTER_ID)
@@ -186,6 +198,12 @@ static int set_event(struct event_data *ev, int cpu,
 		attr->config1 = 1;
 
 	if (ev->event_id == QCOM_LLCC_PMU_RD_EV) {
+		/* Ignore setting up the event if property set. This will avoid
+		 * reading of event as well since ev->pevent will be NULL.
+		 */
+		if (llcc_ignore_setup)
+			goto set_cpu;
+
 		ret = qcom_llcc_pmu_hw_type(&type);
 		if (ret < 0)
 			return ret;
@@ -368,13 +386,13 @@ int qcom_get_cpucp_id(u32 event_id, int cpu)
 
 	event = get_event(event_id, cpu);
 	if (IS_ERR(event)) {
-		pr_err("error getting event %d\n", PTR_ERR(event));
+		pr_err("error getting event %ld\n", PTR_ERR(event));
 		return PTR_ERR(event);
 	}
 
 	return event->cid;
 }
-EXPORT_SYMBOL(qcom_get_cpucp_id);
+EXPORT_SYMBOL_GPL(qcom_get_cpucp_id);
 
 int qcom_pmu_event_supported(u32 event_id, int cpu)
 {
@@ -384,13 +402,13 @@ int qcom_pmu_event_supported(u32 event_id, int cpu)
 
 	return PTR_ERR_OR_ZERO(event);
 }
-EXPORT_SYMBOL(qcom_pmu_event_supported);
+EXPORT_SYMBOL_GPL(qcom_pmu_event_supported);
 
 int qcom_pmu_read(int cpu, u32 event_id, u64 *pmu_data)
 {
 	return __qcom_pmu_read(cpu, event_id, pmu_data, false);
 }
-EXPORT_SYMBOL(qcom_pmu_read);
+EXPORT_SYMBOL_GPL(qcom_pmu_read);
 
 int qcom_pmu_read_local(u32 event_id, u64 *pmu_data)
 {
@@ -398,13 +416,13 @@ int qcom_pmu_read_local(u32 event_id, u64 *pmu_data)
 
 	return __qcom_pmu_read(this_cpu, event_id, pmu_data, true);
 }
-EXPORT_SYMBOL(qcom_pmu_read_local);
+EXPORT_SYMBOL_GPL(qcom_pmu_read_local);
 
 int qcom_pmu_read_all(int cpu, struct qcom_pmu_data *data)
 {
 	return __qcom_pmu_read_all(cpu, data, false);
 }
-EXPORT_SYMBOL(qcom_pmu_read_all);
+EXPORT_SYMBOL_GPL(qcom_pmu_read_all);
 
 int qcom_pmu_read_all_local(struct qcom_pmu_data *data)
 {
@@ -412,7 +430,7 @@ int qcom_pmu_read_all_local(struct qcom_pmu_data *data)
 
 	return __qcom_pmu_read_all(this_cpu, data, true);
 }
-EXPORT_SYMBOL(qcom_pmu_read_all_local);
+EXPORT_SYMBOL_GPL(qcom_pmu_read_all_local);
 
 int qcom_pmu_idle_register(struct qcom_pmu_notif_node *idle_node)
 {
@@ -430,7 +448,7 @@ out:
 	spin_unlock(&idle_list_lock);
 	return 0;
 }
-EXPORT_SYMBOL(qcom_pmu_idle_register);
+EXPORT_SYMBOL_GPL(qcom_pmu_idle_register);
 
 int qcom_pmu_idle_unregister(struct qcom_pmu_notif_node *idle_node)
 {
@@ -451,19 +469,41 @@ int qcom_pmu_idle_unregister(struct qcom_pmu_notif_node *idle_node)
 	spin_unlock(&idle_list_lock);
 	return ret;
 }
-EXPORT_SYMBOL(qcom_pmu_idle_unregister);
+EXPORT_SYMBOL_GPL(qcom_pmu_idle_unregister);
+
+static int events_caching_enable(void)
+{
+	int ret = 0;
+	unsigned int enable = 1;
+
+	if (!qcom_pmu_inited)
+		return -EPROBE_DEFER;
+	if (!ops || !pmu_base)
+		return ret;
+#if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+	ret = ops->set_param(ph, &enable, PMUMAP_ALGO_STR,
+		SET_ENABLE_CACHING, sizeof(enable));
+#else
+	ret = ops->set_cache_enable(ph, &enable);
+#endif
+	if (ret < 0)
+		pr_err("failed to set cache enable tunable :%d\n", ret);
+	return ret;
+}
 
 static int configure_cpucp_map(cpumask_t mask)
 {
 	struct event_data *event;
 	int i, cpu, ret = 0, cid;
-	u8 pmu_map[MAX_NUM_CPUS][MAX_CPUCP_EVT];
+	uint8_t pmu_map[MAX_NUM_CPUS][MAX_CPUCP_EVT];
 	struct cpu_data *cpu_data;
-
+#if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+	int j;
+	struct pmu_map_msg msg;
+#endif
 	if (!qcom_pmu_inited)
 		return -EPROBE_DEFER;
-
-	if (!ops || !pmu_base)
+	if (!ops)
 		return ret;
 
 	/*
@@ -484,8 +524,17 @@ static int configure_cpucp_map(cpumask_t mask)
 			pmu_map[phys_cpu[cpu]][cid] = event->pevent->hw.idx;
 		}
 	}
-
+#if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+	for (i = 0; i < MAX_NUM_CPUS; i++) {
+		for (j = 0; j < MAX_CPUCP_EVT; j++)
+			msg.hw_cntrs[i][j] = pmu_map[i][j];
+	}
+	ret = ops->set_param(ph, &msg, PMUMAP_ALGO_STR, SET_PMU_MAP, sizeof(msg));
+#else
 	ret = ops->set_pmu_map(ph, pmu_map);
+#endif
+	if (ret < 0)
+		pr_err("failed to set pmu map :%d\n", ret);
 
 	return ret;
 }
@@ -540,16 +589,11 @@ static int memlat_pm_notif(struct notifier_block *nb, unsigned long action,
 	struct cpu_data *cpu_data = per_cpu(cpu_ev_data, cpu);
 	struct event_data *ev;
 	int i, cid, aid;
-	u64 count;
+	u32 count;
 	bool pmu_valid = false;
 	bool read_ev  = true;
-	union cpucp_pmu_ctrs *base;
+	struct cpucp_pmu_ctrs *base = pmu_base + (sizeof(struct cpucp_pmu_ctrs) * cpu);
 	unsigned long flags;
-
-	if (pmu_long_counter)
-		base = pmu_base + (sizeof(struct evctrs_64) * cpu);
-	else
-		base = pmu_base + (sizeof(struct evctrs_32) * cpu);
 
 	/* Exit if cpu is in hotplug */
 	spin_lock_irqsave(&cpu_data->read_lock, flags);
@@ -559,12 +603,8 @@ static int memlat_pm_notif(struct notifier_block *nb, unsigned long action,
 	}
 
 	if (action == CPU_PM_EXIT) {
-		if (pmu_base) {
-			if (pmu_long_counter)
-				writel_relaxed(0, &base->evctrs_64.valid);
-			else
-				writel_relaxed(0, &base->evctrs_32.valid);
-	}
+		if (pmu_base)
+			writel_relaxed(0, &base->valid);
 		cpu_data->is_pc = false;
 		spin_unlock_irqrestore(&cpu_data->read_lock, flags);
 		return NOTIFY_OK;
@@ -591,18 +631,11 @@ static int memlat_pm_notif(struct notifier_block *nb, unsigned long action,
 		/* Store pmu values in allocated cpucp pmu region */
 		pmu_valid = true;
 		count = cached_count_value(ev, ev->cached_count, is_amu_valid(aid));
-		if (pmu_long_counter)
-			writeq_relaxed(count, &base->evctrs_64.evctrs[cid]);
-		else
-			writel_relaxed(count, &base->evctrs_32.evctrs[cid]);
+		writel_relaxed(count, &base->evctrs[cid]);
 	}
 	/* Set valid cache flag to allow cpucp to read from this memory location */
-	if (pmu_valid) {
-		if (pmu_long_counter)
-			writel_relaxed(1, &base->evctrs_64.valid);
-		else
-			writel_relaxed(1, &base->evctrs_32.valid);
-	}
+	if (pmu_valid)
+		writel_relaxed(1, &base->valid);
 
 dec_read_cnt:
 	if (read_ev)
@@ -623,7 +656,7 @@ static int qcom_pmu_hotplug_coming_up(unsigned int cpu)
 	int i, ret = 0;
 	unsigned long flags;
 	struct event_data *ev;
-	union cpucp_pmu_ctrs *base;
+	struct cpucp_pmu_ctrs *base = pmu_base + (sizeof(struct cpucp_pmu_ctrs) * cpu);
 	cpumask_t mask;
 
 	if (!attr)
@@ -645,17 +678,8 @@ static int qcom_pmu_hotplug_coming_up(unsigned int cpu)
 	cpumask_set_cpu(cpu, &mask);
 	configure_cpucp_map(mask);
 	/* Set valid as 0 as exiting hotplug */
-	if (pmu_long_counter)
-		base = pmu_base + (sizeof(struct evctrs_64) * cpu);
-	else
-		base = pmu_base + (sizeof(struct evctrs_32) * cpu);
-	if (pmu_base) {
-		if (pmu_long_counter)
-			writel_relaxed(0, &base->evctrs_64.valid);
-		else
-			writel_relaxed(0, &base->evctrs_32.valid);
-	}
-
+	if (pmu_base)
+		writel_relaxed(0, &base->valid);
 
 	spin_lock_irqsave(&cpu_data->read_lock, flags);
 	cpu_data->is_hp = false;
@@ -672,8 +696,8 @@ static int qcom_pmu_hotplug_going_down(unsigned int cpu)
 	int i, cid, aid;
 	unsigned long flags;
 	bool pmu_valid = false;
-	u64 count;
-	union cpucp_pmu_ctrs *base;
+	u32 count;
+	struct cpucp_pmu_ctrs *base = pmu_base + (sizeof(struct cpucp_pmu_ctrs) * cpu);
 
 	if (!qcom_pmu_inited)
 		return 0;
@@ -690,28 +714,17 @@ static int qcom_pmu_hotplug_going_down(unsigned int cpu)
 		if (!is_event_valid(ev))
 			continue;
 		ev->cached_count = read_event(ev, false);
-		if (pmu_long_counter)
-			base = pmu_base + (sizeof(struct evctrs_64) * cpu);
-		else
-			base = pmu_base + (sizeof(struct evctrs_32) * cpu);
 		/* Store pmu values in allocated cpucp pmu region */
 		if (pmu_base && is_event_shared(ev)) {
 			pmu_valid = true;
 			count = cached_count_value(ev, ev->cached_count, is_amu_valid(aid));
-			if (pmu_long_counter)
-				writeq_relaxed(count, &base->evctrs_64.evctrs[cid]);
-			else
-				writel_relaxed(count, &base->evctrs_32.evctrs[cid]);
+			writel_relaxed(count, &base->evctrs[cid]);
 		}
 		delete_event(ev);
 	}
 
-	if (pmu_valid) {
-		if (pmu_long_counter)
-			writel_relaxed(1, &base->evctrs_64.valid);
-		else
-			writel_relaxed(1, &base->evctrs_32.valid);
-	}
+	if (pmu_valid)
+		writel_relaxed(1, &base->valid);
 	return 0;
 }
 
@@ -720,9 +733,9 @@ static int qcom_pmu_cpu_hp_init(void)
 	int ret;
 
 	ret = cpuhp_setup_state_nocalls_cpuslocked(CPUHP_AP_ONLINE_DYN,
-				"QCOM_PMU",
-				qcom_pmu_hotplug_coming_up,
-				qcom_pmu_hotplug_going_down);
+						"QCOM_PMU",
+						qcom_pmu_hotplug_coming_up,
+						qcom_pmu_hotplug_going_down);
 	if (ret < 0)
 		pr_err("qcom_pmu: CPU hotplug notifier error: %d\n",
 		       ret);
@@ -736,42 +749,34 @@ static int qcom_pmu_cpu_hp_init(void) { return 0; }
 static void cache_counters(void)
 {
 	struct cpu_data *cpu_data;
-	int i, cid;
+	int i, cid, aid;
 	unsigned int cpu;
 	struct event_data *event;
-	union cpucp_pmu_ctrs *base;
+	struct cpucp_pmu_ctrs *base;
 	bool pmu_valid;
+	u32 count;
 
 	for_each_possible_cpu(cpu) {
 		cpu_data = per_cpu(cpu_ev_data, cpu);
-		if (pmu_long_counter)
-			base = pmu_base + (sizeof(struct evctrs_64) * cpu);
-		else
-			base = pmu_base + (sizeof(struct evctrs_32) * cpu);
+		base = pmu_base + (sizeof(struct cpucp_pmu_ctrs) * cpu);
 		pmu_valid = false;
 		for (i = 0; i < cpu_data->num_evs; i++) {
 			event = &cpu_data->events[i];
 			cid = event->cid;
+			aid = event->amu_id;
 			if (!is_event_valid(event))
 				continue;
 			read_event(event, false);
 			/* Store pmu values in allocated cpucp pmu region */
 			if (pmu_base && is_event_shared(event)) {
 				pmu_valid = true;
-				if (pmu_long_counter)
-					writeq_relaxed(event->cached_count,
-					&base->evctrs_64.evctrs[cid]);
-				else
-					writel_relaxed(event->cached_count,
-					&base->evctrs_32.evctrs[cid]);
+				count = cached_count_value(event, event->cached_count,
+							   is_amu_valid(aid));
+				writel_relaxed(count, &base->evctrs[cid]);
 			}
 		}
-		if (pmu_valid) {
-			if (pmu_long_counter)
-				writel_relaxed(1, &base->evctrs_64.valid);
-			else
-				writel_relaxed(1, &base->evctrs_32.valid);
-		}
+		if (pmu_valid)
+			writel_relaxed(1, &base->valid);
 	}
 }
 
@@ -833,7 +838,7 @@ static int setup_events(void)
 	if (!attr)
 		return -ENOMEM;
 
-	get_online_cpus();
+	cpus_read_lock();
 	for_each_possible_cpu(cpu) {
 		cpu_data = per_cpu(cpu_ev_data, cpu);
 		for (i = 0; i < cpu_data->num_evs; i++) {
@@ -879,7 +884,7 @@ cleanup_events:
 		}
 	}
 out:
-	put_online_cpus();
+	cpus_read_unlock();
 	if (ret != -EPROBE_DEFER && ret != cpuhp_state) {
 		register_trace_android_vh_cpu_idle_enter(qcom_pmu_idle_enter_notif, NULL);
 		register_trace_android_vh_cpu_idle_exit(qcom_pmu_idle_exit_notif, NULL);
@@ -906,22 +911,19 @@ static void load_pmu_counters(void)
 	pr_info("Enabled all perf counters\n");
 }
 
-static void get_mpidr_cpu(void *cpu)
+int cpucp_pmu_init(struct scmi_device *sdev)
 {
-	u64 mpidr = read_cpuid_mpidr() & MPIDR_HWID_BITMASK;
+	int pcpu, ret = 0;
+	uint32_t cpu;
 
-	*((uint32_t *)cpu) = MPIDR_AFFINITY_LEVEL(mpidr, 1);
-}
-
-int rimps_pmu_init(struct scmi_device *sdev)
-{
-	int ret = 0;
-	uint32_t cpu, pcpu;
-
-	if (!sdev || !sdev->handle)
+	if (!sdev || !sdev->handle || !pmu_base)
 		return -EINVAL;
 
-	ops = sdev->handle->devm_get_protocol(sdev, SCMI_PMU_PROTOCOL, &ph);
+#if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+	ops = sdev->handle->devm_protocol_get(sdev, QCOM_SCMI_VENDOR_PROTOCOL, &ph);
+#else
+	ops = sdev->handle->devm_protocol_get(sdev, SCMI_PMU_PROTOCOL, &ph);
+#endif
 	if (IS_ERR(ops)) {
 		ret = PTR_ERR(ops);
 		ops = NULL;
@@ -929,8 +931,9 @@ int rimps_pmu_init(struct scmi_device *sdev)
 	}
 
 	for_each_possible_cpu(cpu) {
-		smp_call_function_single(cpu, get_mpidr_cpu,
-							 &pcpu, true);
+		pcpu = cpu_logical_to_phys(cpu);
+		if (pcpu < 0)
+			pcpu = cpu;
 		phys_cpu[cpu] = pcpu;
 	}
 	/*
@@ -938,12 +941,18 @@ int rimps_pmu_init(struct scmi_device *sdev)
 	 * will be de-allocated. Make ops NULL to avoid further scmi calls.
 	 */
 	ret = configure_cpucp_map(*cpu_possible_mask);
+	if (ret < 0) {
+		ops = NULL;
+		return ret;
+	}
+
+	ret = events_caching_enable();
 	if (ret < 0)
 		ops = NULL;
 
 	return ret;
 }
-EXPORT_SYMBOL(rimps_pmu_init);
+EXPORT_SYMBOL_GPL(cpucp_pmu_init);
 
 static int configure_pmu_event(u32 event_id, int amu_id, int cid, int cpu)
 {
@@ -985,7 +994,7 @@ static int init_pmu_events(struct device *dev)
 	if (len % NUM_COL || len == 0)
 		return -EINVAL;
 	len /= NUM_COL;
-	if (len > MAX_PMU_EVS)
+	if (len >= MAX_PMU_EVS)
 		return -ENOSPC;
 
 	for (i = 0, j = 0; i < len; i++, j += NUM_COL) {
@@ -1022,7 +1031,7 @@ static int init_pmu_events(struct device *dev)
 			cpucp_map[cid].shared = true;
 			cpucp_map[cid].cpus = cpus;
 		}
-		dev_dbg(dev, "entry=%d: ev=%lu, cpus=%lu cpucp id=%lu amu_id=%d\n",
+		dev_dbg(dev, "entry=%d: ev=%d, cpus=%lu cpucp id=%d amu_id=%d\n",
 			i, event_id, cpus, cid, amu_id);
 	}
 
@@ -1083,9 +1092,15 @@ static ssize_t store_enable_trace(struct kobject *kobj,
 	if (ret < 0)
 		return ret;
 
+#if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+	ret = ops->set_param(ph, &var, PMUMAP_ALGO_STR, SET_ENABLE_TRACE, sizeof(var));
+#else
 	ret = ops->set_enable_trace(ph, &var);
-	if (ret < 0)
+#endif
+	if (ret < 0) {
+		pr_err("failed to set enable_trace tunable: %d\n", ret);
 		return ret;
+	}
 
 	pmu_enable_trace = var;
 
@@ -1094,11 +1109,12 @@ static ssize_t store_enable_trace(struct kobject *kobj,
 
 PMU_ATTR_RW(enable_counters);
 PMU_ATTR_RW(enable_trace);
-static struct attribute *pmu_settings_attr[] = {
+static struct attribute *pmu_settings_attrs[] = {
 	&enable_counters.attr,
 	&enable_trace.attr,
 	NULL,
 };
+ATTRIBUTE_GROUPS(pmu_settings);
 
 static ssize_t attr_show(struct kobject *kobj, struct attribute *attr,
 			 char *buf)
@@ -1129,19 +1145,34 @@ static const struct sysfs_ops pmu_sysfs_ops = {
 	.store	= attr_store,
 };
 
-static struct kobj_type pmu_settings_ktype = {
+static const struct kobj_type pmu_settings_ktype = {
 	.sysfs_ops	= &pmu_sysfs_ops,
-	.default_attrs	= pmu_settings_attr,
+	.default_groups	= pmu_settings_groups,
 
 };
 
 static int qcom_pmu_driver_probe(struct platform_device *pdev)
 {
-	struct device *dev = &pdev->dev;
-	int ret = 0, idx;
+	struct device *dev = &pdev->dev, *dev_root;
+	int ret = 0, idx, len;
 	unsigned int cpu;
 	struct cpu_data *cpu_data;
 	struct resource res;
+#if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+	int cpucp_ret = 0;
+	struct scmi_device *scmi_dev;
+
+	scmi_dev = get_qcom_scmi_device();
+	if (IS_ERR(scmi_dev)) {
+		ret = PTR_ERR(scmi_dev);
+		if (ret == -EPROBE_DEFER)
+			return ret;
+		dev_err(dev, "Error getting scmi_dev ret = %d\n", ret);
+	}
+#endif
+	ret = cpu_logical_to_phys(0);
+	if (ret == -EPROBE_DEFER)
+		return ret;
 
 	if (!pmu_base) {
 		idx = of_property_match_string(dev->of_node, "reg-names", "pmu-base");
@@ -1161,6 +1192,11 @@ static int qcom_pmu_driver_probe(struct platform_device *pdev)
 		memset_io(pmu_base, 0, resource_size(&res));
 	}
 skip_pmu:
+	if (of_find_property(dev->of_node, "qcom,ignore-llcc-setup", &len)) {
+		dev_dbg(dev, "Ignoring llcc setup\n");
+		llcc_ignore_setup = true;
+	}
+
 	for_each_possible_cpu(cpu) {
 		cpu_data = devm_kzalloc(dev, sizeof(*cpu_data), GFP_KERNEL);
 		if (!cpu_data)
@@ -1177,8 +1213,15 @@ skip_pmu:
 		return ret;
 	}
 
-	ret = kobject_init_and_add(&pmu_kobj, &pmu_settings_ktype,
-				   &cpu_subsys.dev_root->kobj, "pmu_lib");
+	dev_root = bus_get_dev_root(&cpu_subsys);
+	if (dev_root) {
+		ret = kobject_init_and_add(&pmu_kobj, &pmu_settings_ktype,
+						&dev_root->kobj, "pmu_lib");
+		put_device(dev_root);
+	} else {
+		dev_err(dev, "failed to get cpu_subsys dev_root\n");
+		return -ENODEV;
+	}
 	if (ret < 0) {
 		dev_err(dev, "failed to init pmu counters kobj: %d\n", ret);
 		kobject_put(&pmu_kobj);
@@ -1193,6 +1236,13 @@ skip_pmu:
 	}
 
 	qcom_pmu_inited = true;
+#if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+	if (!IS_ERR(scmi_dev) && pmu_base) {
+		cpucp_ret = cpucp_pmu_init(scmi_dev);
+		if (cpucp_ret < 0)
+			dev_err(dev, "Err during cpucp_pmu_init ret = %d\n", cpucp_ret);
+	}
+#endif
 	return ret;
 }
 
@@ -1218,18 +1268,10 @@ static struct platform_driver qcom_pmu_driver = {
 		.suppress_bind_attrs = true,
 	},
 };
+module_platform_driver(qcom_pmu_driver);
 
-static int __init qcom_pmu_init(void)
-{
-	return platform_driver_register(&qcom_pmu_driver);
-}
-module_init(qcom_pmu_init);
-
-static __exit void qcom_pmu_exit(void)
-{
-	platform_driver_unregister(&qcom_pmu_driver);
-}
-module_exit(qcom_pmu_exit);
-
+#if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+MODULE_SOFTDEP("pre: qcom_scmi_client");
+#endif
 MODULE_DESCRIPTION("QCOM PMU Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

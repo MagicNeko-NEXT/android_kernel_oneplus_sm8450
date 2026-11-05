@@ -733,4 +733,4 @@ static void __exit regulator_debug_exit(void)
 module_exit(regulator_debug_exit);
 
 MODULE_DESCRIPTION("Regulator debug control library");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

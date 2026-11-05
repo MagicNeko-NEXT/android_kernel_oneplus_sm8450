@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #undef TRACE_SYSTEM
 #define TRACE_SYSTEM gh_virtio_frontend
@@ -146,9 +147,9 @@ TRACE_EVENT(virtio_block_done,
 TRACE_EVENT(virtio_block_submit,
 
 	TP_PROTO(unsigned int dev_index, unsigned int type, unsigned int sector,
-				unsigned int ioprio, int err, unsigned int num),
+				unsigned int ioprio, int err),
 
-	TP_ARGS(dev_index, type, sector, ioprio, err, num),
+	TP_ARGS(dev_index, type, sector, ioprio, err),
 
 	TP_STRUCT__entry(
 		__field(unsigned int,	dev_index)
@@ -156,7 +157,6 @@ TRACE_EVENT(virtio_block_submit,
 		__field(unsigned int,	sector)
 		__field(unsigned int,	ioprio)
 		__field(int,	err)
-		__field(unsigned int,	num)
 	),
 
 	TP_fast_assign(
@@ -165,12 +165,10 @@ TRACE_EVENT(virtio_block_submit,
 		__entry->sector		= sector;
 		__entry->ioprio		= ioprio;
 		__entry->err		= err;
-		__entry->num		= num;
 	),
 
-	TP_printk("virtio%u type %x sector %u ioprio %u num %d err %d",
-			__entry->dev_index, __entry->type, __entry->sector,
-			__entry->ioprio, __entry->num, __entry->err)
+	TP_printk("virtio%u type %x sector %u ioprio %u err %d", __entry->dev_index,
+			__entry->type, __entry->sector, __entry->ioprio, __entry->err)
 );
 
 #endif /* _TRACE_GH_VIRTIO_FRONTEND_H */

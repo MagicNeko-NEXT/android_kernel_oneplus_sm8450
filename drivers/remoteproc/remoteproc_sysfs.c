@@ -16,7 +16,7 @@ static ssize_t recovery_show(struct device *dev,
 {
 	struct rproc *rproc = to_rproc(dev);
 
-	return sprintf(buf, "%s", rproc->recovery_disabled ? "disabled\n" : "enabled\n");
+	return sysfs_emit(buf, "%s", rproc->recovery_disabled ? "disabled\n" : "enabled\n");
 }
 
 /*
@@ -51,12 +51,16 @@ static ssize_t recovery_store(struct device *dev,
 
 	if (sysfs_streq(buf, "enabled")) {
 		/* change the flag and begin the recovery process if needed */
+		mutex_lock(&rproc->lock);
 		rproc->recovery_disabled = false;
 		trace_android_vh_rproc_recovery_set(rproc);
+		mutex_unlock(&rproc->lock);
 		rproc_trigger_recovery(rproc);
 	} else if (sysfs_streq(buf, "disabled")) {
+		mutex_lock(&rproc->lock);
 		rproc->recovery_disabled = true;
 		trace_android_vh_rproc_recovery_set(rproc);
+		mutex_unlock(&rproc->lock);
 	} else if (sysfs_streq(buf, "recover")) {
 		/* begin the recovery process without changing the flag */
 		rproc_trigger_recovery(rproc);
@@ -85,7 +89,7 @@ static ssize_t coredump_show(struct device *dev,
 {
 	struct rproc *rproc = to_rproc(dev);
 
-	return sprintf(buf, "%s\n", rproc_coredump_str[rproc->dump_conf]);
+	return sysfs_emit(buf, "%s\n", rproc_coredump_str[rproc->dump_conf]);
 }
 
 /*
@@ -141,11 +145,8 @@ static ssize_t firmware_show(struct device *dev, struct device_attribute *attr,
 	 * If the remote processor has been started by an external
 	 * entity we have no idea of what image it is running.  As such
 	 * simply display a generic string rather then rproc->firmware.
-	 *
-	 * Here we rely on the autonomous flag because a remote processor
-	 * may have been attached to and currently in a running state.
 	 */
-	if (rproc->autonomous)
+	if (rproc->state == RPROC_ATTACHED)
 		firmware = "unknown";
 
 	return sprintf(buf, "%s\n", firmware);
@@ -175,6 +176,7 @@ static const char * const rproc_state_string[] = {
 	[RPROC_RUNNING]		= "running",
 	[RPROC_CRASHED]		= "crashed",
 	[RPROC_DELETED]		= "deleted",
+	[RPROC_ATTACHED]	= "attached",
 	[RPROC_DETACHED]	= "detached",
 	[RPROC_LAST]		= "invalid",
 };
@@ -199,17 +201,13 @@ static ssize_t state_store(struct device *dev,
 	int ret = 0;
 
 	if (sysfs_streq(buf, "start")) {
-		if (rproc->state == RPROC_RUNNING)
-			return -EBUSY;
-
 		ret = rproc_boot(rproc);
 		if (ret)
 			dev_err(&rproc->dev, "Boot failed: %d\n", ret);
 	} else if (sysfs_streq(buf, "stop")) {
-		if (rproc->state != RPROC_RUNNING)
-			return -EINVAL;
-
-		rproc_shutdown(rproc);
+		ret = rproc_shutdown(rproc);
+	} else if (sysfs_streq(buf, "detach")) {
+		ret = rproc_detach(rproc);
 	} else {
 		dev_err(&rproc->dev, "Unrecognised option: %s\n", buf);
 		ret = -EINVAL;
@@ -228,6 +226,22 @@ static ssize_t name_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(name);
 
+static umode_t rproc_is_visible(struct kobject *kobj, struct attribute *attr,
+				int n)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct rproc *rproc = to_rproc(dev);
+	umode_t mode = attr->mode;
+
+	if (rproc->sysfs_read_only && (attr == &dev_attr_recovery.attr ||
+				       attr == &dev_attr_firmware.attr ||
+				       attr == &dev_attr_state.attr ||
+				       attr == &dev_attr_coredump.attr))
+		mode = 0444;
+
+	return mode;
+}
+
 static struct attribute *rproc_attrs[] = {
 	&dev_attr_coredump.attr,
 	&dev_attr_recovery.attr,
@@ -238,7 +252,8 @@ static struct attribute *rproc_attrs[] = {
 };
 
 static const struct attribute_group rproc_devgroup = {
-	.attrs = rproc_attrs
+	.attrs = rproc_attrs,
+	.is_visible = rproc_is_visible,
 };
 
 static const struct attribute_group *rproc_devgroups[] = {

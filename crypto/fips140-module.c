@@ -14,14 +14,21 @@
  * don't need to meet these requirements.
  */
 
+/*
+ * Since this .c file is the real entry point of fips140.ko, it needs to be
+ * compiled normally, so undo the hacks that were done in fips140-defs.h.
+ */
+#define MODULE
+#undef KBUILD_MODFILE
 #undef __DISABLE_EXPORTS
 
 #include <linux/ctype.h>
+#include <linux/debugfs.h>
 #include <linux/module.h>
 #include <crypto/aead.h>
 #include <crypto/aes.h>
 #include <crypto/hash.h>
-#include <crypto/sha.h>
+#include <crypto/sha2.h>
 #include <crypto/skcipher.h>
 #include <crypto/rng.h>
 #include <trace/hooks/fips140.h>
@@ -37,8 +44,8 @@ u8 __initdata fips140_integ_hmac_key[] = "The quick brown fox jumps over the laz
 /* this is populated by the build tool */
 u8 __initdata fips140_integ_hmac_digest[SHA256_DIGEST_SIZE];
 
-const u32 __initcall_start_marker __section(".initcalls._start");
-const u32 __initcall_end_marker __section(".initcalls._end");
+const initcall_entry_t __fips140_initcalls_start __section(".initcalls._start");
+const initcall_entry_t __fips140_initcalls_end __section(".initcalls._end");
 
 const u8 __fips140_text_start __section(".text.._start");
 const u8 __fips140_text_end __section(".text.._end");
@@ -48,83 +55,154 @@ const u8 __fips140_rodata_end __section(".rodata.._end");
 
 /*
  * We need this little detour to prevent Clang from detecting out of bounds
- * accesses to __fips140_text_start and __fips140_rodata_start, which only exist
- * to delineate the section, and so their sizes are not relevant to us.
+ * accesses to the above *_start symbols, which exist only to delineate the
+ * corresponding sections, and so their sizes are not relevant to us.
  */
-const u32 *__initcall_start = &__initcall_start_marker;
-
-const u8 *__text_start = &__fips140_text_start;
-const u8 *__rodata_start = &__fips140_rodata_start;
+const initcall_entry_t *fips140_initcalls_start = &__fips140_initcalls_start;
+const u8 *fips140_text_start = &__fips140_text_start;
+const u8 *fips140_rodata_start = &__fips140_rodata_start;
 
 /*
- * The list of the crypto API algorithms (by cra_name) that will be unregistered
- * by this module, in preparation for the module registering its own
- * implementation(s) of them.
+ * fips140_algs[] lists the algorithms that this module unregisters from the
+ * kernel crypto API so that it can register its own implementation(s) of them.
  *
- * All algorithms that will be declared as FIPS-approved in the module
- * certification must be listed here, to ensure that the non-FIPS-approved
- * implementations of these algorithms in the kernel image aren't used.
- *
- * For every algorithm in this list, the module should contain all the "same"
- * implementations that the kernel image does, including the C implementation as
- * well as any architecture-specific implementations.  This is needed to avoid
- * performance regressions as well as the possibility of an algorithm being
- * unavailable on some CPUs.  E.g., "xcbc(aes)" isn't in this list, as the
- * module doesn't have a C implementation of it (and it won't be FIPS-approved).
- *
- * Due to a quirk in the FIPS requirements, "gcm(aes)" isn't actually able to be
- * FIPS-approved.  However, we otherwise treat it the same as the algorithms
- * that will be FIPS-approved, and therefore it's included in this list.
- *
- * When adding a new algorithm here, make sure to consider whether it needs a
- * self-test added to fips140_selftests[] as well.
+ * There are two reasons to do the unregistration, i.e. replace the kernel's
+ * algorithms instead of just adding more algorithms.  First, the kernel crypto
+ * API doesn't allow algorithms with duplicate driver names.  Second, for FIPS
+ * approved algorithms we have to ensure that the FIPS copies are actually used.
  */
-static const struct {
-	const char *name;
-	bool approved;
-} fips140_algs_to_replace[] = {
-	{"aes", true},
-
-	{"cmac(aes)", true},
-	{"ecb(aes)", true},
-
-	{"cbc(aes)", true},
-	{"cts(cbc(aes))", true},
-	{"ctr(aes)", true},
-	{"xts(aes)", true},
-	{"gcm(aes)", false},
-
-	{"hmac(sha1)", true},
-	{"hmac(sha224)", true},
-	{"hmac(sha256)", true},
-	{"hmac(sha384)", true},
-	{"hmac(sha512)", true},
-	{"sha1", true},
-	{"sha224", true},
-	{"sha256", true},
-	{"sha384", true},
-	{"sha512", true},
-
-	{"stdrng", true},
-	{"jitterentropy_rng", false},
-};
-
-static bool __init fips140_should_unregister_alg(struct crypto_alg *alg)
-{
-	int i;
+static struct fips140_alg {
+	/*
+	 * Either cra_name or cra_driver_name is set.
+	 *
+	 * cra_name makes the entry match all software implementations of a
+	 * given algorithm.  This is used when the module is meant to replace
+	 * *all* software implementations of the algorithm.  This is required
+	 * for FIPS approved algorithms (approved=true).  When using this style
+	 * of matching, it must be ensured that the module contains all the same
+	 * implementations of the algorithm as the kernel itself; otherwise the
+	 * kernel's functionality and/or performance could be impacted by the
+	 * insertion of the fips140 module.
+	 *
+	 * cra_driver_name makes the entry match a single implementation of an
+	 * algorithm.  This is used for some specific non FIPS approved
+	 * algorithm implementations that get pulled in by being located in the
+	 * same source files as implementations of FIPS approved algorithms.
+	 */
+	const char *cra_name;
+	const char *cra_driver_name;
 
 	/*
-	 * All software algorithms are synchronous, hardware algorithms must
-	 * be covered by their own FIPS 140 certification.
+	 * approved is true if fips140_is_approved_service() should return that
+	 * the algorithm is approved.  This requires cra_name != NULL.
 	 */
-	if (alg->cra_flags & CRYPTO_ALG_ASYNC)
+	bool approved;
+
+	/*
+	 * maybe_uninstantiated is true if the module provides this algorithm
+	 * but doesn't register it directly at module initialization time.  This
+	 * occurs for some of the HMAC variants because they are provided by a
+	 * template which isn't immediately instantiated for every SHA variant
+	 * (since the HMAC self-test only has to test one SHA variant).
+	 */
+	bool maybe_uninstantiated;
+
+	/*
+	 * unregistered_inkern gets set to true at runtime if at least one
+	 * algorithm matching this entry was unregistered from the kernel.  This
+	 * is used to detect unregistrations with no matching registration.
+	 */
+	bool unregistered_inkern;
+} fips140_algs[] = {
+	/* Approved algorithms, all specified by cra_name */
+	{ .cra_name = "aes", .approved = true },
+	{ .cra_name = "cbc(aes)", .approved = true },
+	{ .cra_name = "cmac(aes)", .approved = true },
+	{ .cra_name = "ctr(aes)", .approved = true },
+	{ .cra_name = "cts(cbc(aes))", .approved = true },
+	{ .cra_name = "ecb(aes)", .approved = true },
+	{ .cra_name = "hmac(sha1)", .approved = true,
+	  .maybe_uninstantiated = true },
+	{ .cra_name = "hmac(sha224)", .approved = true,
+	  .maybe_uninstantiated = true },
+	{ .cra_name = "hmac(sha256)", .approved = true },
+	{ .cra_name = "hmac(sha384)", .approved = true,
+	  .maybe_uninstantiated = true },
+	{ .cra_name = "hmac(sha512)", .approved = true,
+	  .maybe_uninstantiated = true },
+	{ .cra_name = "sha1", .approved = true },
+	{ .cra_name = "sha224", .approved = true },
+	{ .cra_name = "sha256", .approved = true },
+	{ .cra_name = "sha384", .approved = true },
+	{ .cra_name = "sha512", .approved = true },
+	{ .cra_name = "sha3-224", .approved = true },
+	{ .cra_name = "sha3-256", .approved = true },
+	{ .cra_name = "sha3-384", .approved = true },
+	{ .cra_name = "sha3-512", .approved = true },
+	{ .cra_name = "stdrng", .approved = true },
+	{ .cra_name = "xts(aes)", .approved = true },
+
+	/*
+	 * Non-approved algorithms specified by cra_name.
+	 *
+	 * Due to a quirk in the FIPS requirements, AES-GCM can't be FIPS
+	 * approved.  But we treat it the same as approved algorithms in that we
+	 * ensure that a self-test and all needed implementations are included.
+	 *
+	 * The Jitter RNG is needed in the module as an entropy source for the
+	 * DRBG algorithms, but it's not considered to be approved itself.
+	 */
+	{ .cra_name = "gcm(aes)" },
+	{ .cra_name = "jitterentropy_rng" },
+
+	/* Non-approved algorithms specified by cra_driver_name */
+	{ .cra_driver_name = "essiv-cbc-aes-sha256-ce" },
+	{ .cra_driver_name = "essiv-cbc-aes-sha256-neon" },
+	{ .cra_driver_name = "cbcmac-aes-ce" },
+	{ .cra_driver_name = "cbcmac-aes-neon" },
+	{ .cra_driver_name = "rfc4106-gcm-aes-ce" },
+	{ .cra_driver_name = "xcbc-aes-ce" },
+	{ .cra_driver_name = "xcbc-aes-neon" },
+	{ .cra_driver_name = "xctr-aes-ce" },
+	{ .cra_driver_name = "xctr-aes-neon" },
+};
+
+/*
+ * Return true if the crypto API algorithm @calg is matched by the fips140
+ * module algorithm specification @falg.
+ */
+static bool __init fips140_alg_matches(const struct fips140_alg *falg,
+				       const struct crypto_alg *calg)
+{
+	/*
+	 * All software algorithms are synchronous.  Hardware algorithms must be
+	 * covered by their own FIPS 140 certification.
+	 */
+	if (calg->cra_flags & CRYPTO_ALG_ASYNC)
 		return false;
 
-	for (i = 0; i < ARRAY_SIZE(fips140_algs_to_replace); i++) {
-		if (!strcmp(alg->cra_name, fips140_algs_to_replace[i].name))
-			return true;
-	}
+	if (falg->cra_name != NULL &&
+	    strcmp(falg->cra_name, calg->cra_name) == 0)
+		return true;
+
+	if (falg->cra_driver_name != NULL &&
+	    strcmp(falg->cra_driver_name, calg->cra_driver_name) == 0)
+		return true;
+
 	return false;
+}
+
+/* Find the entry in fips140_algs[], if any, that @calg is matched by. */
+static struct fips140_alg *__init
+fips140_find_matching_alg(const struct crypto_alg *calg)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(fips140_algs); i++) {
+		if (fips140_alg_matches(&fips140_algs[i], calg))
+			return &fips140_algs[i];
+	}
+	return NULL;
 }
 
 /*
@@ -154,9 +232,11 @@ bool fips140_is_approved_service(const char *name)
 {
 	size_t i;
 
-	for (i = 0; i < ARRAY_SIZE(fips140_algs_to_replace); i++) {
-		if (!strcmp(name, fips140_algs_to_replace[i].name))
-			return fips140_algs_to_replace[i].approved;
+	for (i = 0; i < ARRAY_SIZE(fips140_algs); i++) {
+		if (fips140_algs[i].approved &&
+		    fips140_algs[i].cra_name != NULL &&
+		    strcmp(name, fips140_algs[i].cra_name) == 0)
+			return true;
 	}
 	return false;
 }
@@ -219,7 +299,7 @@ static void fips140_remove_final(struct list_head *list)
 
 static void __init unregister_existing_fips140_algos(void)
 {
-	struct crypto_alg *alg, *tmp;
+	struct crypto_alg *calg, *tmp;
 	LIST_HEAD(remove_list);
 	LIST_HEAD(spawns);
 
@@ -232,10 +312,14 @@ static void __init unregister_existing_fips140_algos(void)
 	 * use. If they are, we can't fully unregister them but we can ensure
 	 * that new users won't use them.
 	 */
-	list_for_each_entry_safe(alg, tmp, &crypto_alg_list, cra_list) {
-		if (!fips140_should_unregister_alg(alg))
+	list_for_each_entry_safe(calg, tmp, &crypto_alg_list, cra_list) {
+		struct fips140_alg *falg = fips140_find_matching_alg(calg);
+
+		if (!falg)
 			continue;
-		if (refcount_read(&alg->cra_refcnt) == 1) {
+		falg->unregistered_inkern = true;
+
+		if (refcount_read(&calg->cra_refcnt) == 1) {
 			/*
 			 * This algorithm is not currently in use, but there may
 			 * be template instances holding references to it via
@@ -244,9 +328,9 @@ static void __init unregister_existing_fips140_algos(void)
 			 * the lock, to prevent races with concurrent TFM
 			 * allocations.
 			 */
-			alg->cra_flags |= CRYPTO_ALG_DEAD;
-			list_move(&alg->cra_list, &remove_list);
-			crypto_remove_spawns(alg, &spawns, NULL);
+			calg->cra_flags |= CRYPTO_ALG_DEAD;
+			list_move(&calg->cra_list, &remove_list);
+			crypto_remove_spawns(calg, &spawns, NULL);
 		} else {
 			/*
 			 * This algorithm is live, i.e. it has TFMs allocated,
@@ -256,7 +340,7 @@ static void __init unregister_existing_fips140_algos(void)
 			 * certified crypto in the first place.  However, we do
 			 * need to ensure that new users will get the FIPS code.
 			 *
-			 * In most cases, setting alg->cra_priority to 0
+			 * In most cases, setting calg->cra_priority to 0
 			 * achieves this.  However, that isn't enough for
 			 * algorithms like "hmac(sha256)" that need to be
 			 * instantiated from a template, since existing
@@ -267,18 +351,56 @@ static void __init unregister_existing_fips140_algos(void)
 			 * algorithms, we also append "+orig" to its name.
 			 */
 			pr_info("found already-live algorithm '%s' ('%s')\n",
-				alg->cra_name, alg->cra_driver_name);
-			alg->cra_priority = 0;
-			strlcat(alg->cra_name, "+orig", CRYPTO_MAX_ALG_NAME);
-			strlcat(alg->cra_driver_name, "+orig",
+				calg->cra_name, calg->cra_driver_name);
+			calg->cra_priority = 0;
+			strlcat(calg->cra_name, "+orig", CRYPTO_MAX_ALG_NAME);
+			strlcat(calg->cra_driver_name, "+orig",
 				CRYPTO_MAX_ALG_NAME);
-			list_move(&alg->cra_list, &existing_live_algos);
+			list_move(&calg->cra_list, &existing_live_algos);
 		}
 	}
 	up_write(&crypto_alg_sem);
 
 	fips140_remove_final(&remove_list);
 	fips140_remove_final(&spawns);
+}
+
+/*
+ * The algorithms unregistered by fips140.ko are determined by fips140_algs[],
+ * but the algorithms registered by fips140.ko are determined by its initcalls.
+ * There is a chance these get out of sync.  Therefore, this function detects
+ * cases where an algorithm was unregistered without a replacement being
+ * registered.  It returns true if things look ok or false if there's a problem.
+ */
+static bool __init fips140_verify_no_extra_unregistrations(void)
+{
+	bool ok = true;
+	size_t i;
+
+	down_read(&crypto_alg_sem);
+	for (i = 0; i < ARRAY_SIZE(fips140_algs); i++) {
+		const struct fips140_alg *falg = &fips140_algs[i];
+		const struct crypto_alg *calg;
+		bool registered = false;
+
+		if (falg->maybe_uninstantiated || !falg->unregistered_inkern)
+			continue;
+
+		list_for_each_entry(calg, &crypto_alg_list, cra_list) {
+			if (fips140_alg_matches(falg, calg)) {
+				registered = true;
+				break;
+			}
+		}
+		if (!registered) {
+			pr_err("This module unregistered %s but did not replace it!\n",
+			       falg->cra_name ?: falg->cra_driver_name);
+			pr_err("Either remove it from fips140_algs[], or fix the module to include it.\n");
+			ok = false;
+		}
+	}
+	up_read(&crypto_alg_sem);
+	return ok;
 }
 
 static void __init unapply_text_relocations(void *section, int section_size,
@@ -291,6 +413,10 @@ static void __init unapply_text_relocations(void *section, int section_size,
 
 		switch (ELF64_R_TYPE(rela->r_info)) {
 #ifdef CONFIG_ARM64
+		case R_AARCH64_ABS32: /* for KCFI */
+			*place = 0;
+			break;
+
 		case R_AARCH64_JUMP26:
 		case R_AARCH64_CALL26:
 			*place &= ~GENMASK(25, 0);
@@ -347,6 +473,94 @@ static void __init unapply_rodata_relocations(void *section, int section_size,
 	}
 }
 
+enum {
+	PACIASP		= 0xd503233f,
+	AUTIASP		= 0xd50323bf,
+	SCS_PUSH	= 0xf800865e,
+	SCS_POP		= 0xf85f8e5e,
+};
+
+/*
+ * To make the integrity check work with dynamic Shadow Call Stack (SCS),
+ * replace all instructions that push or pop from the SCS with the Pointer
+ * Authentication Code (PAC) instructions that were present originally.
+ */
+static void __init unapply_scs_patch(void *section, int section_size)
+{
+#if defined(CONFIG_ARM64) && defined(CONFIG_UNWIND_PATCH_PAC_INTO_SCS)
+	u32 *insns = section;
+	int i;
+
+	for (i = 0; i < section_size / sizeof(insns[0]); i++) {
+		if (insns[i] == SCS_PUSH)
+			insns[i] = PACIASP;
+		else if (insns[i] == SCS_POP)
+			insns[i] = AUTIASP;
+	}
+#endif
+}
+
+#ifdef CONFIG_CRYPTO_FIPS140_MOD_DEBUG_INTEGRITY_CHECK
+static struct {
+	const void *text;
+	int textsize;
+	const void *rodata;
+	int rodatasize;
+} saved_integrity_check_info;
+
+static ssize_t fips140_text_read(struct file *file, char __user *to,
+				 size_t count, loff_t *ppos)
+{
+	return simple_read_from_buffer(to, count, ppos,
+				       saved_integrity_check_info.text,
+				       saved_integrity_check_info.textsize);
+}
+
+static ssize_t fips140_rodata_read(struct file *file, char __user *to,
+				   size_t count, loff_t *ppos)
+{
+	return simple_read_from_buffer(to, count, ppos,
+				       saved_integrity_check_info.rodata,
+				       saved_integrity_check_info.rodatasize);
+}
+
+static const struct file_operations fips140_text_fops = {
+	.read = fips140_text_read,
+};
+
+static const struct file_operations fips140_rodata_fops = {
+	.read = fips140_rodata_read,
+};
+
+static void fips140_init_integrity_debug_files(const void *text, int textsize,
+					       const void *rodata,
+					       int rodatasize)
+{
+	struct dentry *dir;
+
+	dir = debugfs_create_dir("fips140", NULL);
+
+	saved_integrity_check_info.text = kmemdup(text, textsize, GFP_KERNEL);
+	saved_integrity_check_info.textsize = textsize;
+	if (saved_integrity_check_info.text)
+		debugfs_create_file("text", 0400, dir, NULL,
+				    &fips140_text_fops);
+
+	saved_integrity_check_info.rodata = kmemdup(rodata, rodatasize,
+						    GFP_KERNEL);
+	saved_integrity_check_info.rodatasize = rodatasize;
+	if (saved_integrity_check_info.rodata)
+		debugfs_create_file("rodata", 0400, dir, NULL,
+				    &fips140_rodata_fops);
+}
+#else /* CONFIG_CRYPTO_FIPS140_MOD_DEBUG_INTEGRITY_CHECK */
+static void fips140_init_integrity_debug_files(const void *text, int textsize,
+					       const void *rodata,
+					       int rodatasize)
+{
+}
+#endif /* !CONFIG_CRYPTO_FIPS140_MOD_DEBUG_INTEGRITY_CHECK */
+
 extern struct {
 	u32	offset;
 	u32	count;
@@ -376,8 +590,8 @@ static bool __init check_fips140_module_hmac(void)
 
 	rodatacopy = textcopy + textsize;
 
-	memcpy(textcopy, __text_start, textsize);
-	memcpy(rodatacopy, __rodata_start, rodatasize);
+	memcpy(textcopy, fips140_text_start, textsize);
+	memcpy(rodatacopy, fips140_rodata_start, rodatasize);
 
 	// apply the relocations in reverse on the copies of .text  and .rodata
 	unapply_text_relocations(textcopy, textsize,
@@ -387,6 +601,11 @@ static bool __init check_fips140_module_hmac(void)
 	unapply_rodata_relocations(rodatacopy, rodatasize,
 				  offset_to_ptr(&fips140_rela_rodata.offset),
 				  fips140_rela_rodata.count);
+
+	unapply_scs_patch(textcopy, textsize);
+
+	fips140_init_integrity_debug_files(textcopy, textsize,
+					   rodatacopy, rodatasize);
 
 	fips140_inject_integrity_failure(textcopy);
 
@@ -477,20 +696,10 @@ static bool update_fips140_library_routines(void)
 	return ret == 0;
 }
 
-/*
- * Initialize the FIPS 140 module.
- *
- * Note: this routine iterates over the contents of the initcall section, which
- * consists of an array of function pointers that was emitted by the linker
- * rather than the compiler. This means that these function pointers lack the
- * usual CFI stubs that the compiler emits when CFI codegen is enabled. So
- * let's disable CFI locally when handling the initcall array, to avoid
- * surpises.
- */
-static int __init __attribute__((__no_sanitize__("cfi")))
-fips140_init(void)
+/* Initialize the FIPS 140 module */
+static int __init fips140_init(void)
 {
-	const u32 *initcall;
+	const initcall_entry_t *initcall;
 
 	pr_info("loading " FIPS140_MODULE_NAME " " FIPS140_MODULE_VERSION "\n");
 	fips140_init_thread = current;
@@ -498,10 +707,10 @@ fips140_init(void)
 	unregister_existing_fips140_algos();
 
 	/* iterate over all init routines present in this module and call them */
-	for (initcall = __initcall_start + 1;
-	     initcall < &__initcall_end_marker;
+	for (initcall = fips140_initcalls_start + 1;
+	     initcall < &__fips140_initcalls_end;
 	     initcall++) {
-		int (*init)(void) = offset_to_ptr(initcall);
+		initcall_t init = offset_to_ptr(initcall);
 		int err = init();
 
 		/*
@@ -518,6 +727,9 @@ fips140_init(void)
 	if (!fips140_run_selftests())
 		goto panic;
 
+	if (!fips140_verify_no_extra_unregistrations())
+		goto panic;
+
 	/*
 	 * It may seem backward to perform the integrity check last, but this
 	 * is intentional: the check itself uses hmac(sha256) which is one of
@@ -528,10 +740,14 @@ fips140_init(void)
 	 */
 
 	if (!check_fips140_module_hmac()) {
-		pr_crit("integrity check failed -- giving up!\n");
-		goto panic;
+		if (!IS_ENABLED(CONFIG_CRYPTO_FIPS140_MOD_DEBUG_INTEGRITY_CHECK)) {
+			pr_crit("integrity check failed -- giving up!\n");
+			goto panic;
+		}
+		pr_crit("ignoring integrity check failure due to debug mode\n");
+	} else {
+		pr_info("integrity check passed\n");
 	}
-	pr_info("integrity check passed\n");
 
 	complete_all(&fips140_tests_done);
 
@@ -554,50 +770,48 @@ MODULE_IMPORT_NS(CRYPTO_INTERNAL);
 MODULE_LICENSE("GPL v2");
 
 /*
- * Crypto-related helper functions, reproduced here so that they will be
- * covered by the FIPS 140 integrity check.
+ * Below are copies of some selected "crypto-related" helper functions that are
+ * used by fips140.ko but are not already built into it, due to them being
+ * defined in a file that cannot easily be built into fips140.ko (e.g.,
+ * crypto/algapi.c) instead of one that can (e.g., most files in lib/).
  *
- * Non-cryptographic helper functions such as memcpy() can be excluded from the
- * FIPS module, but there is ambiguity about other helper functions like
- * __crypto_xor() and crypto_inc() which aren't cryptographic by themselves,
- * but are more closely associated with cryptography than e.g. memcpy(). To
- * err on the side of caution, we include copies of these in the FIPS module.
+ * There is no hard rule about what needs to be included here, as this is for
+ * FIPS certifiability, not any technical reason.  FIPS modules are supposed to
+ * implement the "crypto" themselves, but to do so they are allowed to call
+ * non-cryptographic helper functions from outside the module.  Something like
+ * memcpy() is "clearly" non-cryptographic.  However, there is is ambiguity
+ * about functions like crypto_inc() which aren't cryptographic by themselves,
+ * but are more closely associated with cryptography than e.g. memcpy().  To err
+ * on the side of caution, we define copies of some selected functions below so
+ * that calls to them from within fips140.ko will remain in fips140.ko.
  */
-void __crypto_xor(u8 *dst, const u8 *src1, const u8 *src2, unsigned int len)
+
+static inline void crypto_inc_byte(u8 *a, unsigned int size)
 {
-	while (len >= 8) {
-		*(u64 *)dst = *(u64 *)src1 ^  *(u64 *)src2;
-		dst += 8;
-		src1 += 8;
-		src2 += 8;
-		len -= 8;
-	}
+	u8 *b = (a + size);
+	u8 c;
 
-	while (len >= 4) {
-		*(u32 *)dst = *(u32 *)src1 ^ *(u32 *)src2;
-		dst += 4;
-		src1 += 4;
-		src2 += 4;
-		len -= 4;
+	for (; size; size--) {
+		c = *--b + 1;
+		*b = c;
+		if (c)
+			break;
 	}
-
-	while (len >= 2) {
-		*(u16 *)dst = *(u16 *)src1 ^ *(u16 *)src2;
-		dst += 2;
-		src1 += 2;
-		src2 += 2;
-		len -= 2;
-	}
-
-	while (len--)
-		*dst++ = *src1++ ^ *src2++;
 }
 
 void crypto_inc(u8 *a, unsigned int size)
 {
-	a += size;
+	__be32 *b = (__be32 *)(a + size);
+	u32 c;
 
-	while (size--)
-		if (++*--a)
-			break;
+	if (IS_ENABLED(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS) ||
+	    IS_ALIGNED((unsigned long)b, __alignof__(*b)))
+		for (; size >= 4; size -= 4) {
+			c = be32_to_cpu(*--b) + 1;
+			*b = cpu_to_be32(c);
+			if (likely(c))
+				return;
+		}
+
+	crypto_inc_byte(a, size);
 }

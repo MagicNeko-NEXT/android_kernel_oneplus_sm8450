@@ -3,6 +3,7 @@
  * f_qdss.c -- QDSS function Driver
  *
  * Copyright (c) 2012-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/init.h>
@@ -386,7 +387,7 @@ static void clear_eps(struct usb_function *f)
 	if (qdss->port.ctrl_out)
 		qdss->port.ctrl_out->driver_data = NULL;
 	if (qdss->port.data) {
-		if (!strcmp(qdss->ch.name, USB_QDSS_CH_MSM)) {
+		if (!qdss_uses_sw_path(qdss)) {
 			msm_ep_clear_ops(qdss->port.data);
 			msm_ep_set_mode(qdss->port.data, USB_EP_NONE);
 		}
@@ -460,8 +461,11 @@ static int qdss_bind(struct usb_configuration *c, struct usb_function *f)
 	qdss->port.data = ep;
 	ep->driver_data = qdss;
 
-	if (!strcmp(qdss->ch.name, USB_QDSS_CH_MSM)) {
-		ret = msm_ep_set_mode(qdss->port.data, USB_EP_BAM);
+	if (!qdss_uses_sw_path(qdss)) {
+		ret = msm_ep_set_mode(qdss->port.data, qdss->ch.ch_type);
+		if (ret < 0)
+			goto clear_ep;
+
 		msm_ep_update_ops(qdss->port.data);
 	}
 
@@ -484,8 +488,8 @@ static int qdss_bind(struct usb_configuration *c, struct usb_function *f)
 		ep->driver_data = qdss;
 	}
 
-	if (!strcmp(qdss->ch.name, USB_QDSS_CH_MSM)) {
-		ret = alloc_sps_req(qdss->port.data);
+	if (!qdss_uses_sw_path(qdss)) {
+		ret = alloc_hw_req(qdss->port.data);
 		if (ret) {
 			pr_err("%s: alloc_sps_req error (%d)\n",
 							__func__, ret);
@@ -530,7 +534,7 @@ fail:
 clear_ep:
 	clear_eps(f);
 
-	return -ENOTSUPP;
+	return -EOPNOTSUPP;
 }
 
 
@@ -599,10 +603,6 @@ static void usb_qdss_disconnect_work(struct work_struct *work)
 
 	/* Uninitialized init data i.e. ep specific operation */
 	if (qdss->opened && !qdss_uses_sw_path(qdss)) {
-		status = uninit_data(qdss->port.data);
-		if (status)
-			pr_err("%s: uninit_data error\n", __func__);
-
 		status = set_qdss_data_connection(qdss, 0);
 		if (status)
 			pr_err("qdss_disconnect error\n");
@@ -648,6 +648,7 @@ static void usb_qdss_connect_work(struct work_struct *work)
 	/* If cable is already removed, discard connect_work */
 	if (qdss->usb_connected == 0) {
 		cancel_work_sync(&qdss->disconnect_w);
+		usb_gadget_autopm_put_async(qdss->gadget);
 		return;
 	}
 
@@ -809,10 +810,8 @@ static struct f_qdss *alloc_usb_qdss(char *channel_name)
 	}
 
 	qdss = kzalloc(sizeof(struct f_qdss), GFP_KERNEL);
-	if (!qdss) {
-		pr_err("%s: Unable to allocate qdss device\n", __func__);
+	if (!qdss)
 		return ERR_PTR(-ENOMEM);
-	}
 
 	qdss->wq = create_singlethread_workqueue(channel_name);
 	if (!qdss->wq) {
@@ -823,6 +822,12 @@ static struct f_qdss *alloc_usb_qdss(char *channel_name)
 	spin_lock_irqsave(&channel_lock, flags);
 	ch = &qdss->ch;
 	ch->name = channel_name;
+
+	if (!strcmp(ch->name, USB_QDSS_CH_EBC))
+		ch->ch_type = USB_EP_EBC;
+	else
+		ch->ch_type = USB_EP_NONE;
+
 	list_add_tail(&ch->list, &usb_qdss_ch_list);
 	spin_unlock_irqrestore(&channel_lock, flags);
 
@@ -1022,14 +1027,10 @@ void usb_qdss_close(struct usb_qdss_ch *ch)
 	if (!qdss->usb_connected || qdss_uses_sw_path(qdss))
 		goto unlock_out;
 
-	if (qdss->endless_req) {
+	if (qdss->endless_req)
 		usb_ep_dequeue(qdss->port.data, qdss->endless_req);
-	}
-	gadget = qdss->gadget;
 
-	status = uninit_data(qdss->port.data);
-	if (status)
-		pr_err("%s: uninit_data error\n", __func__);
+	gadget = qdss->gadget;
 
 	status = set_qdss_data_connection(qdss, 0);
 	if (status)
@@ -1089,7 +1090,7 @@ static struct configfs_item_operations qdss_item_ops = {
 static ssize_t qdss_enable_debug_inface_show(struct config_item *item,
 			char *page)
 {
-	return snprintf(page, PAGE_SIZE, "%s\n",
+	return scnprintf(page, PAGE_SIZE, "%s\n",
 		(to_f_qdss_opts(item)->usb_qdss->debug_inface_enabled) ?
 		"Enabled" : "Disabled");
 }
@@ -1235,4 +1236,4 @@ static void __exit usb_qdss_exit(void)
 module_init(usb_qdss_init);
 module_exit(usb_qdss_exit);
 MODULE_DESCRIPTION("USB QDSS Function Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

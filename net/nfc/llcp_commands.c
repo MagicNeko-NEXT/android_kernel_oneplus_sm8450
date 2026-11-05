@@ -337,8 +337,6 @@ int nfc_llcp_send_disconnect(struct nfc_llcp_sock *sock)
 	struct nfc_dev *dev;
 	struct nfc_llcp_local *local;
 
-	pr_debug("Sending DISC\n");
-
 	local = sock->local;
 	if (local == NULL)
 		return -ENODEV;
@@ -362,8 +360,6 @@ int nfc_llcp_send_symm(struct nfc_dev *dev)
 	struct nfc_llcp_local *local;
 	u16 size = 0;
 	int err;
-
-	pr_debug("Sending SYMM\n");
 
 	local = nfc_llcp_find_local(dev);
 	if (local == NULL)
@@ -405,8 +401,6 @@ int nfc_llcp_send_connect(struct nfc_llcp_sock *sock)
 	int err;
 	u16 size = 0;
 	__be16 miux;
-
-	pr_debug("Sending CONNECT\n");
 
 	local = sock->local;
 	if (local == NULL)
@@ -481,8 +475,6 @@ int nfc_llcp_send_cc(struct nfc_llcp_sock *sock)
 	int err;
 	u16 size = 0;
 	__be16 miux;
-
-	pr_debug("Sending CC\n");
 
 	local = sock->local;
 	if (local == NULL)
@@ -786,8 +778,23 @@ int nfc_llcp_send_ui_frame(struct nfc_llcp_sock *sock, u8 ssap, u8 dsap,
 		if (likely(frag_len > 0))
 			skb_put_data(pdu, msg_ptr, frag_len);
 
+		spin_lock(&local->tx_queue.lock);
+
+		if (list_empty(&local->list)) {
+			spin_unlock(&local->tx_queue.lock);
+
+			kfree_skb(pdu);
+
+			len -= remaining_len;
+			if (len == 0)
+				len = -ENXIO;
+			break;
+		}
+
 		/* No need to check for the peer RW for UI frames */
-		skb_queue_tail(&local->tx_queue, pdu);
+		__skb_queue_tail(&local->tx_queue, pdu);
+
+		spin_unlock(&local->tx_queue.lock);
 
 		remaining_len -= frag_len;
 		msg_ptr += frag_len;

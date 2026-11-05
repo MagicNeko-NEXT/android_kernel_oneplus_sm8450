@@ -1,7 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.*/
-/* Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
- */
+/* Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved. */
 
 #ifndef _MHI_QCOM_
 #define _MHI_QCOM_
@@ -80,6 +78,7 @@ struct mhi_pci_dev_info {
 	bool allow_m1;
 	bool skip_forced_suspend;
 	bool sfr_support;
+	bool timesync;
 	bool drv_support;
 };
 

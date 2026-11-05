@@ -114,7 +114,7 @@ static struct fb_fix_screeninfo ufx_fix = {
 	.accel =        FB_ACCEL_NONE,
 };
 
-static const u32 smscufx_info_flags = FBINFO_DEFAULT | FBINFO_READS_FAST |
+static const u32 smscufx_info_flags = FBINFO_READS_FAST |
 	FBINFO_VIRTFB |	FBINFO_HWACCEL_IMAGEBLIT | FBINFO_HWACCEL_FILLRECT |
 	FBINFO_HWACCEL_COPYAREA | FBINFO_MISC_ALWAYS_SETPAR;
 
@@ -780,6 +780,9 @@ static int ufx_ops_mmap(struct fb_info *info, struct vm_area_struct *vma)
 	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
 	unsigned long page, pos;
 
+	if (info->fbdefio)
+		return fb_deferred_io_mmap(info, vma);
+
 	if (vma->vm_pgoff > (~0UL >> PAGE_SHIFT))
 		return -EINVAL;
 	if (size > info->fix.smem_len)
@@ -953,12 +956,10 @@ static void ufx_ops_fillrect(struct fb_info *info,
  *   Touching ANY framebuffer memory that triggers a page fault
  *   in fb_defio will cause a deadlock, when it also tries to
  *   grab the same mutex. */
-static void ufx_dpy_deferred_io(struct fb_info *info,
-				struct list_head *pagelist)
+static void ufx_dpy_deferred_io(struct fb_info *info, struct list_head *pagereflist)
 {
-	struct page *cur;
-	struct fb_deferred_io *fbdefio = info->fbdefio;
 	struct ufx_data *dev = info->par;
+	struct fb_deferred_io_pageref *pageref;
 
 	if (!fb_defio)
 		return;
@@ -967,12 +968,12 @@ static void ufx_dpy_deferred_io(struct fb_info *info,
 		return;
 
 	/* walk the written page list and render each to device */
-	list_for_each_entry(cur, &fbdefio->pagelist, lru) {
+	list_for_each_entry(pageref, pagereflist, list) {
 		/* create a rectangle of full screen width that encloses the
 		 * entire dirty framebuffer page */
 		const int x = 0;
 		const int width = dev->info->var.xres;
-		const int y = (cur->index << PAGE_SHIFT) / (width * 2);
+		const int y = pageref->offset / (width * 2);
 		int height = (PAGE_SIZE / (width * 2)) + 1;
 		height = min(height, (int)(dev->info->var.yres - y));
 
@@ -987,7 +988,6 @@ static int ufx_ops_ioctl(struct fb_info *info, unsigned int cmd,
 			 unsigned long arg)
 {
 	struct ufx_data *dev = info->par;
-	struct dloarea *area = NULL;
 
 	if (!atomic_read(&dev->usb_active))
 		return 0;
@@ -1002,6 +1002,10 @@ static int ufx_ops_ioctl(struct fb_info *info, unsigned int cmd,
 
 	/* TODO: Help propose a standard fb.h ioctl to report mmap damage */
 	if (cmd == UFX_IOCTL_REPORT_DAMAGE) {
+		struct dloarea *area __free(kfree) = kmalloc(sizeof(*area), GFP_KERNEL);
+		if (!area)
+			return -ENOMEM;
+
 		/* If we have a damage-aware client, turn fb_defio "off"
 		 * To avoid perf imact of unnecessary page fault handling.
 		 * Done by resetting the delay for this fb_info to a very
@@ -1011,7 +1015,8 @@ static int ufx_ops_ioctl(struct fb_info *info, unsigned int cmd,
 		if (info->fbdefio)
 			info->fbdefio->delay = UFX_DEFIO_WRITE_DISABLE;
 
-		area = (struct dloarea *)arg;
+		if (copy_from_user(area, (u8 __user *)arg, sizeof(*area)))
+			return -EFAULT;
 
 		if (area->x < 0)
 			area->x = 0;
@@ -1149,7 +1154,7 @@ static void ufx_free_framebuffer(struct ufx_data *dev)
 		fb_dealloc_cmap(&info->cmap);
 	if (info->monspecs.modedb)
 		fb_destroy_modedb(info->monspecs.modedb);
-	vfree(info->screen_base);
+	vfree(info->screen_buffer);
 
 	fb_destroy_modelist(&info->modelist);
 
@@ -1256,7 +1261,7 @@ static int ufx_ops_set_par(struct fb_info *info)
 
 	if ((result == 0) && (dev->fb_count == 0)) {
 		/* paint greenscreen */
-		pix_framebuffer = (u16 *) info->screen_base;
+		pix_framebuffer = (u16 *)info->screen_buffer;
 		for (i = 0; i < info->fix.smem_len / 2; i++)
 			pix_framebuffer[i] = 0x37e6;
 
@@ -1302,7 +1307,7 @@ static int ufx_realloc_framebuffer(struct ufx_data *dev, struct fb_info *info)
 {
 	int old_len = info->fix.smem_len;
 	int new_len;
-	unsigned char *old_fb = info->screen_base;
+	unsigned char *old_fb = info->screen_buffer;
 	unsigned char *new_fb;
 
 	pr_debug("Reallocating framebuffer. Addresses will change!");
@@ -1317,12 +1322,12 @@ static int ufx_realloc_framebuffer(struct ufx_data *dev, struct fb_info *info)
 		if (!new_fb)
 			return -ENOMEM;
 
-		if (info->screen_base) {
+		if (info->screen_buffer) {
 			memcpy(new_fb, old_fb, old_len);
-			vfree(info->screen_base);
+			vfree(info->screen_buffer);
 		}
 
-		info->screen_base = new_fb;
+		info->screen_buffer = new_fb;
 		info->fix.smem_len = PAGE_ALIGN(new_len);
 		info->fix.smem_start = (unsigned long) new_fb;
 		info->flags = smscufx_info_flags;
@@ -1495,7 +1500,7 @@ static int ufx_setup_modes(struct ufx_data *dev, struct fb_info *info,
 	u8 *edid;
 	int i, result = 0, tries = 3;
 
-	if (info->dev) /* only use mutex if info has been registered */
+	if (refcount_read(&info->count)) /* only use mutex if info has been registered */
 		mutex_lock(&info->lock);
 
 	edid = kmalloc(EDID_LENGTH, GFP_KERNEL);
@@ -1609,7 +1614,7 @@ error:
 	if (edid && (dev->edid != edid))
 		kfree(edid);
 
-	if (info->dev)
+	if (refcount_read(&info->count))
 		mutex_unlock(&info->lock);
 
 	return result;
@@ -1745,7 +1750,7 @@ reset_active:
 	atomic_set(&dev->usb_active, 0);
 setup_modes:
 	fb_destroy_modedb(info->monspecs.modedb);
-	vfree(info->screen_base);
+	vfree(info->screen_buffer);
 	fb_destroy_modelist(&info->modelist);
 error:
 	fb_dealloc_cmap(&info->cmap);

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #if !defined(_TRACE_QCOM_LPM_H) || defined(TRACE_HEADER_MULTI_READ)
@@ -31,7 +32,7 @@ TRACE_EVENT(lpm_gov_select,
 		       __entry->reason = reason;
 	),
 
-	TP_printk("state:%d qos-us:%lld sleep-us:%llu reason:%#x",
+	TP_printk("state:%d qos-us:%lld sleep-us:%llu reason:%#llx",
 		  __entry->idx, __entry->qos, __entry->sleep, __entry->reason)
 );
 
@@ -53,7 +54,7 @@ TRACE_EVENT(gov_pred_select,
 		__entry->tmr_time = tmr_time;
 	),
 
-	TP_printk("pred:%u time:%lu tmr_time:%u",
+	TP_printk("pred:%u time:%llu tmr_time:%u",
 		__entry->predtype, __entry->predicted, __entry->tmr_time)
 );
 

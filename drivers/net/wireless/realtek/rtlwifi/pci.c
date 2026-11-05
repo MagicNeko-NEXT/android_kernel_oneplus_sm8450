@@ -1035,7 +1035,7 @@ static void _rtl_pci_prepare_bcn_tasklet(struct tasklet_struct *t)
 	}
 
 	/*NB: the beacon data buffer must be 32-bit aligned. */
-	pskb = ieee80211_beacon_get(hw, mac->vif);
+	pskb = ieee80211_beacon_get(hw, mac->vif, 0);
 	if (!pskb)
 		return;
 	hdr = rtl_get_hdr(pskb);
@@ -1675,6 +1675,7 @@ static void rtl_pci_deinit(struct ieee80211_hw *hw)
 
 	synchronize_irq(rtlpci->pdev->irq);
 	tasklet_kill(&rtlpriv->works.irq_tasklet);
+	tasklet_kill(&rtlpriv->works.irq_prepare_bcn_tasklet);
 	cancel_work_sync(&rtlpriv->works.lps_change_work);
 }
 
@@ -2188,7 +2189,7 @@ int rtl_pci_probe(struct pci_dev *pdev,
 		err = -ENODEV;
 		goto fail2;
 	}
-	rtlpriv->cfg->ops->init_sw_leds(hw);
+	rtl_init_sw_leds(hw);
 
 	/*aspm */
 	rtl_pci_init_aspm(hw);

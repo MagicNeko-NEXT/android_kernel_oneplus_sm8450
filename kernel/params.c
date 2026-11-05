@@ -4,6 +4,7 @@
 
 */
 #include <linux/kernel.h>
+#include <linux/kstrtox.h>
 #include <linux/string.h>
 #include <linux/errno.h>
 #include <linux/module.h>
@@ -310,7 +311,7 @@ int param_set_bool(const char *val, const struct kernel_param *kp)
 	if (!val) val = "1";
 
 	/* One of =[yYnN01] */
-	return strtobool(val, kp->arg);
+	return kstrtobool(val, kp->arg);
 }
 EXPORT_SYMBOL(param_set_bool);
 
@@ -330,7 +331,7 @@ EXPORT_SYMBOL(param_ops_bool);
 
 int param_set_bool_enable_only(const char *val, const struct kernel_param *kp)
 {
-	int err = 0;
+	int err;
 	bool new_value;
 	bool orig_value = *(bool *)kp->arg;
 	struct kernel_param dummy_kp = *kp;
@@ -592,12 +593,6 @@ static ssize_t param_attr_store(struct module_attribute *mattr,
 }
 #endif
 
-#ifdef CONFIG_MODULES
-#define __modinit
-#else
-#define __modinit __init
-#endif
-
 #ifdef CONFIG_SYSFS
 void kernel_param_lock(struct module *mod)
 {
@@ -622,9 +617,9 @@ EXPORT_SYMBOL(kernel_param_unlock);
  * create file in sysfs.  Returns an error on out of memory.  Always cleans up
  * if there's an error.
  */
-static __modinit int add_sysfs_param(struct module_kobject *mk,
-				     const struct kernel_param *kp,
-				     const char *name)
+static __init_or_module int add_sysfs_param(struct module_kobject *mk,
+					    const struct kernel_param *kp,
+					    const char *name)
 {
 	struct module_param_attrs *new_mp;
 	struct attribute **new_attrs;
@@ -749,16 +744,8 @@ void module_param_sysfs_remove(struct module *mod)
 }
 #endif
 
-void destroy_params(const struct kernel_param *params, unsigned num)
-{
-	unsigned int i;
-
-	for (i = 0; i < num; i++)
-		if (params[i].ops->free)
-			params[i].ops->free(params[i].arg);
-}
-
-static struct module_kobject * __init locate_module_kobject(const char *name)
+struct module_kobject * __init_or_module
+lookup_or_create_module_kobject(const char *name)
 {
 	struct module_kobject *mk;
 	struct kobject *kobj;
@@ -800,7 +787,7 @@ static void __init kernel_add_sysfs_param(const char *name,
 	struct module_kobject *mk;
 	int err;
 
-	mk = locate_module_kobject(name);
+	mk = lookup_or_create_module_kobject(name);
 	if (!mk)
 		return;
 
@@ -846,7 +833,7 @@ static void __init param_sysfs_builtin(void)
 			name_len = 0;
 		} else {
 			name_len = dot - kp->name + 1;
-			strlcpy(modname, kp->name, name_len);
+			strscpy(modname, kp->name, name_len);
 		}
 		kernel_add_sysfs_param(modname, kp, name_len);
 	}
@@ -861,19 +848,17 @@ ssize_t __modver_version_show(struct module_attribute *mattr,
 	return scnprintf(buf, PAGE_SIZE, "%s\n", vattr->version);
 }
 
-extern const struct module_version_attribute *__start___modver[];
-extern const struct module_version_attribute *__stop___modver[];
+extern const struct module_version_attribute __start___modver[];
+extern const struct module_version_attribute __stop___modver[];
 
 static void __init version_sysfs_builtin(void)
 {
-	const struct module_version_attribute **p;
+	const struct module_version_attribute *vattr;
 	struct module_kobject *mk;
 	int err;
 
-	for (p = __start___modver; p < __stop___modver; p++) {
-		const struct module_version_attribute *vattr = *p;
-
-		mk = locate_module_kobject(vattr->module_name);
+	for (vattr = __start___modver; vattr < __stop___modver; vattr++) {
+		mk = lookup_or_create_module_kobject(vattr->module_name);
 		if (mk) {
 			err = sysfs_create_file(&mk->kobj, &vattr->mattr.attr);
 			WARN_ON_ONCE(err);
@@ -928,9 +913,9 @@ static const struct sysfs_ops module_sysfs_ops = {
 	.store = module_attr_store,
 };
 
-static int uevent_filter(struct kset *kset, struct kobject *kobj)
+static int uevent_filter(const struct kobject *kobj)
 {
-	struct kobj_type *ktype = get_ktype(kobj);
+	const struct kobj_type *ktype = get_ktype(kobj);
 
 	if (ktype == &module_ktype)
 		return 1;
@@ -942,7 +927,6 @@ static const struct kset_uevent_ops module_uevent_ops = {
 };
 
 struct kset *module_kset;
-int module_sysfs_initialized;
 
 static void module_kobj_release(struct kobject *kobj)
 {
@@ -952,13 +936,17 @@ static void module_kobj_release(struct kobject *kobj)
 		complete(mk->kobj_completion);
 }
 
-struct kobj_type module_ktype = {
+const struct kobj_type module_ktype = {
 	.release   =	module_kobj_release,
 	.sysfs_ops =	&module_sysfs_ops,
 };
 
 /*
- * param_sysfs_init - wrapper for built-in params support
+ * param_sysfs_init - create "module" kset
+ *
+ * This must be done before the initramfs is unpacked and
+ * request_module() thus becomes possible, because otherwise the
+ * module load would fail in mod_sysfs_init.
  */
 static int __init param_sysfs_init(void)
 {
@@ -968,13 +956,43 @@ static int __init param_sysfs_init(void)
 			__FILE__, __LINE__);
 		return -ENOMEM;
 	}
-	module_sysfs_initialized = 1;
+
+	return 0;
+}
+subsys_initcall(param_sysfs_init);
+
+/*
+ * param_sysfs_builtin_init - add sysfs version and parameter
+ * attributes for built-in modules
+ */
+static int __init param_sysfs_builtin_init(void)
+{
+	if (!module_kset)
+		return -ENOMEM;
 
 	version_sysfs_builtin();
 	param_sysfs_builtin();
 
 	return 0;
 }
-subsys_initcall(param_sysfs_init);
+late_initcall(param_sysfs_builtin_init);
 
 #endif /* CONFIG_SYSFS */
+
+#ifdef CONFIG_MODULES
+
+/*
+ * module_destroy_params - free all parameters for one module
+ * @params: module parameters (array)
+ * @num: number of module parameters
+ */
+void module_destroy_params(const struct kernel_param *params, unsigned int num)
+{
+	unsigned int i;
+
+	for (i = 0; i < num; i++)
+		if (params[i].ops->free)
+			params[i].ops->free(params[i].arg);
+}
+
+#endif /* CONFIG_MODULES */

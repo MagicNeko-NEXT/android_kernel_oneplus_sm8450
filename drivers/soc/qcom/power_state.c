@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2025, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "%s: %s: " fmt, KBUILD_MODNAME, __func__
@@ -30,7 +29,6 @@
 
 #include "linux/power_state.h"
 
-
 #if IS_ENABLED(CONFIG_ARCH_MONACO)
 #define DS_ENTRY_SMC_ID		0xC3000924
 #else
@@ -48,7 +46,6 @@
 #define DS_NUM_PARAMETERS	1
 #define DS_ENTRY		1
 #define DS_EXIT			0
-
 
 #define POWER_STATS_BASEMINOR		0
 #define POWER_STATS_MAX_MINOR		1
@@ -122,13 +119,13 @@ static struct power_state_drvdata *drv;
 
 static int subsys_suspend(struct subsystem_data *ss_data, struct rproc *rproc, uint32_t state)
 {
-	int ret = 0;
+	int ret;
 
 	switch (state) {
 	case SUBSYS_DEEPSLEEP:
 	case SUBSYS_HIBERNATE:
 		ss_data->ignore_ssr = true;
-		rproc_shutdown(rproc);
+		ret = rproc_shutdown(rproc);
 		ss_data->ignore_ssr = false;
 		break;
 	default:
@@ -142,7 +139,7 @@ static int subsys_suspend(struct subsystem_data *ss_data, struct rproc *rproc, u
 
 static int subsys_resume(struct subsystem_data *ss_data, struct rproc *rproc, u32 state)
 {
-	int ret = 0;
+	int ret;
 
 	switch (state) {
 	case SUBSYS_DEEPSLEEP:
@@ -167,7 +164,7 @@ static int subsystem_resume(struct power_state_drvdata *drv, u32 state)
 	struct rproc *rproc = NULL;
 
 	list_for_each_entry(ss_data, &drv->sub_sys_list, list) {
-		pr_info("%s subsystem resume start\n", ss_data->name);
+		pr_debug("%s subsystem resume start\n", ss_data->name);
 		rproc = rproc_get_by_phandle(ss_data->rproc_handle);
 		if (!rproc)
 			return -ENODEV;
@@ -178,7 +175,7 @@ static int subsystem_resume(struct power_state_drvdata *drv, u32 state)
 			BUG();
 		}
 		rproc_put(rproc);
-		pr_info("%s subsystem resume complete\n", ss_data->name);
+		pr_debug("%s subsystem resume complete\n", ss_data->name);
 	}
 
 	return ret;
@@ -191,7 +188,7 @@ static int subsystem_suspend(struct power_state_drvdata *drv, u32 state)
 	struct rproc *rproc = NULL;
 
 	list_for_each_entry(ss_data, &drv->sub_sys_list, list) {
-		pr_info("%s subsystem suspend start\n", ss_data->name);
+		pr_debug("%s subsystem suspend start\n", ss_data->name);
 		rproc = rproc_get_by_phandle(ss_data->rproc_handle);
 		if (!rproc)
 			return -ENODEV;
@@ -199,10 +196,11 @@ static int subsystem_suspend(struct power_state_drvdata *drv, u32 state)
 		ret = subsys_suspend(ss_data, rproc, state);
 		if (ret) {
 			pr_err("%s subsystem suspend failed\n", ss_data->name);
+			/* There is no SoC recovery if this fails */
 			BUG();
 		}
 		rproc_put(rproc);
-		pr_info("%s subsystem suspend complete\n", ss_data->name);
+		pr_debug("%s subsystem suspend complete\n", ss_data->name);
 	}
 
 	return ret;
@@ -238,7 +236,6 @@ static int send_deep_sleep_vote(int state, struct power_state_drvdata *drv)
 	return msm_rpm_send_message(MSM_RPM_CTX_SLEEP_SET, RPM_XO_DS_REQ,
 				    RPM_XO_DS_ID, &drv->kvp_req, 1);
 }
-
 #elif IS_ENABLED(CONFIG_NOTIFY_AOP)
 static int send_deep_sleep_vote(int state, struct power_state_drvdata *drv)
 {
@@ -272,7 +269,7 @@ static long ps_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			__pm_relax(drv->ps_ws);
 		}
 		drv->current_state = ACTIVE;
-		pr_info("low power mode exit complete\n");
+		pr_debug("low power mode exit complete\n");
 		break;
 
 	case ENTER_DEEPSLEEP:
@@ -317,7 +314,6 @@ static long ps_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	default:
 		pr_err("Inside default in power_state.c due to %d\n", cmd);
 		ret = -ENOIOCTLCMD;
-		pr_err("%s: Default\n", __func__);
 		break;
 	}
 
@@ -360,7 +356,7 @@ static int ps_ssr_cb(struct notifier_block *nb, unsigned long opcode, void *data
 		}
 	}
 
-	if (!ss_present || ss_data->ignore_ssr)
+	if (!ss_present || (ss_present && ss_data && ss_data->ignore_ssr))
 		return NOTIFY_DONE;
 
 	switch (opcode) {
@@ -388,7 +384,7 @@ static int ps_pm_cb(struct notifier_block *nb, unsigned long event, void *unused
 	switch (event) {
 	case PM_SUSPEND_PREPARE:
 		if (drv->current_state == DEEPSLEEP) {
-			pr_info("Deep Sleep entry\n");
+			pr_debug("Deep Sleep entry\n");
 			ret = send_deep_sleep_vote(DS_ENTRY, drv);
 			if (ret)
 				return NOTIFY_BAD;
@@ -400,10 +396,11 @@ static int ps_pm_cb(struct notifier_block *nb, unsigned long event, void *unused
 
 	case PM_POST_SUSPEND:
 		if (pm_suspend_via_firmware()) {
-			pr_info("Deep Sleep exit\n");
+			pr_debug("Deep Sleep exit\n");
 
 			ret = send_deep_sleep_vote(DS_EXIT, drv);
 			if (ret)
+				/* There is no SoC recovery if this fails */
 				BUG_ON(1);
 			__pm_stay_awake(drv->ps_ws);
 			send_uevent(drv, EXIT_DEEP_SLEEP);
@@ -413,7 +410,7 @@ static int ps_pm_cb(struct notifier_block *nb, unsigned long event, void *unused
 		break;
 
 	case PM_HIBERNATION_PREPARE:
-		pr_info("Hibernate entry\n");
+		pr_debug("Hibernate entry\n");
 
 		send_uevent(drv, PREPARE_FOR_HIBERNATION);
 		drv->current_state = HIBERNATE;
@@ -425,7 +422,7 @@ static int ps_pm_cb(struct notifier_block *nb, unsigned long event, void *unused
 
 	case PM_POST_HIBERNATION:
 	case PM_POST_RESTORE:
-		pr_info("Hibernate exit\n");
+		pr_debug("Hibernate exit\n");
 		send_uevent(drv, EXIT_HIBERNATE);
 		break;
 
@@ -441,7 +438,7 @@ static void power_state_resume(void)
 {
 	struct arm_smccc_res res;
 
-	if (pm_suspend_via_firmware())
+	if (pm_suspend_target_state == PM_SUSPEND_MEM)
 		arm_smccc_smc(DS_ENTRY_SMC_ID, DS_NUM_PARAMETERS, DS_EXIT, 0, 0, 0, 0, 0, &res);
 }
 
@@ -449,7 +446,7 @@ static int power_state_suspend(void)
 {
 	struct arm_smccc_res res;
 
-	if (pm_suspend_via_firmware()) {
+	if (pm_suspend_target_state == PM_SUSPEND_MEM) {
 		arm_smccc_smc(DS_ENTRY_SMC_ID, DS_NUM_PARAMETERS, DS_ENTRY, 0, 0, 0, 0, 0, &res);
 		if (res.a0)
 			return res.a0;
@@ -479,7 +476,7 @@ static ssize_t suspend_delay_store(struct kobject *kobj, struct kobj_attribute *
 		return ret;
 	}
 
-	drv->suspend_delay = val;
+	drv->deep_sleep_allowed = val;
 
 	return count;
 }
@@ -529,35 +526,26 @@ static int power_state_dev_init(struct power_state_drvdata *drv)
 
 	cdev_init(&drv->ps_cdev, &ps_fops);
 	ret = cdev_add(&drv->ps_cdev, drv->ps_dev_no, 1);
-	if (ret) {
-		unregister_chrdev_region(drv->ps_dev_no, 1);
-		return ret;
-	}
+	if (ret)
+		goto unregister_chrdev;
 
-	drv->ps_class = class_create(THIS_MODULE, POWER_STATE_DEVICE_NAME);
+	drv->ps_class = class_create(POWER_STATE_DEVICE_NAME);
 	if (IS_ERR_OR_NULL(drv->ps_class)) {
-		cdev_del(&drv->ps_cdev);
-		unregister_chrdev_region(drv->ps_dev_no, 1);
-		return PTR_ERR(drv->ps_class);
+		ret = PTR_ERR(drv->ps_class);
+		goto delete_cdev;
 	}
 
 	drv->ps_dev = device_create(drv->ps_class, NULL,
 				    drv->ps_dev_no, NULL, POWER_STATE_DEVICE_NAME);
 	if (IS_ERR_OR_NULL(drv->ps_dev)) {
-		class_destroy(drv->ps_class);
-		cdev_del(&drv->ps_cdev);
-		unregister_chrdev_region(drv->ps_dev_no, 1);
-		return PTR_ERR(drv->ps_dev);
+		ret = PTR_ERR(drv->ps_dev);
+		goto destroy_class;
 	}
 
 	drv->ps_kobj = kobject_create_and_add(POWER_STATE_DEVICE_NAME, kernel_kobj);
 	if (!drv->ps_kobj) {
 		ret = -ENOMEM;
-		device_destroy(drv->ps_class, drv->ps_dev_no);
-		class_destroy(drv->ps_class);
-		cdev_del(&drv->ps_cdev);
-		unregister_chrdev_region(drv->ps_dev_no, 1);
-		return ret;
+		goto destroy_device;
 	}
 
 	sysfs_attr_init(&drv->ps_ka.attr);
@@ -600,9 +588,17 @@ static int power_state_dev_init(struct power_state_drvdata *drv)
 
 exit:
 	kobject_put(drv->ps_kobj);
+
+destroy_device:
 	device_destroy(drv->ps_class, drv->ps_dev_no);
+
+destroy_class:
 	class_destroy(drv->ps_class);
+
+delete_cdev:
 	cdev_del(&drv->ps_cdev);
+
+unregister_chrdev:
 	unregister_chrdev_region(drv->ps_dev_no, 1);
 
 	return ret;
@@ -642,7 +638,7 @@ static int power_state_probe(struct platform_device *pdev)
 		if (ret)
 			goto remove_ss;
 
-		ss_data = devm_kzalloc(&pdev->dev, sizeof(struct subsystem_data), GFP_KERNEL);
+		ss_data = devm_kzalloc(&pdev->dev, sizeof(*ss_data), GFP_KERNEL);
 		if (!ss_data) {
 			ret = -ENOMEM;
 			goto remove_ss;
@@ -698,7 +694,6 @@ remove_ss:
 		qcom_unregister_ssr_notifier(ss_data->ssr_handle, &ss_data->ps_ssr_nb);
 		list_del(&ss_data->list);
 	}
-	INIT_LIST_HEAD(&drv->sub_sys_list);
 	wakeup_source_unregister(drv->ps_ws);
 remove_pm_notifier:
 	unregister_pm_notifier(&drv->ps_pm_nb);
@@ -749,4 +744,4 @@ static struct platform_driver power_state_driver = {
 
 module_platform_driver(power_state_driver);
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. (QTI) Power State Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

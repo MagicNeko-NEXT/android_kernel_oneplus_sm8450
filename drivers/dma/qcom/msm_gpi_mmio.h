@@ -1,11 +1,23 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2017-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 /* Register offsets from gpi-top */
+#define GPI_GPII_MAP_EE_n_CH_k_VP_TABLE(n, k) \
+		(0x17800 + (0x4 * (k)) + (0x80 * (n)))
 #define GPI_GPII_n_CH_k_CNTXT_0_OFFS(n, k) \
-	(0x20000 + (0x4000 * (n)) + (0x80 * (k)))
+		(0x20000 + (0x4000 * (n)) + (0x80 * (k)))
+#define GPI_GPII_n_CH_k_CNTXT_2_OFFS(n, k) \
+		(0x20008 + (0x4000 * (n)) + (0x80 * (k)))
+#define GPI_GPII_n_CH_k_CNTXT_4_OFFS(n, k) \
+		(0x20010 + (0x4000 * (n)) + (0x80 * (k)))
+#define GPI_GPII_n_CH_k_CNTXT_6_OFFS(n, k) \
+		(0x20018 + (0x4000 * (n)) + (0x80 * (k)))
+#define GPI_GPII_n_CH_k_RE_FETCH_READ_PTR(n, k) \
+		(0x20054 + (0x4000 * (n)) + (0x80 * (k)))
+
 #define GPI_GPII_n_CH_k_CNTXT_0_ELEMENT_SIZE_BMSK (0xFF000000)
 #define GPI_GPII_n_CH_k_CNTXT_0_ELEMENT_SIZE_SHFT (24)
 #define GPI_GPII_n_CH_k_CNTXT_0_CHSTATE_BMSK (0xF00000)
@@ -43,10 +55,19 @@
 #define GPI_GPII_n_CH_CMD_UART_SW_STALE (32)
 #define GPI_GPII_n_CH_CMD_UART_RFR_READY (33)
 #define GPI_GPII_n_CH_CMD_UART_RFR_NOT_READY (34)
+#define GPI_GPII_n_CH_CMD_ENABLE_HID (48)
+#define GPI_GPII_n_CH_CMD_DISABLE_HID (49)
 
 /* EV Context Array */
 #define GPI_GPII_n_EV_CH_k_CNTXT_0_OFFS(n, k) \
-	(0x21000 + (0x4000 * (n)) + (0x80 * (k)))
+		(0x21000 + (0x4000 * (n)) + (0x80 * (k)))
+#define GPI_GPII_n_EV_CH_k_CNTXT_2_OFFS(n, k) \
+		(0x21008 + (0x4000 * (n)) + (0x80 * (k)))
+#define GPI_GPII_n_EV_CH_k_CNTXT_4_OFFS(n, k) \
+		(0x21010 + (0x4000 * (n)) + (0x80 * (k)))
+#define GPI_GPII_n_EV_CH_k_CNTXT_6_OFFS(n, k) \
+		(0x21018 + (0x4000 * (n)) + (0x80 * (k)))
+
 #define GPI_GPII_n_EV_CH_k_CNTXT_0_ELEMENT_SIZE_BMSK (0xFF000000)
 #define GPI_GPII_n_EV_CH_k_CNTXT_0_ELEMENT_SIZE_SHFT (24)
 #define GPI_GPII_n_EV_CH_k_CNTXT_0_CHSTATE_BMSK (0xF00000)
@@ -207,8 +228,8 @@ enum CNTXT_OFFS {
 /* Scratch registeres */
 #define GPI_GPII_n_CH_k_SCRATCH_0_OFFS(n, k) \
 	(0x20060 + (0x4000 * (n)) + (0x80 * (k)))
-#define GPI_GPII_n_CH_K_SCRATCH_0(pair, proto, seid) \
-	((pair << 16) | (proto << 4) | seid)
+#define GPI_GPII_n_CH_K_SCRATCH_0(pair, int_config, proto, seid) \
+	(((pair) << 16) | ((int_config) << 15) | ((proto) << 4) | (seid))
 #define GPI_GPII_n_CH_k_SCRATCH_1_OFFS(n, k) \
 	(0x20064 + (0x4000 * (n)) + (0x80 * (k)))
 #define GPI_GPII_n_CH_k_SCRATCH_2_OFFS(n, k) \
@@ -228,3 +249,4 @@ enum CNTXT_OFFS {
 #define GPI_DEBUG_QSB_LOG_1 (0x5068)
 #define GPI_DEBUG_QSB_LOG_2 (0x506C)
 #define GPI_DEBUG_QSB_LOG_LAST_MISC_ID(n) (0x5070 + (0x4*n))
+#define GPI_DEBUG_BUSY_REG (0x5010)

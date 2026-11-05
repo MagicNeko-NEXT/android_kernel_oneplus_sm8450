@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2016, 2019-2021, The Linux Foundation. All rights reserved. */
+/* Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved. */
 
 #include <linux/clk.h>
 #include <linux/export.h>
@@ -24,6 +25,7 @@
 static struct clk_hw *measure;
 static bool debug_suspend;
 static bool debug_suspend_atomic;
+static bool qcom_clk_debug_inited;
 static struct dentry *clk_debugfs_suspend;
 static struct dentry *clk_debugfs_suspend_atomic;
 
@@ -286,10 +288,11 @@ static int clk_debug_mux_set_parent(struct clk_hw *hw, u8 index)
 	if (ret)
 		goto err;
 
-	/* Set the mux's post divider bits */
-	ret = regmap_update_bits(mux->regmap, mux->post_div_offset,
-				 mux->post_div_mask,
-				 (mux->post_div_val - 1) << mux->post_div_shift);
+	if (mux->post_div_offset != U32_MAX)
+		/* Set the mux's post divider bits */
+		ret = regmap_update_bits(mux->regmap, mux->post_div_offset,
+					 mux->post_div_mask,
+					 (mux->post_div_val - 1) << mux->post_div_shift);
 
 err:
 	clk_runtime_put_debug_mux(mux);
@@ -321,6 +324,7 @@ const struct clk_ops clk_debug_mux_ops = {
 	.get_parent = clk_debug_mux_get_parent,
 	.set_parent = clk_debug_mux_set_parent,
 	.debug_init = clk_debug_measure_add,
+	.determine_rate = clk_hw_determine_rate_no_reparent,
 	.init = clk_debug_mux_init,
 };
 EXPORT_SYMBOL(clk_debug_mux_ops);
@@ -443,6 +447,9 @@ static int clk_debug_measure_get(void *data, u64 *val)
 	int ret = 0;
 	u32 regval;
 
+	if (!measure)
+		return -EINVAL;
+
 	ret = clk_runtime_get_debug_mux(meas);
 	if (ret)
 		return ret;
@@ -451,7 +458,8 @@ static int clk_debug_measure_get(void *data, u64 *val)
 
 	ret = clk_find_and_set_parent(measure, hw);
 	if (ret) {
-		pr_err("Failed to set the debug mux's parent.\n");
+		pr_err("Failed to set the debug mux's parent for %s\n",
+		       qcom_clk_hw_get_name(hw));
 		goto exit;
 	}
 
@@ -672,6 +680,14 @@ static int list_rates_show(struct seq_file *s, void *unused)
 	int i = 0, level;
 	unsigned long rate, rate_max = 0;
 
+	/*
+	 * Some RCGs don't populate their freq_tbl until the first
+	 * determine_rate() callback (e.g. DFS and CRM). Ensure this happens by
+	 * calling clk_round_rate(), which will internally call
+	 * determine_rate().
+	 */
+	clk_round_rate(hw->clk, 0);
+
 	/* Find max frequency supported within voltage constraints. */
 	if (!vdd_class) {
 		rate_max = ULONG_MAX;
@@ -711,7 +727,7 @@ void clk_debug_print_hw(struct clk_hw *hw, struct seq_file *f)
 {
 	struct clk_regmap *rclk;
 
-	if (IS_ERR_OR_NULL(hw))
+	if (IS_ERR_OR_NULL(hw) || !hw->core)
 		return;
 
 	clk_debug_print_hw(clk_hw_get_parent(hw), f);
@@ -766,6 +782,27 @@ void clk_common_debug_init(struct clk_hw *hw, struct dentry *dentry)
 	debugfs_create_file("clk_print_regs", 0444, dentry, hw,
 			    &clock_print_hw_fops);
 
+	if (!qcom_clk_debug_inited) {
+		clk_debug_init();
+		qcom_clk_debug_inited = true;
+	}
+}
+
+static int clk_list_rate_vdd_level(struct clk_hw *hw, unsigned int rate)
+{
+	struct clk_regmap *rclk;
+	struct clk_vdd_class_data *vdd_data;
+
+	if (!clk_is_regmap_clk(hw))
+		return 0;
+
+	rclk = to_clk_regmap(hw);
+	vdd_data = &rclk->vdd_data;
+
+	if (!vdd_data->vdd_class)
+		return 0;
+
+	return clk_find_vdd_level(hw, vdd_data, rate);
 }
 
 static int clock_debug_print_clock(struct hw_debug_clk *dclk, struct seq_file *s)
@@ -803,10 +840,12 @@ static int clock_debug_print_clock(struct hw_debug_clk *dclk, struct seq_file *s
 		if (!clk_hw)
 			break;
 
-		clk_rate = clk_hw_get_rate(clk_hw);
-
-		if (!atomic)
+		if (!atomic) {
+			clk_rate = clk_get_rate(clk);
 			vdd_level = clk_list_rate_vdd_level(clk_hw, clk_rate);
+		} else {
+			clk_rate = clk_hw_get_rate(clk_hw);
+		}
 
 		if (s) {
 			/*

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (C) 2019 Microsoft Corporation.
  *
@@ -71,8 +71,13 @@ int verity_verify_sig_parse_opt_args(struct dm_arg_set *as,
 				     const char *arg_name)
 {
 	struct dm_target *ti = v->ti;
-	int ret = 0;
+	int ret;
 	const char *sig_key = NULL;
+
+	if (v->signature_key_desc) {
+		ti->error = DM_VERITY_VERIFY_ERR("root_hash_sig_key_desc already specified");
+		return -EINVAL;
+	}
 
 	if (!*argc) {
 		ti->error = DM_VERITY_VERIFY_ERR("Signature key not specified");
@@ -83,15 +88,74 @@ int verity_verify_sig_parse_opt_args(struct dm_arg_set *as,
 	(*argc)--;
 
 	ret = verity_verify_get_sig_from_key(sig_key, sig_opts);
+	if (ret < 0) {
+		ti->error = DM_VERITY_VERIFY_ERR("Invalid key specified");
+		return ret;
+	}
+
+	v->signature_key_desc = kstrdup(sig_key, GFP_KERNEL);
+	if (!v->signature_key_desc) {
+		ti->error = DM_VERITY_VERIFY_ERR("Could not allocate memory for signature key");
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+#if defined(CONFIG_DM_VERITY_SIG_VALUE)
+bool verity_verify_is_sig_value_opt_arg(const char *arg_name)
+{
+	return (!strcasecmp(
+		arg_name, DM_VERITY_ROOT_HASH_VERIFICATION_OPT_SIG_KEY_VALUE));
+}
+
+static int
+verity_verify_get_sig_from_key_value(const char *key_value,
+				     struct dm_verity_sig_opts *sig_opts)
+{
+	int ret = 0;
+
+	if (!key_value)
+		return -ENOMEM;
+
+	sig_opts->sig_size = strlen(key_value) / 2;
+	sig_opts->sig = kmalloc(sig_opts->sig_size, GFP_KERNEL);
+	if (!sig_opts->sig) {
+		ret = -ENOMEM;
+		goto end;
+	}
+
+	ret = hex2bin(sig_opts->sig, key_value, strlen(key_value) / 2);
+end:
+	return ret;
+}
+
+int verity_verify_sig_value_parse_opt_args(struct dm_arg_set *as,
+					   struct dm_verity *v,
+					   struct dm_verity_sig_opts *sig_opts,
+					   unsigned int *argc,
+					   const char *arg_name)
+{
+	struct dm_target *ti = v->ti;
+	int ret = 0;
+	const char *sig_key_value = NULL;
+
+	if (!*argc) {
+		ti->error = DM_VERITY_VERIFY_ERR(
+			"Signature key value not specified");
+		return -EINVAL;
+	}
+
+	sig_key_value = dm_shift_arg(as);
+	(*argc)--;
+
+	ret = verity_verify_get_sig_from_key_value(sig_key_value, sig_opts);
 	if (ret < 0)
 		ti->error = DM_VERITY_VERIFY_ERR("Invalid key specified");
 
-	v->signature_key_desc = kstrdup(sig_key, GFP_KERNEL);
-	if (!v->signature_key_desc)
-		return -ENOMEM;
-
 	return ret;
 }
+#endif
 
 /*
  * verify_verify_roothash - Verify the root hash of the verity hash device
@@ -119,8 +183,13 @@ int verity_verify_root_hash(const void *root_hash, size_t root_hash_len,
 	}
 
 	ret = verify_pkcs7_signature(root_hash, root_hash_len, sig_data,
-				sig_len, NULL, VERIFYING_UNSPECIFIED_SIGNATURE,
-				NULL, NULL);
+				sig_len,
+#ifdef CONFIG_DM_VERITY_VERIFY_ROOTHASH_SIG_SECONDARY_KEYRING
+				VERIFY_USE_SECONDARY_KEYRING,
+#else
+				NULL,
+#endif
+				VERIFYING_UNSPECIFIED_SIGNATURE, NULL, NULL);
 
 	return ret;
 }

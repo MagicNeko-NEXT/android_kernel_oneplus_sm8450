@@ -1,13 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 menu "Android"
 
-config ANDROID
-	bool "Android Drivers"
-	help
-	  Enable support for various drivers needed on the Android platform
-
-if ANDROID
-
 config ANDROID_BINDER_IPC
 	bool "Android Binder IPC Driver"
 	depends on MMU
@@ -74,6 +67,17 @@ config ANDROID_VENDOR_HOOKS
 	  Allow vendor modules to attach to tracepoint "hooks" defined via
 	  DECLARE_HOOK or DECLARE_RESTRICTED_HOOK.
 
+config ANDROID_DEBUG_KINFO
+	bool "Android Debug Kernel Information Support"
+	depends on KALLSYMS
+	help
+	  This supports kernel information backup for bootloader usage.
+	  Specifics:
+	   - The kallsyms symbols for unwind_backtrace
+	   - Page directory pointer
+	   - UTS_RELEASE
+	   - BUILD_INFO(ro.build.fingerprint)
+
 config ANDROID_KABI_RESERVE
 	bool "Android KABI reserve padding"
 	default y
@@ -109,6 +113,14 @@ config ANDROID_VENDOR_OEM_DATA
 
 	  If even slightly unsure, say Y.
 
-endif # if ANDROID
+config ANDROID_WRAPFD
+	bool "WrapFD Driver"
+	depends on MMU
+	help
+	  Enable WrapFD driver to control ability to map a file
+
+	  WrapFD allows wrapping an fd representing a memory buffer into a new
+	  file supporting ioctl API for file ownership that controls ability to
+	  map the file.
 
 endmenu

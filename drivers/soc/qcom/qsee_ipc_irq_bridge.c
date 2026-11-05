@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/cdev.h>
@@ -13,7 +13,6 @@
 #include <linux/poll.h>
 #include <linux/remoteproc/qcom_rproc.h>
 #include <linux/slab.h>
-#include <trace/events/rproc_qcom.h>
 
 #define MODULE_NAME "qsee_ipc_irq_bridge"
 #define DEVICE_NAME MODULE_NAME
@@ -28,8 +27,7 @@
 
 #define QIIB_ERR(x...) do { \
 	pr_err(x); \
-	if (qiib_info->log_ctx) \
-		ipc_log_string(qiib_info->log_ctx, x); \
+	ipc_log_string(qiib_info->log_ctx, x); \
 	} while (0)
 
 static void qiib_cleanup(void);
@@ -149,23 +147,18 @@ static int qiib_restart_notifier_cb(struct notifier_block *this,
 	struct qiib_dev *devp = container_of(this, struct qiib_dev, nb);
 
 	if (code == QCOM_SSR_BEFORE_SHUTDOWN) {
-		trace_rproc_qcom_event(devp->ssr_name,
-				"QCOM_SSR_BEFORE_POWERUP", "qiib_restart_notifier-enter");
 		QIIB_DBG("%s: %s: subsystem restart for %s\n", __func__,
 				"QCOM_SSR_BEFORE_SHUTDOWN",
 				devp->ssr_name);
 		devp->in_reset = true;
 		wake_up_interruptible(&devp->poll_wait_queue);
 	} else if (code == QCOM_SSR_AFTER_POWERUP) {
-		trace_rproc_qcom_event(devp->ssr_name,
-				"QCOM_SSR_AFTER_SHUTDOWN", "qiib_restart_notifier-enter");
 		QIIB_DBG("%s: %s: subsystem restart for %s\n", __func__,
 				"QCOM_SSR_AFTER_POWERUP",
 				devp->ssr_name);
 		devp->in_reset = false;
 	}
 
-	trace_rproc_qcom_event(devp->ssr_name, "qiib_restart_notifier", "exit");
 	return NOTIFY_DONE;
 }
 
@@ -466,7 +459,7 @@ static int qiib_alloc_chrdev_region(void)
 		return ret;
 	}
 
-	qiib_info->classp = class_create(THIS_MODULE, DEVICE_NAME);
+	qiib_info->classp = class_create(DEVICE_NAME);
 	if (IS_ERR(qiib_info->classp)) {
 		QIIB_ERR("%s: class_create() failed ENOMEM\n", __func__);
 		ret = -ENOMEM;
@@ -587,4 +580,4 @@ static void __exit qsee_ipc_irq_bridge_exit(void)
 module_exit(qsee_ipc_irq_bridge_exit);
 MODULE_SOFTDEP("pre: qcom_ipcc");
 MODULE_DESCRIPTION("QSEE IPC interrupt bridge");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

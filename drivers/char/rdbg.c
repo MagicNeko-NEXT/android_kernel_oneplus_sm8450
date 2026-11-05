@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2013-2021, The Linux Foundation. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 and
- * only version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
+ * ​​​​Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/cdev.h>
@@ -61,23 +52,23 @@ struct smq_block_map {
 struct smq_node {
 	uint16_t index_block;
 	uint16_t num_blocks;
-} __attribute__ ((__packed__));
+} __packed;
 
 struct smq_hdr {
 	uint8_t producer_version;
 	uint8_t consumer_version;
-} __attribute__ ((__packed__));
+} __packed;
 
 struct smq_out_state {
 	uint32_t init;
 	uint32_t index_check_queue_for_reset;
 	uint32_t index_sent_write;
 	uint32_t index_free_read;
-} __attribute__ ((__packed__));
+} __packed;
 
 struct smq_out {
 	struct smq_out_state s;
-	struct smq_node sent[1];
+	struct smq_node sent[];
 };
 
 struct smq_in_state {
@@ -85,11 +76,11 @@ struct smq_in_state {
 	uint32_t index_check_queue_for_reset_ack;
 	uint32_t index_sent_read;
 	uint32_t index_free_write;
-} __attribute__ ((__packed__));
+} __packed;
 
 struct smq_in {
 	struct smq_in_state s;
-	struct smq_node free[1];
+	struct smq_node free[];
 };
 
 struct smq {
@@ -124,6 +115,7 @@ struct rdbg_data {
 	struct smq    producer_smrb;
 	struct smq    consumer_smrb;
 	struct mutex  write_mutex;
+	int smp2p_data[32];
 };
 
 struct rdbg_device {
@@ -134,8 +126,6 @@ struct rdbg_device {
 	struct rdbg_data *rdbg_data;
 };
 
-
-int registers[32] = {0};
 static struct rdbg_device g_rdbg_instance = {
 	.class = NULL,
 	.dev_no = 0,
@@ -740,10 +730,10 @@ static void send_interrupt_to_subsystem(struct rdbg_data *rdbgdata)
 	unsigned int offset = rdbgdata->gpio_out_offset;
 	unsigned int val;
 
-	val = (registers[offset]) ^ (BIT(rdbgdata->out.smem_bit+offset));
+	val = (rdbgdata->smp2p_data[offset]) ^ (BIT(rdbgdata->out.smem_bit+offset));
 	qcom_smem_state_update_bits(rdbgdata->out.smem_state,
-				BIT(rdbgdata->out.smem_bit+offset), val);
-	registers[offset] = val;
+			BIT(rdbgdata->out.smem_bit+offset), val);
+	rdbgdata->smp2p_data[offset] = val;
 	rdbgdata->gpio_out_offset = (offset + 1) % 32;
 }
 
@@ -818,6 +808,16 @@ static int rdbg_open(struct inode *inode, struct file *filp)
 	rdbgdata->smem_addr = qcom_smem_get(QCOM_SMEM_HOST_ANY,
 			      proc_info[device_id].smem_buffer_addr,
 			      &(rdbgdata->smem_size));
+
+	if (IS_ERR(rdbgdata->smem_addr)) {
+		pr_err("rdbg: Can't retrieve data from common SMEM region.\n"
+				"Retrieving data from device specific partition.\n");
+		if (PTR_ERR(rdbgdata->smem_addr) == -ENOENT) {
+			rdbgdata->smem_addr = qcom_smem_get(device_id,
+					proc_info[device_id].smem_buffer_addr,
+					&(rdbgdata->smem_size));
+		}
+	}
 	if (!rdbgdata->smem_addr) {
 		dev_err(rdbgdata->device, "%s: Could not allocate smem memory\n",
 			__func__);
@@ -1142,7 +1142,7 @@ static int __init rdbg_init(void)
 		pr_err("Error in cdev_add\n");
 		goto chrdev_bail;
 	}
-	rdbgdevice->class = class_create(THIS_MODULE, "rdbg");
+	rdbgdevice->class = class_create("rdbg");
 	if (IS_ERR(rdbgdevice->class)) {
 		err = PTR_ERR(rdbgdevice->class);
 		pr_err("Error in class_create\n");
@@ -1211,4 +1211,4 @@ static void __exit rdbg_exit(void)
 module_exit(rdbg_exit);
 
 MODULE_DESCRIPTION("rdbg module");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

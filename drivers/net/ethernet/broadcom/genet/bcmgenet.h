@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Copyright (c) 2014-2020 Broadcom
+ * Copyright (c) 2014-2025 Broadcom
  */
 
 #ifndef __BCMGENET_H__
@@ -15,6 +15,11 @@
 #include <linux/phy.h>
 #include <linux/dim.h>
 #include <linux/ethtool.h>
+
+#include "../unimac.h"
+
+/* Maximum number of hardware queues, downsized if needed */
+#define GENET_MAX_MQ_CNT	4
 
 /* total number of Buffer Descriptors, same for Rx/Tx */
 #define TOTAL_DESC				256
@@ -150,62 +155,26 @@ struct bcmgenet_mib_counters {
 	u32	tx_realloc_tsb_failed;
 };
 
-#define UMAC_HD_BKP_CTRL		0x004
-#define	 HD_FC_EN			(1 << 0)
-#define  HD_FC_BKOFF_OK			(1 << 1)
-#define  IPG_CONFIG_RX_SHIFT		2
-#define  IPG_CONFIG_RX_MASK		0x1F
+struct bcmgenet_tx_stats64 {
+	struct u64_stats_sync syncp;
+	u64_stats_t	packets;
+	u64_stats_t	bytes;
+	u64_stats_t	errors;
+	u64_stats_t	dropped;
+};
 
-#define UMAC_CMD			0x008
-#define  CMD_TX_EN			(1 << 0)
-#define  CMD_RX_EN			(1 << 1)
-#define  UMAC_SPEED_10			0
-#define  UMAC_SPEED_100			1
-#define  UMAC_SPEED_1000		2
-#define  UMAC_SPEED_2500		3
-#define  CMD_SPEED_SHIFT		2
-#define  CMD_SPEED_MASK			3
-#define  CMD_PROMISC			(1 << 4)
-#define  CMD_PAD_EN			(1 << 5)
-#define  CMD_CRC_FWD			(1 << 6)
-#define  CMD_PAUSE_FWD			(1 << 7)
-#define  CMD_RX_PAUSE_IGNORE		(1 << 8)
-#define  CMD_TX_ADDR_INS		(1 << 9)
-#define  CMD_HD_EN			(1 << 10)
-#define  CMD_SW_RESET			(1 << 13)
-#define  CMD_LCL_LOOP_EN		(1 << 15)
-#define  CMD_AUTO_CONFIG		(1 << 22)
-#define  CMD_CNTL_FRM_EN		(1 << 23)
-#define  CMD_NO_LEN_CHK			(1 << 24)
-#define  CMD_RMT_LOOP_EN		(1 << 25)
-#define  CMD_PRBL_EN			(1 << 27)
-#define  CMD_TX_PAUSE_IGNORE		(1 << 28)
-#define  CMD_TX_RX_EN			(1 << 29)
-#define  CMD_RUNT_FILTER_DIS		(1 << 30)
-
-#define UMAC_MAC0			0x00C
-#define UMAC_MAC1			0x010
-#define UMAC_MAX_FRAME_LEN		0x014
-
-#define UMAC_MODE			0x44
-#define  MODE_LINK_STATUS		(1 << 5)
-
-#define UMAC_EEE_CTRL			0x064
-#define  EN_LPI_RX_PAUSE		(1 << 0)
-#define  EN_LPI_TX_PFC			(1 << 1)
-#define  EN_LPI_TX_PAUSE		(1 << 2)
-#define  EEE_EN				(1 << 3)
-#define  RX_FIFO_CHECK			(1 << 4)
-#define  EEE_TX_CLK_DIS			(1 << 5)
-#define  DIS_EEE_10M			(1 << 6)
-#define  LP_IDLE_PREDICTION_MODE	(1 << 7)
-
-#define UMAC_EEE_LPI_TIMER		0x068
-#define UMAC_EEE_WAKE_TIMER		0x06C
-#define UMAC_EEE_REF_COUNT		0x070
-#define  EEE_REFERENCE_COUNT_MASK	0xffff
-
-#define UMAC_TX_FLUSH			0x334
+struct bcmgenet_rx_stats64 {
+	struct u64_stats_sync syncp;
+	u64_stats_t	bytes;
+	u64_stats_t	packets;
+	u64_stats_t	errors;
+	u64_stats_t	dropped;
+	u64_stats_t	multicast;
+	u64_stats_t	length_errors;
+	u64_stats_t	over_errors;
+	u64_stats_t	crc_errors;
+	u64_stats_t	frame_errors;
+};
 
 #define UMAC_MIB_START			0x400
 
@@ -384,6 +353,7 @@ struct bcmgenet_mib_counters {
 #define  EXT_CFG_IDDQ_BIAS		(1 << 0)
 #define  EXT_CFG_PWR_DOWN		(1 << 1)
 #define  EXT_CK25_DIS			(1 << 4)
+#define  EXT_CFG_IDDQ_GLOBAL_PWR	(1 << 3)
 #define  EXT_GPHY_RESET			(1 << 5)
 
 /* DMA rings size */
@@ -564,10 +534,8 @@ struct bcmgenet_skb_cb {
 struct bcmgenet_tx_ring {
 	spinlock_t	lock;		/* ring lock */
 	struct napi_struct napi;	/* NAPI per tx queue */
-	unsigned long	packets;
-	unsigned long	bytes;
+	struct bcmgenet_tx_stats64 stats64;
 	unsigned int	index;		/* ring index */
-	unsigned int	queue;		/* queue index */
 	struct enet_cb	*cbs;		/* tx ring buffer control block*/
 	unsigned int	size;		/* size of each tx ring */
 	unsigned int    clean_ptr;      /* Tx ring clean pointer */
@@ -577,8 +545,6 @@ struct bcmgenet_tx_ring {
 	unsigned int	prod_index;	/* Tx ring producer index SW copy */
 	unsigned int	cb_ptr;		/* Tx ring initial CB ptr */
 	unsigned int	end_ptr;	/* Tx ring end CB ptr */
-	void (*int_enable)(struct bcmgenet_tx_ring *);
-	void (*int_disable)(struct bcmgenet_tx_ring *);
 	struct bcmgenet_priv *priv;
 };
 
@@ -592,10 +558,7 @@ struct bcmgenet_net_dim {
 
 struct bcmgenet_rx_ring {
 	struct napi_struct napi;	/* Rx NAPI struct */
-	unsigned long	bytes;
-	unsigned long	packets;
-	unsigned long	errors;
-	unsigned long	dropped;
+	struct bcmgenet_rx_stats64 stats64;
 	unsigned int	index;		/* Rx ring index */
 	struct enet_cb	*cbs;		/* Rx ring buffer control block */
 	unsigned int	size;		/* Rx ring size */
@@ -607,8 +570,6 @@ struct bcmgenet_rx_ring {
 	struct bcmgenet_net_dim dim;
 	u32		rx_max_coalesced_frames;
 	u32		rx_coalesce_usecs;
-	void (*int_enable)(struct bcmgenet_rx_ring *);
-	void (*int_disable)(struct bcmgenet_rx_ring *);
 	struct bcmgenet_priv *priv;
 };
 
@@ -637,7 +598,7 @@ struct bcmgenet_priv {
 	struct enet_cb *tx_cbs;
 	unsigned int num_tx_bds;
 
-	struct bcmgenet_tx_ring tx_rings[DESC_INDEX + 1];
+	struct bcmgenet_tx_ring tx_rings[GENET_MAX_MQ_CNT + 1];
 
 	/* receive variables */
 	void __iomem *rx_bds;
@@ -647,10 +608,13 @@ struct bcmgenet_priv {
 	struct bcmgenet_rxnfc_rule rxnfc_rules[MAX_NUM_OF_FS_RULES];
 	struct list_head rxnfc_list;
 
-	struct bcmgenet_rx_ring rx_rings[DESC_INDEX + 1];
+	struct bcmgenet_rx_ring rx_rings[GENET_MAX_MQ_CNT + 1];
 
 	/* other misc variables */
 	struct bcmgenet_hw_params *hw_params;
+	unsigned autoneg_pause:1;
+	unsigned tx_pause:1;
+	unsigned rx_pause:1;
 
 	/* MDIO bus variables */
 	wait_queue_head_t wq;
@@ -663,13 +627,10 @@ struct bcmgenet_priv {
 	bool clk_eee_enabled;
 
 	/* PHY device variables */
-	int old_link;
-	int old_speed;
-	int old_duplex;
-	int old_pause;
 	phy_interface_t phy_interface;
 	int phy_addr;
 	int ext_phy;
+	bool ephy_16nm;
 
 	/* Interrupt variables */
 	struct work_struct bcmgenet_irq_work;
@@ -703,6 +664,31 @@ struct bcmgenet_priv {
 
 	struct ethtool_eee eee;
 };
+
+static inline bool bcmgenet_has_40bits(struct bcmgenet_priv *priv)
+{
+	return !!(priv->hw_params->flags & GENET_HAS_40BITS);
+}
+
+static inline bool bcmgenet_has_ext(struct bcmgenet_priv *priv)
+{
+	return !!(priv->hw_params->flags & GENET_HAS_EXT);
+}
+
+static inline bool bcmgenet_has_mdio_intr(struct bcmgenet_priv *priv)
+{
+	return !!(priv->hw_params->flags & GENET_HAS_MDIO_INTR);
+}
+
+static inline bool bcmgenet_has_moca_link_det(struct bcmgenet_priv *priv)
+{
+	return !!(priv->hw_params->flags & GENET_HAS_MOCA_LINK_DET);
+}
+
+static inline bool bcmgenet_has_ephy_16nm(struct bcmgenet_priv *priv)
+{
+	return priv->ephy_16nm;
+}
 
 #define GENET_IO_MACRO(name, offset)					\
 static inline u32 bcmgenet_##name##_readl(struct bcmgenet_priv *priv,	\
@@ -747,6 +733,7 @@ int bcmgenet_mii_init(struct net_device *dev);
 int bcmgenet_mii_config(struct net_device *dev, bool init);
 int bcmgenet_mii_probe(struct net_device *dev);
 void bcmgenet_mii_exit(struct net_device *dev);
+void bcmgenet_phy_pause_set(struct net_device *dev, bool rx, bool tx);
 void bcmgenet_phy_power_set(struct net_device *dev, bool enable);
 void bcmgenet_mii_setup(struct net_device *dev);
 

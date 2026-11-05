@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (C) 2020 The Linux Foundation. All rights reserved.
- * Copyright (c) 2021 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2021,2025 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/kernel.h>
@@ -112,7 +112,7 @@ static void pdr_locator_del_server(struct qmi_handle *qmi,
 	mutex_unlock(&pdr->lock);
 }
 
-static struct qmi_ops pdr_locator_ops = {
+static const struct qmi_ops pdr_locator_ops = {
 	.new_server = pdr_locator_new_server,
 	.del_server = pdr_locator_del_server,
 };
@@ -133,7 +133,7 @@ static int pdr_register_listener(struct pdr_handle *pdr,
 		return ret;
 
 	req.enable = enable;
-	strcpy(req.service_path, pds->service_path);
+	strscpy(req.service_path, pds->service_path, sizeof(req.service_path));
 
 	ret = qmi_send_request(&pdr->notifier_hdl, &pds->addr,
 			       &txn, SERVREG_REGISTER_LISTENER_REQ,
@@ -240,7 +240,7 @@ static void pdr_notifier_del_server(struct qmi_handle *qmi,
 	mutex_unlock(&pdr->list_lock);
 }
 
-static struct qmi_ops pdr_notifier_ops = {
+static const struct qmi_ops pdr_notifier_ops = {
 	.new_server = pdr_notifier_new_server,
 	.del_server = pdr_notifier_del_server,
 };
@@ -259,7 +259,7 @@ static int pdr_send_indack_msg(struct pdr_handle *pdr, struct pdr_service *pds,
 		return ret;
 
 	req.transaction_id = tid;
-	strcpy(req.service_path, pds->service_path);
+	strscpy(req.service_path, pds->service_path, sizeof(req.service_path));
 
 	ret = qmi_send_request(&pdr->notifier_hdl, &pds->addr,
 			       &txn, SERVREG_SET_ACK_REQ,
@@ -328,24 +328,23 @@ static void pdr_indication_cb(struct qmi_handle *qmi,
 					      notifier_hdl);
 	const struct servreg_state_updated_ind *ind_msg = data;
 	struct pdr_list_node *ind;
-	struct pdr_service *pds;
-	bool found = false;
+	struct pdr_service *pds = NULL, *iter;
 
 	if (!ind_msg || !ind_msg->service_path[0] ||
 	    strlen(ind_msg->service_path) > SERVREG_NAME_LENGTH)
 		return;
 
 	mutex_lock(&pdr->list_lock);
-	list_for_each_entry(pds, &pdr->lookups, node) {
-		if (strcmp(pds->service_path, ind_msg->service_path))
+	list_for_each_entry(iter, &pdr->lookups, node) {
+		if (strcmp(iter->service_path, ind_msg->service_path))
 			continue;
 
-		found = true;
+		pds = iter;
 		break;
 	}
 	mutex_unlock(&pdr->list_lock);
 
-	if (!found)
+	if (!pds)
 		return;
 
 	pr_info("PDR: Indication received from %s, state: 0x%x, trans-id: %d\n",
@@ -368,7 +367,7 @@ static void pdr_indication_cb(struct qmi_handle *qmi,
 	queue_work(pdr->indack_wq, &pdr->indack_work);
 }
 
-static struct qmi_msg_handler qmi_indication_handler[] = {
+static const struct qmi_msg_handler qmi_indication_handler[] = {
 	{
 		.type = QMI_INDICATION,
 		.msg_id = SERVREG_STATE_UPDATED_IND_ID,
@@ -433,7 +432,7 @@ static int pdr_locate_service(struct pdr_handle *pdr, struct pdr_service *pds)
 		return -ENOMEM;
 
 	/* Prepare req message */
-	strcpy(req.service_name, pds->service_name);
+	strscpy(req.service_name, pds->service_name, sizeof(req.service_name));
 	req.domain_offset_valid = true;
 	req.domain_offset = 0;
 
@@ -558,8 +557,8 @@ struct pdr_service *pdr_add_lookup(struct pdr_handle *pdr,
 		return ERR_PTR(-ENOMEM);
 
 	pds->service = SERVREG_NOTIFIER_SERVICE;
-	strcpy(pds->service_name, service_name);
-	strcpy(pds->service_path, service_path);
+	strscpy(pds->service_name, service_name, sizeof(pds->service_name));
+	strscpy(pds->service_path, service_path, sizeof(pds->service_path));
 	pds->need_locator_lookup = true;
 
 	mutex_lock(&pdr->list_lock);
@@ -614,7 +613,7 @@ int pdr_restart_pd(struct pdr_handle *pdr, struct pdr_service *pds)
 			break;
 
 		/* Prepare req message */
-		strcpy(req.service_path, pds->service_path);
+		strscpy(req.service_path, pds->service_path, sizeof(req.service_path));
 		addr = pds->addr;
 		break;
 	}

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2018-2020 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2025, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt)	"QG-K: %s: " fmt, __func__
@@ -163,19 +164,19 @@ static int qg_read_ocv(struct qpnp_qg *chip, u32 *ocv_uv, u32 *ocv_raw, u8 type)
 	switch (type) {
 	case S3_GOOD_OCV:
 		addr = QG_S3_GOOD_OCV_V_DATA0_REG;
-		strlcpy(ocv_name, "S3_GOOD_OCV", 20);
+		strscpy(ocv_name, "S3_GOOD_OCV", 20);
 		break;
 	case S7_PON_OCV:
 		addr = QG_S7_PON_OCV_V_DATA0_REG;
-		strlcpy(ocv_name, "S7_PON_OCV", 20);
+		strscpy(ocv_name, "S7_PON_OCV", 20);
 		break;
 	case S3_LAST_OCV:
 		addr = QG_LAST_S3_SLEEP_V_DATA0_REG;
-		strlcpy(ocv_name, "S3_LAST_OCV", 20);
+		strscpy(ocv_name, "S3_LAST_OCV", 20);
 		break;
 	case SDAM_PON_OCV:
 		addr = QG_SDAM_PON_OCV_OFFSET;
-		strlcpy(ocv_name, "SDAM_PON_OCV", 20);
+		strscpy(ocv_name, "SDAM_PON_OCV", 20);
 		break;
 	default:
 		pr_err("Invalid OCV type %d\n", type);
@@ -2135,6 +2136,9 @@ static int qg_iio_write_raw(struct iio_dev *indio_dev,
 		if (chip->sp)
 			soh_profile_update(chip->sp, chip->soh);
 		break;
+	case PSY_IIO_CLEAR_SOH:
+		chip->first_profile_load = val1;
+		break;
 	case PSY_IIO_ESR_ACTUAL:
 		chip->esr_actual = val1;
 		break;
@@ -2148,13 +2152,13 @@ static int qg_iio_write_raw(struct iio_dev *indio_dev,
 		rc = qg_setprop_batt_age_level(chip, val1);
 		break;
 	default:
-		pr_err("Unsupported QG IIO chan %d\n", chan->channel);
+		pr_debug("Unsupported QG IIO chan %d\n", chan->channel);
 		rc = -EINVAL;
 		break;
 	}
 
 	if (rc < 0)
-		pr_err("Couldn't write IIO channel %d, rc = %d\n",
+		pr_err_ratelimited("Couldn't write IIO channel %d, rc = %d\n",
 			chan->channel, rc);
 
 	return rc;
@@ -2260,6 +2264,9 @@ static int qg_iio_read_raw(struct iio_dev *indio_dev,
 	case PSY_IIO_SOH:
 		*val1 = chip->soh;
 		break;
+	case PSY_IIO_CLEAR_SOH:
+		*val1 = chip->first_profile_load;
+		break;
 	case PSY_IIO_CC_SOC:
 		rc = qg_get_cc_soc(chip, val1);
 		break;
@@ -2288,13 +2295,13 @@ static int qg_iio_read_raw(struct iio_dev *indio_dev,
 		*val1 = chip->qg_mode;
 		break;
 	default:
-		pr_debug("Unsupported property %d\n", chan->channel);
+		pr_debug("Unsupported QG IIO chan %d\n", chan->channel);
 		rc = -EINVAL;
 		break;
 	}
 
 	if (rc < 0) {
-		pr_err("Couldn't read IIO channel %d, rc = %d\n",
+		pr_err_ratelimited("Couldn't read IIO channel %d, rc = %d\n",
 			chan->channel, rc);
 		return rc;
 	}
@@ -2302,8 +2309,8 @@ static int qg_iio_read_raw(struct iio_dev *indio_dev,
 	return IIO_VAL_INT;
 }
 
-static int qg_iio_of_xlate(struct iio_dev *indio_dev,
-				const struct of_phandle_args *iiospec)
+static int qg_iio_fwnode_xlate(struct iio_dev *indio_dev,
+				const struct fwnode_reference_args *iiospec)
 {
 	struct qpnp_qg *chip = iio_priv(indio_dev);
 	struct iio_chan_spec *iio_chan = chip->iio_chan;
@@ -2320,7 +2327,7 @@ static int qg_iio_of_xlate(struct iio_dev *indio_dev,
 static const struct iio_info qg_iio_info = {
 	.read_raw	= qg_iio_read_raw,
 	.write_raw	= qg_iio_write_raw,
-	.of_xlate	= qg_iio_of_xlate,
+	.fwnode_xlate	= qg_iio_fwnode_xlate,
 };
 
 #define DEFAULT_CL_BEGIN_IBAT_UA	(-100000)
@@ -2738,7 +2745,7 @@ static int qg_init_psy(struct qpnp_qg *chip)
 	chip->qg_psy = devm_power_supply_register(chip->dev,
 				&qg_psy_desc, &qg_psy_cfg);
 	if (IS_ERR_OR_NULL(chip->qg_psy)) {
-		pr_err("Failed to register qg_psy, rc = %d\n",
+		pr_err("Failed to register qg_psy, rc = %ld\n",
 				PTR_ERR(chip->qg_psy));
 		return -ENODEV;
 	}
@@ -2970,7 +2977,7 @@ static int qg_register_device(struct qpnp_qg *chip)
 		goto unregister_chrdev;
 	}
 
-	chip->qg_class = class_create(THIS_MODULE, "qg");
+	chip->qg_class = class_create("qg");
 	if (IS_ERR_OR_NULL(chip->qg_class)) {
 		pr_err("Failed to create qg class\n");
 		rc = -EINVAL;
@@ -3067,8 +3074,8 @@ static int qg_load_battery_profile(struct qpnp_qg *chip)
 				chip->batt_id_ohm / 1000, NULL);
 	}
 
-	if (IS_ERR(profile_node)) {
-		rc = PTR_ERR(profile_node);
+	if (IS_ERR_OR_NULL(profile_node)) {
+		rc = profile_node ? PTR_ERR(profile_node) : -EINVAL;
 		pr_err("Failed to detect valid QG battery profile %d\n", rc);
 		return rc;
 	}
@@ -3308,7 +3315,7 @@ static int qg_determine_pon_soc(struct qpnp_qg *chip)
 	ocv_uv = shutdown[SDAM_OCV_UV];
 	soc = shutdown[SDAM_SOC];
 	soc_raw = shutdown[SDAM_SOC] * 100;
-	strlcpy(ocv_type, "SHUTDOWN_SOC", 20);
+	strscpy(ocv_type, "SHUTDOWN_SOC", 20);
 	qg_dbg(chip, QG_DEBUG_PON, "Using SHUTDOWN_SOC @ PON\n");
 
 use_pon_ocv:
@@ -3316,35 +3323,35 @@ use_pon_ocv:
 		if (chip->wa_flags & QG_PON_OCV_WA) {
 			if (ocv[S3_LAST_OCV].ocv_raw == FIFO_V_RESET_VAL) {
 				if (!ocv[SDAM_PON_OCV].ocv_uv) {
-					strlcpy(ocv_type, "S7_PON_SOC", 20);
+					strscpy(ocv_type, "S7_PON_SOC", 20);
 					ocv_uv = ocv[S7_PON_OCV].ocv_uv;
 				} else if (ocv[SDAM_PON_OCV].ocv_uv <=
 						ocv[S7_PON_OCV].ocv_uv) {
-					strlcpy(ocv_type, "S7_PON_SOC", 20);
+					strscpy(ocv_type, "S7_PON_SOC", 20);
 					ocv_uv = ocv[S7_PON_OCV].ocv_uv;
 				} else if (!shutdown[SDAM_VALID] &&
 					((ocv[SDAM_PON_OCV].ocv_uv -
 						ocv[S7_PON_OCV].ocv_uv) >
 						S7_ERROR_MARGIN_UV)) {
-					strlcpy(ocv_type, "S7_PON_SOC", 20);
+					strscpy(ocv_type, "S7_PON_SOC", 20);
 					ocv_uv = ocv[S7_PON_OCV].ocv_uv;
 				} else {
-					strlcpy(ocv_type, "SDAM_PON_SOC", 20);
+					strscpy(ocv_type, "SDAM_PON_SOC", 20);
 					ocv_uv = ocv[SDAM_PON_OCV].ocv_uv;
 				}
 			} else {
 				if (ocv[S3_LAST_OCV].ocv_uv >=
 						ocv[S7_PON_OCV].ocv_uv) {
-					strlcpy(ocv_type, "S3_LAST_SOC", 20);
+					strscpy(ocv_type, "S3_LAST_SOC", 20);
 					ocv_uv = ocv[S3_LAST_OCV].ocv_uv;
 				} else {
-					strlcpy(ocv_type, "S7_PON_SOC", 20);
+					strscpy(ocv_type, "S7_PON_SOC", 20);
 					ocv_uv = ocv[S7_PON_OCV].ocv_uv;
 				}
 			}
 		} else {
 			/* Use S7 PON OCV */
-			strlcpy(ocv_type, "S7_PON_SOC", 20);
+			strscpy(ocv_type, "S7_PON_SOC", 20);
 			ocv_uv = ocv[S7_PON_OCV].ocv_uv;
 		}
 
@@ -3469,7 +3476,8 @@ static int qg_sanitize_sdam(struct qpnp_qg *chip)
 	} else if (data == 0) {
 		rc = qg_sdam_write(SDAM_MAGIC, SDAM_MAGIC_NUMBER);
 		if (!rc)
-			qg_dbg(chip, QG_DEBUG_PON, "First boot. SDAM initilized\n");
+			qg_dbg(chip, QG_DEBUG_PON, "First boot. SDAM initialized\n");
+		chip->first_profile_load = true;
 	} else {
 		/* SDAM has invalid value */
 		rc = qg_sdam_clear();
@@ -3477,6 +3485,7 @@ static int qg_sanitize_sdam(struct qpnp_qg *chip)
 			pr_err("SDAM uninitialized, SDAM reset\n");
 			rc = qg_sdam_write(SDAM_MAGIC, SDAM_MAGIC_NUMBER);
 		}
+		chip->first_profile_load = true;
 	}
 
 	if (rc < 0)
@@ -3942,7 +3951,6 @@ static int qg_alg_init(struct qpnp_qg *chip)
 #ifdef CONFIG_DEBUG_FS
 static void qg_create_debugfs(struct qpnp_qg *chip)
 {
-	struct dentry *entry;
 
 	chip->dfs_root = debugfs_create_dir("qgauge", NULL);
 	if (IS_ERR_OR_NULL(chip->dfs_root)) {
@@ -3951,12 +3959,8 @@ static void qg_create_debugfs(struct qpnp_qg *chip)
 		return;
 	}
 
-	entry = debugfs_create_u32("debug_mask", 0600, chip->dfs_root,
+	debugfs_create_u32("debug_mask", 0600, chip->dfs_root,
 			&qg_debug_mask);
-	if (IS_ERR_OR_NULL(entry)) {
-		pr_err("Failed to create debug_mask rc=%ld\n", (long)entry);
-		debugfs_remove_recursive(chip->dfs_root);
-	}
 }
 #else
 static void qg_create_debugfs(struct qpnp_qg *chip)
@@ -4377,7 +4381,7 @@ static int qg_parse_dt(struct qpnp_qg *chip)
 	else
 		chip->dt.esr_low_temp_threshold = (int)temp;
 
-	rc = of_property_read_u32(node, "qcom,shutdown_soc_threshold", &temp);
+	rc = of_property_read_u32(node, "qcom,shutdown-soc-threshold", &temp);
 	if (rc < 0)
 		chip->dt.shutdown_soc_threshold = -EINVAL;
 	else
@@ -4494,7 +4498,7 @@ static int process_suspend(struct qpnp_qg *chip)
 			(chip->dt.s2_fifo_length - sleep_fifo_length)) {
 		/*
 		 * If the real-time FIFO count is greater than
-		 * the the #fifo to enter sleep, save the FIFO data
+		 * the #fifo to enter sleep, save the FIFO data
 		 * and reset the fifo count. This is avoid a gauranteed wakeup
 		 * due to fifo_done event as the curent FIFO length is already
 		 * beyond the sleep length.
@@ -4525,7 +4529,7 @@ static int process_suspend(struct qpnp_qg *chip)
 
 	get_rtc_time(&chip->suspend_time);
 
-	qg_dbg(chip, QG_DEBUG_PM, "FIFO rt_length=%d sleep_fifo_length=%d default_s2_count=%d suspend_data=%d time=%d\n",
+	qg_dbg(chip, QG_DEBUG_PM, "FIFO rt_length=%d sleep_fifo_length=%d default_s2_count=%d suspend_data=%d time=%ld\n",
 			fifo_rt_length, sleep_fifo_length,
 			chip->dt.s2_fifo_length, chip->suspend_data,
 			chip->suspend_time);
@@ -4588,7 +4592,7 @@ static int process_resume(struct qpnp_qg *chip)
 	}
 	rt_status &= FIFO_UPDATE_DONE_INT_LAT_STS_BIT;
 
-	qg_dbg(chip, QG_DEBUG_PM, "FIFO_DONE_STS=%d suspend_data=%d good_ocv=%d sleep_time=%d secs\n",
+	qg_dbg(chip, QG_DEBUG_PM, "FIFO_DONE_STS=%d suspend_data=%d good_ocv=%d sleep_time=%ld secs\n",
 				!!rt_status, chip->suspend_data,
 				chip->kdata.param[QG_GOOD_OCV_UV].valid,
 				sleep_time_secs);
@@ -4704,7 +4708,7 @@ static int qpnp_qg_probe(struct platform_device *pdev)
 	}
 
 	/* ADC for BID & THERM */
-	chip->batt_id_chan = iio_channel_get(&pdev->dev, "batt-id");
+	chip->batt_id_chan = devm_iio_channel_get(&pdev->dev, "batt-id");
 	if (IS_ERR(chip->batt_id_chan)) {
 		rc = PTR_ERR(chip->batt_id_chan);
 		if (rc != -EPROBE_DEFER)
@@ -4713,7 +4717,7 @@ static int qpnp_qg_probe(struct platform_device *pdev)
 		return rc;
 	}
 
-	chip->batt_therm_chan = iio_channel_get(&pdev->dev, "batt-therm");
+	chip->batt_therm_chan = devm_iio_channel_get(&pdev->dev, "batt-therm");
 	if (IS_ERR(chip->batt_therm_chan)) {
 		rc = PTR_ERR(chip->batt_therm_chan);
 		if (rc != -EPROBE_DEFER)
@@ -5002,4 +5006,4 @@ static struct platform_driver qpnp_qg_driver = {
 module_platform_driver(qpnp_qg_driver);
 
 MODULE_DESCRIPTION("QPNP QG Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

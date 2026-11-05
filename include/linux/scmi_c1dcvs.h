@@ -2,11 +2,12 @@
 /*
  * scmi c1dcvs protocols header
  *
- * copyright (c) 2021, the linux foundation. all rights reserved.
+ * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
-#ifndef _scmi_c1dcvs_h
-#define _scmi_c1dcvs_h
+#ifndef _SCMI_C1DCVS_H
+#define _SCMI_C1DCVS_H
 
 #include <linux/bitfield.h>
 #include <linux/device.h>
@@ -21,7 +22,16 @@ struct scmi_protocol_handle;
  * struct scmi_c1dcvs_vendor_ops - represents the various operations provided
  *      by scmi c1dcvs protocol
  *
- * @scmi_enable_c1dcvs: enables/disables c1dcvs algorithm on cpucp.
+ * @set_enable_c1dcvs: enable/disable c1dcvs
+ * @get_enable_c1dcvs: retrieve c1dcvs enable/disable status
+ * @set_enable_trace: enable/disable tracing
+ * @get_enable_trace: retrieve tracing enable/disable status
+ * @set_ipc_thresh: set IPC thresholds
+ * @get_ipc_thresh: retrieve IPC thresholds
+ * @set_efreq_thresh: set effective frequency threshold
+ * @get_efreq_thresh: retrieve effective frequency threshold
+ * @set_hysteresis: set hysteresis settings
+ * @get_hysteresis: get hysteresis settings
  */
 struct scmi_c1dcvs_vendor_ops {
 	int (*set_enable_c1dcvs)(const struct scmi_protocol_handle *ph, void *buf);
@@ -45,5 +55,4 @@ static inline int c1dcvs_enable(bool enable)
 }
 #endif
 
-#endif /* _scmi_c1dcvs_h */
-
+#endif /* _SCMI_C1DCVS_H */

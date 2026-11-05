@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2014, 2017-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022, Qualcomm Innovation Center, Inc. All rights reserved.
  */
+
 #ifndef __ESOC_CLIENT_H_
 #define __ESOC_CLIENT_H_
 
@@ -35,6 +37,7 @@ struct esoc_desc {
 	void *priv;
 };
 
+#if IS_ENABLED(CONFIG_QCOM_ESOC_CLIENT)
 /* Can return probe deferral */
 struct esoc_desc *devm_register_esoc_client(struct device *dev,
 							const char *name);
@@ -45,4 +48,34 @@ int esoc_register_client_hook(struct esoc_desc *desc,
 				struct esoc_client_hook *client_hook);
 int esoc_unregister_client_hook(struct esoc_desc *desc,
 				struct esoc_client_hook *client_hook);
+
+#else
+struct esoc_desc *devm_register_esoc_client(struct device *dev,
+							const char *name)
+{
+	return NULL;
+}
+
+void devm_unregister_esoc_client(struct device *dev,
+						struct esoc_desc *esoc_desc)
+{
+}
+
+int esoc_register_client_notifier(struct notifier_block *nb)
+{
+	return -EPERM;
+}
+
+int esoc_register_client_hook(struct esoc_desc *desc,
+				struct esoc_client_hook *client_hook)
+{
+	return -EPERM;
+}
+
+int esoc_unregister_client_hook(struct esoc_desc *desc,
+				struct esoc_client_hook *client_hook)
+{
+	return -EPERM;
+}
+#endif
 #endif

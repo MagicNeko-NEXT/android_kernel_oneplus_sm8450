@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
  *
  */
 
@@ -64,7 +65,7 @@ void *gh_mem_notifier_register(enum gh_mem_notifier_tag tag,
 
 	return entry;
 }
-EXPORT_SYMBOL(gh_mem_notifier_register);
+EXPORT_SYMBOL_GPL(gh_mem_notifier_register);
 
 /**
  * gh_mem_notifier_unregister: Unregister for memory notifier notifications
@@ -88,7 +89,7 @@ void gh_mem_notifier_unregister(void *cookie)
 	entry->data = NULL;
 	mutex_unlock(&mem_notifier_entries_lock);
 }
-EXPORT_SYMBOL(gh_mem_notifier_unregister);
+EXPORT_SYMBOL_GPL(gh_mem_notifier_unregister);
 
 static enum gh_mem_notifier_tag gh_mem_notifier_get_tag(unsigned long action,
 							void *msg)
@@ -153,5 +154,5 @@ static void __exit gh_mem_notifier_exit(void)
 }
 module_exit(gh_mem_notifier_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. Gunyah Memory Notifier");

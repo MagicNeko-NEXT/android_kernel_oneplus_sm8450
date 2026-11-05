@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
- *
+ * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/slab.h>
@@ -9,8 +9,9 @@
 #include <linux/spinlock.h>
 #include <linux/interrupt.h>
 
-#include <linux/gunyah/gh_dbl.h>
 #include <linux/gunyah/gh_errno.h>
+#include <linux/gunyah/gh_dbl.h>
+#include <linux/gunyah.h>
 #include "hcall_dbl.h"
 
 struct gh_dbl_desc {
@@ -78,9 +79,8 @@ static int gh_dbl_validate_params(struct gh_dbl_desc *client_desc,
 			goto err;
 		}
 
-		if ((cap_table_entry->rx_cap_id == GH_CAPID_INVAL) &&
-			(flags & GH_DBL_NONBLOCK)) {
-			ret = -EAGAIN;
+		if (flags & GH_DBL_NONBLOCK) {
+			ret = cap_table_entry->rx_cap_id == GH_CAPID_INVAL ? -EAGAIN : 0;
 			goto err;
 		}
 
@@ -96,9 +96,8 @@ static int gh_dbl_validate_params(struct gh_dbl_desc *client_desc,
 			goto err;
 		}
 
-		if ((cap_table_entry->tx_cap_id == GH_CAPID_INVAL) &&
-			(flags & GH_DBL_NONBLOCK)) {
-			ret = -EAGAIN;
+		if (flags & GH_DBL_NONBLOCK) {
+			ret = cap_table_entry->tx_cap_id == GH_CAPID_INVAL ? -EAGAIN : 0;
 			goto err;
 		}
 
@@ -158,7 +157,7 @@ int gh_dbl_read_and_clean(void *dbl_client_desc, gh_dbl_flags_t *clear_flags,
 
 	return ret;
 }
-EXPORT_SYMBOL(gh_dbl_read_and_clean);
+EXPORT_SYMBOL_GPL(gh_dbl_read_and_clean);
 
 /**
  * gh_dbl_set_mask - Set doorbell object mask
@@ -199,7 +198,7 @@ int gh_dbl_set_mask(void *dbl_client_desc, gh_dbl_flags_t enable_mask,
 
 	return ret;
 }
-EXPORT_SYMBOL(gh_dbl_set_mask);
+EXPORT_SYMBOL_GPL(gh_dbl_set_mask);
 
 /**
  * gh_dbl_send - Set flags in the doorbell
@@ -245,7 +244,7 @@ int gh_dbl_send(void *dbl_client_desc, gh_dbl_flags_t *newflags,
 
 	return ret;
 }
-EXPORT_SYMBOL(gh_dbl_send);
+EXPORT_SYMBOL_GPL(gh_dbl_send);
 
 /**
  * gh_dbl_reset - clear all the flags of the doorbell and sets all bits in
@@ -280,7 +279,7 @@ int gh_dbl_reset(void *dbl_client_desc, const unsigned long flags)
 
 	return ret;
 }
-EXPORT_SYMBOL(gh_dbl_reset);
+EXPORT_SYMBOL_GPL(gh_dbl_reset);
 
 static irqreturn_t gh_dbl_rx_callback_thread(int irq, void *data)
 {
@@ -350,7 +349,7 @@ err:
 	spin_unlock(&cap_table_entry->cap_entry_lock);
 	return ERR_PTR(ret);
 }
-EXPORT_SYMBOL(gh_dbl_tx_register);
+EXPORT_SYMBOL_GPL(gh_dbl_tx_register);
 
 /**
  * gh_dbl_rx_register: Register as a Rx client to use the doorbell
@@ -359,7 +358,7 @@ EXPORT_SYMBOL(gh_dbl_tx_register);
  * @rx_cb: Callback of the client when there is a vIRQ on doorbell
  * @priv: Private data of the driver
  *
- * The function returns a descriptor for the clients to receieve a message.
+ * The function returns a descriptor for the clients to receive a message.
  * Else, returns -EBUSY if some other client is already registered
  * to this label, and -EINVAL for invalid arguments. The caller should check
  * the return value using IS_ERR_OR_NULL() and PTR_ERR() to extract the error
@@ -417,7 +416,7 @@ err:
 	spin_unlock(&cap_table_entry->cap_entry_lock);
 	return ERR_PTR(ret);
 }
-EXPORT_SYMBOL(gh_dbl_rx_register);
+EXPORT_SYMBOL_GPL(gh_dbl_rx_register);
 
 /**
  * gh_dbl_tx_unregister: Unregister Tx client to use the doorbell
@@ -467,7 +466,7 @@ int gh_dbl_tx_unregister(void *dbl_client_desc)
 
 	return 0;
 }
-EXPORT_SYMBOL(gh_dbl_tx_unregister);
+EXPORT_SYMBOL_GPL(gh_dbl_tx_unregister);
 
 /**
  * gh_dbl_rx_unregister: Unregister Rx client to use the doorbell
@@ -520,7 +519,7 @@ int gh_dbl_rx_unregister(void *dbl_client_desc)
 
 	return 0;
 }
-EXPORT_SYMBOL(gh_dbl_rx_unregister);
+EXPORT_SYMBOL_GPL(gh_dbl_rx_unregister);
 
 /**
  * This API is called by RM driver to populate doorbell objects
@@ -601,7 +600,7 @@ int gh_dbl_populate_cap_info(enum gh_dbl_label label, u64 cap_id,
 err:
 	return ret;
 }
-EXPORT_SYMBOL(gh_dbl_populate_cap_info);
+EXPORT_SYMBOL_GPL(gh_dbl_populate_cap_info);
 
 /**
  * This API is called by RM driver to free up doorbell objects
@@ -657,7 +656,7 @@ err_unlock:
 
 	return ret;
 }
-EXPORT_SYMBOL(gh_dbl_reset_cap_info);
+EXPORT_SYMBOL_GPL(gh_dbl_reset_cap_info);
 
 static void gh_dbl_cleanup(int begin_idx)
 {
@@ -709,4 +708,4 @@ static void __exit gh_dbl_exit(void)
 module_exit(gh_dbl_exit);
 
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. Gunyah Doorbell Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

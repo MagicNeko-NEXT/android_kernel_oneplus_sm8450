@@ -26,7 +26,7 @@
 #include <asm/cp15.h>
 #include <asm/mach-types.h>
 #include <asm/memblock.h>
-#include <asm/memory.h>
+#include <asm/page.h>
 #include <asm/prom.h>
 #include <asm/sections.h>
 #include <asm/setup.h>
@@ -158,51 +158,10 @@ phys_addr_t __init arm_memblock_steal(phys_addr_t size, phys_addr_t align)
 		panic("Failed to steal %pa bytes at %pS\n",
 		      &size, (void *)_RET_IP_);
 
-	memblock_free(phys, size);
+	memblock_phys_free(phys, size);
 	memblock_remove(phys, size);
 
 	return phys;
-}
-
-static void __init arm_initrd_init(void)
-{
-#ifdef CONFIG_BLK_DEV_INITRD
-	phys_addr_t start;
-	unsigned long size;
-
-	initrd_start = initrd_end = 0;
-
-	if (!phys_initrd_size)
-		return;
-
-	/*
-	 * Round the memory region to page boundaries as per free_initrd_mem()
-	 * This allows us to detect whether the pages overlapping the initrd
-	 * are in use, but more importantly, reserves the entire set of pages
-	 * as we don't want these pages allocated for other purposes.
-	 */
-	start = round_down(phys_initrd_start, PAGE_SIZE);
-	size = phys_initrd_size + (phys_initrd_start - start);
-	size = round_up(size, PAGE_SIZE);
-
-	if (!memblock_is_region_memory(start, size)) {
-		pr_err("INITRD: 0x%08llx+0x%08lx is not a memory region - disabling initrd\n",
-		       (u64)start, size);
-		return;
-	}
-
-	if (memblock_is_region_reserved(start, size)) {
-		pr_err("INITRD: 0x%08llx+0x%08lx overlaps in-use memory region - disabling initrd\n",
-		       (u64)start, size);
-		return;
-	}
-
-	memblock_reserve(start, size);
-
-	/* Now convert initrd to virtual addresses */
-	initrd_start = __phys_to_virt(phys_initrd_start);
-	initrd_end = initrd_start + phys_initrd_size;
-#endif
 }
 
 #ifdef CONFIG_CPU_ICACHE_MISMATCH_WORKAROUND
@@ -226,7 +185,7 @@ void __init arm_memblock_init(const struct machine_desc *mdesc)
 	/* Register the kernel text, kernel data and initrd with memblock. */
 	memblock_reserve(__pa(KERNEL_START), KERNEL_END - KERNEL_START);
 
-	arm_initrd_init();
+	reserve_initrd_mem();
 
 	arm_mm_memblock_reserve();
 
@@ -277,85 +236,6 @@ static inline void poison_init_mem(void *s, size_t count)
 		*p++ = 0xe7fddef0;
 }
 
-static inline void __init
-free_memmap(unsigned long start_pfn, unsigned long end_pfn)
-{
-	struct page *start_pg, *end_pg;
-	phys_addr_t pg, pgend;
-
-	/*
-	 * Convert start_pfn/end_pfn to a struct page pointer.
-	 */
-	start_pg = pfn_to_page(start_pfn - 1) + 1;
-	end_pg = pfn_to_page(end_pfn - 1) + 1;
-
-	/*
-	 * Convert to physical addresses, and
-	 * round start upwards and end downwards.
-	 */
-	pg = PAGE_ALIGN(__pa(start_pg));
-	pgend = __pa(end_pg) & PAGE_MASK;
-
-	/*
-	 * If there are free pages between these,
-	 * free the section of the memmap array.
-	 */
-	if (pg < pgend)
-		memblock_free_early(pg, pgend - pg);
-}
-
-/*
- * The mem_map array can get very big.  Free the unused area of the memory map.
- */
-static void __init free_unused_memmap(void)
-{
-	unsigned long start, end, prev_end = 0;
-	int i;
-
-	/*
-	 * This relies on each bank being in address order.
-	 * The banks are sorted previously in bootmem_init().
-	 */
-	for_each_mem_pfn_range(i, MAX_NUMNODES, &start, &end, NULL) {
-#ifdef CONFIG_SPARSEMEM
-		/*
-		 * Take care not to free memmap entries that don't exist
-		 * due to SPARSEMEM sections which aren't present.
-		 */
-		start = min(start,
-				 ALIGN(prev_end, PAGES_PER_SECTION));
-#endif
-		/*
-		 * Align down here since many operations in VM subsystem
-		 * presume that there are no holes in the memory map inside
-		 * a pageblock
-		 */
-		start = round_down(start, pageblock_nr_pages);
-
-		/*
-		 * If we had a previous bank, and there is a space
-		 * between the current bank and the previous, free it.
-		 */
-		if (prev_end && prev_end < start)
-			free_memmap(prev_end, start);
-
-		/*
-		 * Align up here since many operations in VM subsystem
-		 * presume that there are no holes in the memory map inside
-		 * a pageblock
-		 */
-		prev_end = ALIGN(end, pageblock_nr_pages);
-	}
-
-#ifdef CONFIG_SPARSEMEM
-	if (!IS_ALIGNED(prev_end, PAGES_PER_SECTION)) {
-		prev_end = ALIGN(end, pageblock_nr_pages);
-		free_memmap(prev_end,
-			    ALIGN(prev_end, PAGES_PER_SECTION));
-	}
-#endif
-}
-
 static void __init free_highpages(void)
 {
 #ifdef CONFIG_HIGHMEM
@@ -391,17 +271,12 @@ static void __init free_highpages(void)
 void __init mem_init(void)
 {
 #ifdef CONFIG_ARM_LPAE
-	if (swiotlb_force == SWIOTLB_FORCE ||
-	    max_pfn > arm_dma_pfn_limit)
-		swiotlb_init(1);
-	else
-		swiotlb_force = SWIOTLB_NO_FORCE;
+	swiotlb_init(max_pfn > arm_dma_pfn_limit, SWIOTLB_VERBOSE);
 #endif
 
 	set_max_mapnr(pfn_to_page(max_pfn) - mem_map);
 
 	/* this will put all unused low memory onto the freelists */
-	free_unused_memmap();
 	memblock_free_all();
 
 #ifdef CONFIG_SA1111
@@ -410,8 +285,6 @@ void __init mem_init(void)
 #endif
 
 	free_highpages();
-
-	mem_init_print_info(NULL);
 
 	/*
 	 * Check boundaries twice: Some fundamental inconsistencies can
@@ -436,9 +309,6 @@ struct section_perm {
 	pmdval_t mask;
 	pmdval_t prot;
 	pmdval_t clear;
-	pteval_t ptemask;
-	pteval_t pteprot;
-	pteval_t pteclear;
 };
 
 /* First section-aligned location at or after __start_rodata. */
@@ -452,8 +322,6 @@ static struct section_perm nx_perms[] = {
 		.end	= (unsigned long)_stext,
 		.mask	= ~PMD_SECT_XN,
 		.prot	= PMD_SECT_XN,
-		.ptemask = ~L_PTE_XN,
-		.pteprot = L_PTE_XN,
 	},
 	/* Make init RW (set NX). */
 	{
@@ -462,8 +330,6 @@ static struct section_perm nx_perms[] = {
 		.end	= (unsigned long)_sdata,
 		.mask	= ~PMD_SECT_XN,
 		.prot	= PMD_SECT_XN,
-		.ptemask = ~L_PTE_XN,
-		.pteprot = L_PTE_XN,
 	},
 	/* Make rodata NX (set RO in ro_perms below). */
 	{
@@ -472,8 +338,6 @@ static struct section_perm nx_perms[] = {
 		.end    = (unsigned long)__init_begin,
 		.mask   = ~PMD_SECT_XN,
 		.prot   = PMD_SECT_XN,
-		.ptemask = ~L_PTE_XN,
-		.pteprot = L_PTE_XN,
 	},
 };
 
@@ -491,8 +355,6 @@ static struct section_perm ro_perms[] = {
 		.prot   = PMD_SECT_APX | PMD_SECT_AP_WRITE,
 		.clear  = PMD_SECT_AP_WRITE,
 #endif
-		.ptemask = ~L_PTE_RDONLY,
-		.pteprot = L_PTE_RDONLY,
 	},
 };
 
@@ -501,34 +363,6 @@ static struct section_perm ro_perms[] = {
  * copied into each mm). During startup, this is the init_mm. Is only
  * safe to be called with preemption disabled, as under stop_machine().
  */
-struct pte_data {
-	pteval_t mask;
-	pteval_t val;
-};
-
-static int __pte_update(pte_t *ptep, unsigned long addr, void *d)
-{
-	struct pte_data *data = d;
-	pte_t pte = *ptep;
-
-	pte = __pte((pte_val(*ptep) & data->mask) | data->val);
-	set_pte_ext(ptep, pte, 0);
-
-	return 0;
-}
-
-static inline void pte_update(unsigned long addr, pteval_t mask,
-				  pteval_t prot, struct mm_struct *mm)
-{
-	struct pte_data data;
-
-	data.mask = mask;
-	data.val = prot;
-
-	apply_to_page_range(mm, addr, SECTION_SIZE, __pte_update, &data);
-	flush_tlb_kernel_range(addr, addr + SECTION_SIZE);
-}
-
 static inline void section_update(unsigned long addr, pmdval_t mask,
 				  pmdval_t prot, struct mm_struct *mm)
 {
@@ -577,21 +411,11 @@ static void set_section_perms(struct section_perm *perms, int n, bool set,
 
 		for (addr = perms[i].start;
 		     addr < perms[i].end;
-		     addr += SECTION_SIZE) {
-			pmd_t *pmd;
-
-			pmd = pmd_offset(pud_offset(pgd_offset(mm, addr),
-						addr), addr);
-			if (pmd_bad(*pmd))
-				section_update(addr, perms[i].mask,
-					set ? perms[i].prot : perms[i].clear,
-					mm);
-			else
-				pte_update(addr, perms[i].ptemask,
-				     set ? perms[i].pteprot : perms[i].pteclear,
-				     mm);
-		}
+		     addr += SECTION_SIZE)
+			section_update(addr, perms[i].mask,
+				set ? perms[i].prot : perms[i].clear, mm);
 	}
+
 }
 
 /**
@@ -631,31 +455,10 @@ static int __mark_rodata_ro(void *unused)
 	return 0;
 }
 
-static int kernel_set_to_readonly __read_mostly;
-
 void mark_rodata_ro(void)
 {
-	kernel_set_to_readonly = 1;
 	stop_machine(__mark_rodata_ro, NULL, NULL);
 	debug_checkwx();
-}
-
-void set_kernel_text_rw(void)
-{
-	if (!kernel_set_to_readonly)
-		return;
-
-	set_section_perms(ro_perms, ARRAY_SIZE(ro_perms), false,
-				current->active_mm);
-}
-
-void set_kernel_text_ro(void)
-{
-	if (!kernel_set_to_readonly)
-		return;
-
-	set_section_perms(ro_perms, ARRAY_SIZE(ro_perms), true,
-				current->active_mm);
 }
 
 #else

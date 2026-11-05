@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "mem_buf_vm: " fmt
@@ -46,7 +47,7 @@ PERIPHERAL_VM(CP_APP, cp_app);
 
 static struct mem_buf_vm vm_trusted_vm = {
 	.name = "qcom,trusted_vm",
-	.vmid = VMID_TUIVM,
+	.vmid = VMID_TVM,
 	.allowed_api = MEM_BUF_API_GUNYAH,
 };
 
@@ -81,6 +82,12 @@ struct mem_buf_vm *pdata_array[] = {
 	NULL,
 };
 
+int mem_buf_current_vmid(void)
+{
+	return current_vmid;
+}
+EXPORT_SYMBOL_GPL(mem_buf_current_vmid);
+
 /*
  * Opening this file acquires a refcount on vm->dev's kobject - see
  * chrdev_open(). So private data won't be free'd out from
@@ -103,7 +110,7 @@ bool mem_buf_vm_uses_hyp_assign(void)
 {
 	return current_vmid == VMID_HLOS;
 }
-EXPORT_SYMBOL(mem_buf_vm_uses_hyp_assign);
+EXPORT_SYMBOL_GPL(mem_buf_vm_uses_hyp_assign);
 
 /*
  * Use Gunyah API if any vm in the source or destination requires it.
@@ -135,7 +142,7 @@ int mem_buf_vm_uses_gunyah(int *vmids, unsigned int nr_acl_entries)
 
 	return false;
 }
-EXPORT_SYMBOL(mem_buf_vm_uses_gunyah);
+EXPORT_SYMBOL_GPL(mem_buf_vm_uses_gunyah);
 
 int mem_buf_fd_to_vmid(int fd)
 {
@@ -158,21 +165,7 @@ int mem_buf_fd_to_vmid(int fd)
 	fput(file);
 	return ret;
 }
-EXPORT_SYMBOL(mem_buf_fd_to_vmid);
-
-int mem_buf_check_vmids(int *vmids, unsigned long nr)
-{
-	int i;
-
-	for (i = 0; i < nr; i++) {
-		if (!xa_load(&mem_buf_vms, vmids[i])) {
-			pr_err_ratelimited("Unknown vmid %d\n", vmids[i]);
-			return -EINVAL;
-		}
-	}
-	return 0;
-}
-EXPORT_SYMBOL(mem_buf_check_vmids);
+EXPORT_SYMBOL_GPL(mem_buf_fd_to_vmid);
 
 static void mem_buf_vm_device_release(struct device *dev)
 {
@@ -281,7 +274,7 @@ static int mem_buf_vm_add_self(void)
 	return 0;
 }
 
-static char *mem_buf_vm_devnode(struct device *dev, umode_t *mode)
+static char *mem_buf_vm_devnode(const struct device *dev, umode_t *mode)
 {
 	return kasprintf(GFP_KERNEL, "mem_buf_vm/%s", dev_name(dev));
 }
@@ -311,7 +304,7 @@ int mem_buf_vm_init(struct device *dev)
 	if (ret)
 		return ret;
 
-	mem_buf_vm_class = class_create(THIS_MODULE, DEVNAME);
+	mem_buf_vm_class = class_create(DEVNAME);
 	if (IS_ERR(mem_buf_vm_class)) {
 		ret = PTR_ERR(mem_buf_vm_class);
 		goto err_class_create;

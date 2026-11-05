@@ -16,7 +16,10 @@
 #include <asm/kvm_asm.h>
 #include <asm/kvm_emulate.h>
 #include <asm/kvm_mmu.h>
+#include <asm/kvm_nested.h>
+#include <asm/kvm_pkvm.h>
 #include <asm/debug-monitors.h>
+#include <asm/stacktrace/nvhe.h>
 #include <asm/traps.h>
 
 #include <kvm/arm_hypercalls.h>
@@ -26,7 +29,7 @@
 
 typedef int (*exit_handle_fn)(struct kvm_vcpu *);
 
-static void kvm_handle_guest_serror(struct kvm_vcpu *vcpu, u32 esr)
+static void kvm_handle_guest_serror(struct kvm_vcpu *vcpu, u64 esr)
 {
 	if (!arm64_is_ras_serror(esr) || arm64_is_fatal_ras_serror(NULL, esr))
 		kvm_inject_vabt(vcpu);
@@ -34,19 +37,21 @@ static void kvm_handle_guest_serror(struct kvm_vcpu *vcpu, u32 esr)
 
 static int handle_hvc(struct kvm_vcpu *vcpu)
 {
-	int ret;
-
 	trace_kvm_hvc_arm64(*vcpu_pc(vcpu), vcpu_get_reg(vcpu, 0),
 			    kvm_vcpu_hvc_get_imm(vcpu));
 	vcpu->stat.hvc_exit_stat++;
 
-	ret = kvm_hvc_call_handler(vcpu);
-	if (ret < 0) {
-		vcpu_set_reg(vcpu, 0, ~0UL);
+	/* Forward hvc instructions to the virtual EL2 if the guest has EL2. */
+	if (vcpu_has_nv(vcpu)) {
+		if (vcpu_read_sys_reg(vcpu, HCR_EL2) & HCR_HCD)
+			kvm_inject_undefined(vcpu);
+		else
+			kvm_inject_nested_sync(vcpu, kvm_vcpu_get_esr(vcpu));
+
 		return 1;
 	}
 
-	return ret;
+	return kvm_smccc_call_handler(vcpu);
 }
 
 static int handle_smc(struct kvm_vcpu *vcpu)
@@ -57,11 +62,29 @@ static int handle_smc(struct kvm_vcpu *vcpu)
 	 * Trap exception, not a Secure Monitor Call exception [...]"
 	 *
 	 * We need to advance the PC after the trap, as it would
-	 * otherwise return to the same address...
+	 * otherwise return to the same address. Furthermore, pre-incrementing
+	 * the PC before potentially exiting to userspace maintains the same
+	 * abstraction for both SMCs and HVCs.
 	 */
-	vcpu_set_reg(vcpu, 0, ~0UL);
 	kvm_incr_pc(vcpu);
-	return 1;
+
+	/*
+	 * SMCs with a nonzero immediate are reserved according to DEN0028E 2.9
+	 * "SMC and HVC immediate value".
+	 */
+	if (kvm_vcpu_hvc_get_imm(vcpu)) {
+		vcpu_set_reg(vcpu, 0, ~0UL);
+		return 1;
+	}
+
+	/*
+	 * If imm is zero then it is likely an SMCCC call.
+	 *
+	 * Note that on ARMv8.3, even if EL3 is not implemented, SMC executed
+	 * at Non-secure EL1 is trapped to EL2 if HCR_EL2.TSC==1, rather than
+	 * being treated as UNDEFINED.
+	 */
+	return kvm_smccc_call_handler(vcpu);
 }
 
 /*
@@ -80,25 +103,51 @@ static int handle_no_fpsimd(struct kvm_vcpu *vcpu)
  *
  * @vcpu:	the vcpu pointer
  *
- * WFE: Yield the CPU and come back to this vcpu when the scheduler
+ * WFE[T]: Yield the CPU and come back to this vcpu when the scheduler
  * decides to.
- * WFI: Simply call kvm_vcpu_block(), which will halt execution of
+ * WFI: Simply call kvm_vcpu_halt(), which will halt execution of
  * world-switches and schedule other host processes until there is an
  * incoming IRQ or FIQ to the VM.
+ * WFIT: Same as WFI, with a timed wakeup implemented as a background timer
+ *
+ * WF{I,E}T can immediately return if the deadline has already expired.
  */
 static int kvm_handle_wfx(struct kvm_vcpu *vcpu)
 {
-	if (kvm_vcpu_get_esr(vcpu) & ESR_ELx_WFx_ISS_WFE) {
+	u64 esr = kvm_vcpu_get_esr(vcpu);
+
+	if (esr & ESR_ELx_WFx_ISS_WFE) {
 		trace_kvm_wfx_arm64(*vcpu_pc(vcpu), true);
 		vcpu->stat.wfe_exit_stat++;
-		kvm_vcpu_on_spin(vcpu, vcpu_mode_priv(vcpu));
 	} else {
 		trace_kvm_wfx_arm64(*vcpu_pc(vcpu), false);
 		vcpu->stat.wfi_exit_stat++;
-		kvm_vcpu_block(vcpu);
-		kvm_clear_request(KVM_REQ_UNHALT, vcpu);
 	}
 
+	if (esr & ESR_ELx_WFx_ISS_WFxT) {
+		if (esr & ESR_ELx_WFx_ISS_RV) {
+			u64 val, now;
+
+			now = kvm_arm_timer_get_reg(vcpu, KVM_REG_ARM_TIMER_CNT);
+			val = vcpu_get_reg(vcpu, kvm_vcpu_sys_get_rt(vcpu));
+
+			if (now >= val)
+				goto out;
+		} else {
+			/* Treat WFxT as WFx if RN is invalid */
+			esr &= ~ESR_ELx_WFx_ISS_WFxT;
+		}
+	}
+
+	if (esr & ESR_ELx_WFx_ISS_WFE) {
+		kvm_vcpu_on_spin(vcpu, vcpu_mode_priv(vcpu));
+	} else {
+		if (esr & ESR_ELx_WFx_ISS_WFxT)
+			vcpu_set_flag(vcpu, IN_WFIT);
+
+		kvm_vcpu_wfi(vcpu);
+	}
+out:
 	kvm_incr_pc(vcpu);
 
 	return 1;
@@ -113,50 +162,47 @@ static int kvm_handle_wfx(struct kvm_vcpu *vcpu)
  * guest and host are using the same debug facilities it will be up to
  * userspace to re-inject the correct exception for guest delivery.
  *
- * @return: 0 (while setting vcpu->run->exit_reason), -1 for error
+ * @return: 0 (while setting vcpu->run->exit_reason)
  */
 static int kvm_handle_guest_debug(struct kvm_vcpu *vcpu)
 {
 	struct kvm_run *run = vcpu->run;
-	u32 esr = kvm_vcpu_get_esr(vcpu);
-	int ret = 0;
+	u64 esr = kvm_vcpu_get_esr(vcpu);
 
 	run->exit_reason = KVM_EXIT_DEBUG;
-	run->debug.arch.hsr = esr;
+	run->debug.arch.hsr = lower_32_bits(esr);
+	run->debug.arch.hsr_high = upper_32_bits(esr);
+	run->flags = KVM_DEBUG_ARCH_HSR_HIGH_VALID;
 
 	switch (ESR_ELx_EC(esr)) {
 	case ESR_ELx_EC_WATCHPT_LOW:
 		run->debug.arch.far = vcpu->arch.fault.far_el2;
-		fallthrough;
-	case ESR_ELx_EC_SOFTSTP_LOW:
-	case ESR_ELx_EC_BREAKPT_LOW:
-	case ESR_ELx_EC_BKPT32:
-	case ESR_ELx_EC_BRK64:
 		break;
-	default:
-		kvm_err("%s: un-handled case esr: %#08x\n",
-			__func__, (unsigned int) esr);
-		ret = -1;
+	case ESR_ELx_EC_SOFTSTP_LOW:
+		vcpu_clear_flag(vcpu, DBG_SS_ACTIVE_PENDING);
 		break;
 	}
 
-	return ret;
+	return 0;
 }
 
 static int kvm_handle_unknown_ec(struct kvm_vcpu *vcpu)
 {
-	u32 esr = kvm_vcpu_get_esr(vcpu);
+	u64 esr = kvm_vcpu_get_esr(vcpu);
 
-	kvm_pr_unimpl("Unknown exception class: esr: %#08x -- %s\n",
+	kvm_pr_unimpl("Unknown exception class: esr: %#016llx -- %s\n",
 		      esr, esr_get_class_string(esr));
 
 	kvm_inject_undefined(vcpu);
 	return 1;
 }
 
+/*
+ * Guest access to SVE registers should be routed to this handler only
+ * when the system doesn't support SVE.
+ */
 static int handle_sve(struct kvm_vcpu *vcpu)
 {
-	/* Until SVE is supported for guests: */
 	kvm_inject_undefined(vcpu);
 	return 1;
 }
@@ -172,6 +218,41 @@ static int kvm_handle_ptrauth(struct kvm_vcpu *vcpu)
 	return 1;
 }
 
+static int kvm_handle_eret(struct kvm_vcpu *vcpu)
+{
+	if (kvm_vcpu_get_esr(vcpu) & ESR_ELx_ERET_ISS_ERET)
+		return kvm_handle_ptrauth(vcpu);
+
+	/*
+	 * If we got here, two possibilities:
+	 *
+	 * - the guest is in EL2, and we need to fully emulate ERET
+	 *
+	 * - the guest is in EL1, and we need to reinject the
+         *   exception into the L1 hypervisor.
+	 *
+	 * If KVM ever traps ERET for its own use, we'll have to
+	 * revisit this.
+	 */
+	if (is_hyp_ctxt(vcpu))
+		kvm_emulate_nested_eret(vcpu);
+	else
+		kvm_inject_nested_sync(vcpu, kvm_vcpu_get_esr(vcpu));
+
+	return 1;
+}
+
+static int handle_svc(struct kvm_vcpu *vcpu)
+{
+	/*
+	 * So far, SVC traps only for NV via HFGITR_EL2. A SVC from a
+	 * 32bit guest would be caught by vpcu_mode_is_bad_32bit(), so
+	 * we should only have to deal with a 64 bit exception.
+	 */
+	kvm_inject_nested_sync(vcpu, kvm_vcpu_get_esr(vcpu));
+	return 1;
+}
+
 static exit_handle_fn arm_exit_handlers[] = {
 	[0 ... ESR_ELx_EC_MAX]	= kvm_handle_unknown_ec,
 	[ESR_ELx_EC_WFx]	= kvm_handle_wfx,
@@ -179,13 +260,16 @@ static exit_handle_fn arm_exit_handlers[] = {
 	[ESR_ELx_EC_CP15_64]	= kvm_handle_cp15_64,
 	[ESR_ELx_EC_CP14_MR]	= kvm_handle_cp14_32,
 	[ESR_ELx_EC_CP14_LS]	= kvm_handle_cp14_load_store,
+	[ESR_ELx_EC_CP10_ID]	= kvm_handle_cp10_id,
 	[ESR_ELx_EC_CP14_64]	= kvm_handle_cp14_64,
 	[ESR_ELx_EC_HVC32]	= handle_hvc,
 	[ESR_ELx_EC_SMC32]	= handle_smc,
 	[ESR_ELx_EC_HVC64]	= handle_hvc,
 	[ESR_ELx_EC_SMC64]	= handle_smc,
+	[ESR_ELx_EC_SVC64]	= handle_svc,
 	[ESR_ELx_EC_SYS64]	= kvm_handle_sys_reg,
 	[ESR_ELx_EC_SVE]	= handle_sve,
+	[ESR_ELx_EC_ERET]	= kvm_handle_eret,
 	[ESR_ELx_EC_IABT_LOW]	= kvm_handle_guest_abort,
 	[ESR_ELx_EC_DABT_LOW]	= kvm_handle_guest_abort,
 	[ESR_ELx_EC_SOFTSTP_LOW]= kvm_handle_guest_debug,
@@ -199,7 +283,7 @@ static exit_handle_fn arm_exit_handlers[] = {
 
 static exit_handle_fn kvm_get_exit_handler(struct kvm_vcpu *vcpu)
 {
-	u32 esr = kvm_vcpu_get_esr(vcpu);
+	u64 esr = kvm_vcpu_get_esr(vcpu);
 	u8 esr_ec = ESR_ELx_EC(esr);
 
 	return arm_exit_handlers[esr_ec];
@@ -216,6 +300,21 @@ static int handle_trap_exceptions(struct kvm_vcpu *vcpu)
 	int handled;
 
 	/*
+	 * If we run a non-protected VM when protection is enabled
+	 * system-wide, resync the state from the hypervisor and mark
+	 * it as dirty on the host side if it wasn't dirty already
+	 * (which could happen if preemption has taken place).
+	 */
+	if (is_protected_kvm_enabled() && !kvm_vm_is_protected(vcpu->kvm)) {
+		preempt_disable();
+		if (!(vcpu_get_flag(vcpu, PKVM_HOST_STATE_DIRTY))) {
+			kvm_call_hyp_nvhe(__pkvm_vcpu_sync_state);
+			vcpu_set_flag(vcpu, PKVM_HOST_STATE_DIRTY);
+		}
+		preempt_enable();
+	}
+
+	/*
 	 * See ARM ARM B1.14.1: "Hyp traps on instructions
 	 * that fail their condition code check"
 	 */
@@ -230,6 +329,75 @@ static int handle_trap_exceptions(struct kvm_vcpu *vcpu)
 	}
 
 	return handled;
+}
+
+static int handle_hyp_req_mem(struct kvm_vcpu *vcpu,
+			   struct kvm_hyp_req *req)
+{
+	struct kvm *kvm = vcpu->kvm;
+	unsigned long nr_pages;
+	int ret;
+
+	switch (req->mem.dest) {
+	case REQ_MEM_DEST_HYP_ALLOC:
+		return __pkvm_topup_hyp_alloc(req->mem.nr_pages);
+	case REQ_MEM_DEST_VCPU_MEMCACHE:
+		nr_pages = vcpu->arch.stage2_mc.nr_pages;
+		ret = topup_hyp_memcache(&vcpu->arch.stage2_mc,
+					 req->mem.nr_pages, 0);
+		nr_pages = vcpu->arch.stage2_mc.nr_pages - nr_pages;
+		atomic64_add(nr_pages << PAGE_SHIFT, &kvm->stat.protected_hyp_mem);
+		atomic64_add(nr_pages << PAGE_SHIFT, &kvm->stat.protected_pgtable_mem);
+
+		return ret;
+	};
+
+	pr_warn("Unknown kvm_hyp_req mem dest: %d\n", req->mem.dest);
+
+	return -EINVAL;
+}
+
+static int handle_hyp_req_map(struct kvm_vcpu *vcpu,
+			      struct kvm_hyp_req *req)
+{
+	return pkvm_mem_abort_range(vcpu, req->map.guest_ipa, req->map.size);
+}
+
+static int handle_hyp_req_split(struct kvm_vcpu *vcpu, struct kvm_hyp_req *req)
+{
+	return __pkvm_pgtable_stage2_split(vcpu, req->split.guest_ipa, req->split.size);
+}
+
+static int handle_hyp_req(struct kvm_vcpu *vcpu)
+{
+	struct kvm_hyp_req *hyp_req = vcpu->arch.hyp_reqs;
+	int i, ret;
+
+	for (i = 0; i < KVM_HYP_REQ_MAX; i++, hyp_req++) {
+		if (hyp_req->type == KVM_HYP_LAST_REQ)
+			break;
+
+		switch (hyp_req->type) {
+		case KVM_HYP_REQ_TYPE_MEM:
+			ret = handle_hyp_req_mem(vcpu, hyp_req);
+			break;
+		case KVM_HYP_REQ_TYPE_MAP:
+			ret = handle_hyp_req_map(vcpu, hyp_req);
+			break;
+		case KVM_HYP_REQ_TYPE_SPLIT:
+			ret = handle_hyp_req_split(vcpu, hyp_req);
+			break;
+		default:
+			pr_warn("Unknown kvm_hyp_req type: %d\n", hyp_req->type);
+			ret = -EINVAL;
+		}
+
+		if (ret)
+			return ret;
+	}
+
+	/* handled */
+	return 1;
 }
 
 /*
@@ -260,7 +428,7 @@ int handle_exit(struct kvm_vcpu *vcpu, int exception_index)
 	case ARM_EXCEPTION_HYP_GONE:
 		/*
 		 * EL2 has been reset to the hyp-stub. This happens when a guest
-		 * is pre-empted by kvm_reboot()'s shutdown call.
+		 * is pre-emptied by kvm_reboot()'s shutdown call.
 		 */
 		run->exit_reason = KVM_EXIT_FAIL_ENTRY;
 		return 0;
@@ -271,6 +439,8 @@ int handle_exit(struct kvm_vcpu *vcpu, int exception_index)
 		 */
 		run->exit_reason = KVM_EXIT_FAIL_ENTRY;
 		return -EINVAL;
+	case ARM_EXCEPTION_HYP_REQ:
+		return handle_hyp_req(vcpu);
 	default:
 		kvm_pr_unimpl("Unsupported exception type: %d",
 			      exception_index);
@@ -282,6 +452,13 @@ int handle_exit(struct kvm_vcpu *vcpu, int exception_index)
 /* For exit types that need handling before we can be preempted */
 void handle_exit_early(struct kvm_vcpu *vcpu, int exception_index)
 {
+	/*
+	 * We just exited, so the state is clean from a hypervisor
+	 * perspective.
+	 */
+	if (is_protected_kvm_enabled())
+		vcpu_clear_flag(vcpu, PKVM_HOST_STATE_DIRTY);
+
 	if (ARM_SERROR_PENDING(exception_index)) {
 		if (this_cpu_has_cap(ARM64_HAS_RAS_EXTN)) {
 			u64 disr = kvm_vcpu_get_disr(vcpu);
@@ -298,4 +475,76 @@ void handle_exit_early(struct kvm_vcpu *vcpu, int exception_index)
 
 	if (exception_index == ARM_EXCEPTION_EL1_SERROR)
 		kvm_handle_guest_serror(vcpu, kvm_vcpu_get_esr(vcpu));
+}
+
+static void print_nvhe_hyp_panic(const char *name, u64 panic_addr)
+{
+	kvm_err("nVHE hyp %s at: [<%016llx>] %pB!\n", name, panic_addr,
+		(void *)(panic_addr + kaslr_offset()));
+}
+
+static void kvm_nvhe_report_cfi_failure(u64 panic_addr)
+{
+	print_nvhe_hyp_panic("CFI failure", panic_addr);
+
+	if (IS_ENABLED(CONFIG_CFI_PERMISSIVE))
+		kvm_err(" (CONFIG_CFI_PERMISSIVE ignored for hyp failures)\n");
+}
+
+void __noreturn __cold nvhe_hyp_panic_handler(u64 esr, u64 spsr,
+					      u64 elr_virt, u64 elr_phys,
+					      u64 par, uintptr_t vcpu,
+					      u64 far, u64 hpfar)
+{
+	u64 elr_in_kimg = __phys_to_kimg(elr_phys);
+	u64 hyp_offset = elr_in_kimg - kaslr_offset() - elr_virt;
+	u64 mode = spsr & PSR_MODE_MASK;
+	u64 panic_addr = elr_virt + hyp_offset;
+	u64 mod_addr = pkvm_el2_mod_kern_va(elr_virt);
+
+	if (mode != PSR_MODE_EL2t && mode != PSR_MODE_EL2h) {
+		kvm_err("Invalid host exception to nVHE hyp!\n");
+	} else if (ESR_ELx_EC(esr) == ESR_ELx_EC_BRK64 &&
+		   esr_brk_comment(esr) == BUG_BRK_IMM) {
+		const char *file = NULL;
+		unsigned int line = 0;
+
+		/* All hyp bugs, including warnings, are treated as fatal. */
+		if (!is_protected_kvm_enabled() ||
+		    IS_ENABLED(CONFIG_NVHE_EL2_DEBUG)) {
+			struct bug_entry *bug = find_bug(elr_in_kimg);
+
+			if (bug)
+				bug_get_file_line(bug, &file, &line);
+		}
+
+		if (file)
+			kvm_err("nVHE hyp BUG at: %s:%u!\n", file, line);
+		else if (mod_addr)
+			kvm_err("nVHE hyp BUG at: [<%016llx>] %pB!\n", mod_addr,
+					(void *)mod_addr);
+		else
+			print_nvhe_hyp_panic("BUG", panic_addr);
+	} else if (IS_ENABLED(CONFIG_CFI_CLANG) && esr_is_cfi_brk(esr)) {
+		kvm_nvhe_report_cfi_failure(panic_addr);
+	} else if (mod_addr) {
+		kvm_err("nVHE hyp panic at: [<%016llx>] %pB!\n", mod_addr,
+				(void *)mod_addr);
+	} else {
+		print_nvhe_hyp_panic("panic", panic_addr);
+	}
+
+	/* Dump the nVHE hypervisor backtrace */
+	kvm_nvhe_dump_backtrace(hyp_offset);
+
+	/*
+	 * Hyp has panicked and we're going to handle that by panicking the
+	 * kernel. The kernel offset will be revealed in the panic so we're
+	 * also safe to reveal the hyp offset as a debugging aid for translating
+	 * hyp VAs to vmlinux addresses.
+	 */
+	kvm_err("Hyp Offset: 0x%llx\n", hyp_offset);
+
+	panic("HYP panic:\nPS:%08llx PC:%016llx ESR:%016llx\nFAR:%016llx HPFAR:%016llx PAR:%016llx\nVCPU:%016lx\n",
+	      spsr, elr_virt, esr, far, hpfar, par, vcpu);
 }

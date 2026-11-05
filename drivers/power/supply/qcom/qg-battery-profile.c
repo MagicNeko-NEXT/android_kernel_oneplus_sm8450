@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2018-2020 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2025, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt)	"QG-K: %s: " fmt, __func__
@@ -297,7 +298,7 @@ static int qg_parse_battery_profile(struct qg_battery_data *battery)
 			goto cleanup;
 		}
 
-		strlcpy(battery->profile[i].name, table[i].table_name,
+		strscpy(battery->profile[i].name, table[i].table_name,
 						strlen(table[i].table_name));
 		battery->profile[i].rows = rows;
 		battery->profile[i].cols = cols;
@@ -458,8 +459,7 @@ int qg_batterydata_init(struct device_node *profile_node)
 			goto unregister_chrdev;
 		}
 
-		battery->battery_class = class_create(THIS_MODULE,
-							"qg_battery");
+		battery->battery_class = class_create("qg_battery");
 		if (IS_ERR_OR_NULL(battery->battery_class)) {
 			pr_err("Failed to create qg-battery class\n");
 			rc = -ENODEV;

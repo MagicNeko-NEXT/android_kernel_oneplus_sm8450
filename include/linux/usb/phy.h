@@ -158,6 +158,9 @@ struct usb_phy {
 	enum usb_charger_type (*charger_detect)(struct usb_phy *x);
 
 	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_RESERVE(2);
+	ANDROID_KABI_RESERVE(3);
+	ANDROID_KABI_RESERVE(4);
 };
 
 /* for board-specific init logic */

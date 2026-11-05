@@ -52,12 +52,10 @@ config QRTR_TUN
 
 config QRTR_MHI
 	tristate "MHI IPC Router channels"
-	depends on MHI_BUS || (COMPILE_TEST && MHI_BUS=n)
+	depends on MHI_BUS
 	help
-	  Say Y here to support MHI based ipcrouter channels.  MHI is the
-	  transport used for external modem connections for IPC Router. The
-	  MHI transport fakes synchronous sends by waiting for the uplink
-	  callback from the MHI framework before returing to qrtr core.
+	  Say Y here to support MHI based ipcrouter channels. MHI is the
+	  transport used for communicating to external modems.
 
 config QRTR_GUNYAH
 	tristate "Gunyah IPC Router channels"
@@ -67,12 +65,13 @@ config QRTR_GUNYAH
 	  Router communication between two virtual machines. The transport
 	  uses dynamically shared memory and gunyah doorbells.
 
-config QRTR_DEBUG
-	bool "QRTR debug enhancements"
+config QRTR_GENPOOL
+	tristate "Genpool FIFO IPC Router channels"
 	help
-	  Say Y here to enable QRTR debug enhancements support and currently
-	  supporting logging of resume tx failure cases when skb alloc failed
-	  and confirm rx flag is set. Also logging the skb alloc failure
-	  while allocating skb in rx path.
+	  Say Y here to support a fifo based ipcrouter channel with genpool and
+	  IPCC signaling. The genpool fifo transport layer enables IPC Router
+	  communication between two endpoints. The transport utilizes a reserved
+	  memory created and owned by another device, which is shared through
+	  the genpool framework.
 
 endif # QRTR

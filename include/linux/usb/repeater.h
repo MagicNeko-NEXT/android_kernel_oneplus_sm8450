@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Copyright (c) 2021, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2021-2023, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #ifndef __LINUX_USB_REPEATER_H
 #define __LINUX_USB_REPEATER_H
@@ -19,26 +19,20 @@ struct usb_repeater  {
 	struct list_head	head;
 	int	(*reset)(struct usb_repeater *x, bool bring_out_of_reset);
 	int	(*init)(struct usb_repeater *x);
-#ifdef OPLUS_FEATURE_CHG_BASIC
-	int	(*init_with_mode)(struct usb_repeater *x, int mode);
-#endif
 	int	(*suspend)(struct usb_repeater *r, int suspend);
 	int	(*powerup)(struct usb_repeater *r);
 	int	(*powerdown)(struct usb_repeater *r);
+	int	(*get_version)(struct usb_repeater *r);
 };
-
-#ifdef OPLUS_FEATURE_CHG_BASIC
-enum oplus_usb_repeater_param {
-    OPLUS_REPEATER_PARAM_DEVICE,
-    OPLUS_REPEATER_PARAM_HOST
-};
-#endif
 
 #if IS_ENABLED(CONFIG_USB_REPEATER)
 struct usb_repeater *devm_usb_get_repeater_by_phandle(struct device *dev,
 		const char *phandle, u8 index);
 struct usb_repeater *devm_usb_get_repeater_by_node(struct device *dev,
 		struct device_node *node);
+struct usb_repeater *usb_get_repeater_by_phandle(struct device *dev,
+			const char *phandle, u8 index);
+struct usb_repeater *usb_get_repeater_by_node(struct device_node *node);
 void usb_put_repeater(struct usb_repeater *r);
 int usb_add_repeater_dev(struct usb_repeater *r);
 void usb_remove_repeater_dev(struct usb_repeater *r);
@@ -51,13 +45,21 @@ static inline struct usb_repeater *devm_usb_get_repeater_by_node(
 		struct device *dev, struct device_node *node)
 { return ERR_PTR(-ENXIO); }
 
+static inline struct usb_repeater *usb_get_repeater_by_phandle(
+		struct device *d, const char *phandle, u8 index)
+{ return ERR_PTR(-ENXIO); }
+
+static inline struct usb_repeater *usb_get_repeater_by_node(
+		struct device_node *node)
+{ return ERR_PTR(-ENXIO); }
+
 static inline void usb_put_repeater(struct usb_repeater *r)
 { }
 
-static int usb_add_repeater_dev(struct usb_repeater *r)
+static inline int usb_add_repeater_dev(struct usb_repeater *r)
 { return 0; }
 
-static void usb_remove_repeater_dev(struct usb_repeater *r)
+static inline void usb_remove_repeater_dev(struct usb_repeater *r)
 { }
 #endif
 
@@ -77,16 +79,6 @@ static inline int usb_repeater_init(struct usb_repeater *r)
 	else
 		return 0;
 }
-
-#ifdef OPLUS_FEATURE_CHG_BASIC
-static inline int usb_repeater_init_with_mode(struct usb_repeater *r, int param)
-{
-	if (r && r->init_with_mode != NULL)
-		return r->init_with_mode(r, param);
-	else
-		return 0;
-}
-#endif
 
 static inline int usb_repeater_suspend(struct usb_repeater *r, int suspend)
 {
@@ -110,5 +102,13 @@ static inline int usb_repeater_powerdown(struct usb_repeater *r)
 		return r->powerdown(r);
 	else
 		return 0;
+}
+
+static inline int usb_repeater_get_version(struct usb_repeater *r)
+{
+	if (r && r->get_version != NULL)
+		return r->get_version(r);
+	else
+		return -EINVAL;
 }
 #endif /* __LINUX_USB_REPEATER_H */

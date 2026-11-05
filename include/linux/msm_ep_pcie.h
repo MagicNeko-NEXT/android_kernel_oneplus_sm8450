@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (c) 2015, 2017, 2019-2021, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -10,7 +10,6 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  */
-/* Copyright (c) 2025 Qualcomm Innovation Center, Inc. All rights reserved.*/
 
 #ifndef __MSM_EP_PCIE_H
 #define __MSM_EP_PCIE_H
@@ -21,6 +20,7 @@ enum ep_pcie_link_status {
 	EP_PCIE_LINK_DISABLED,
 	EP_PCIE_LINK_UP,
 	EP_PCIE_LINK_ENABLED,
+	EP_PCIE_LINK_IN_L23READY,
 };
 
 enum ep_pcie_event {
@@ -35,6 +35,7 @@ enum ep_pcie_event {
 	EP_PCIE_EVENT_MMIO_WRITE = 0x80,
 	EP_PCIE_EVENT_L1SUB_TIMEOUT = 0x100,
 	EP_PCIE_EVENT_L1SUB_TIMEOUT_EXIT = 0x200,
+	EP_PCIE_EVENT_LINKUP_VF = 0x400,
 };
 
 enum ep_pcie_irq_event {
@@ -69,11 +70,17 @@ enum ep_pcie_options {
 	EP_PCIE_OPT_ALL = 0xFFFFFFFF,
 };
 
+enum ep_pcie_msi_type {
+	MSI = 0,
+	MSIX = 0x1,
+};
+
 struct ep_pcie_notify {
 	enum ep_pcie_event event;
 	void *user;
 	void *data;
 	u32 options;
+	u32 vf_id;
 };
 
 struct ep_pcie_register_event {
@@ -87,10 +94,10 @@ struct ep_pcie_register_event {
 };
 
 struct ep_pcie_iatu {
-	u32 start;
-	u32 end;
-	u32 tgt_lower;
-	u32 tgt_upper;
+	u64 start;
+	u64 end;
+	u64 tgt_lower;
+	u64 tgt_upper;
 };
 
 struct ep_pcie_msi_config {
@@ -98,6 +105,7 @@ struct ep_pcie_msi_config {
 	u32 upper;
 	u32 data;
 	u32 msg_num;
+	enum ep_pcie_msi_type msi_type;
 };
 
 struct ep_pcie_db_config {
@@ -111,38 +119,45 @@ struct ep_pcie_inactivity {
 	uint32_t timer_us;
 };
 
+struct ep_pcie_cap {
+	bool sriov_enabled;
+	bool msix_enabled;
+	u32  num_vfs;
+};
+
 struct ep_pcie_hw {
 	struct list_head node;
 	u32 device_id;
-	void *private_data;
+	void **private_data;
 	int (*register_event)(struct ep_pcie_register_event *reg);
 	int (*deregister_event)(void);
 	enum ep_pcie_link_status (*get_linkstatus)(void);
-	u32 (*get_qtimer_off)(void *dev);
 	int (*config_outbound_iatu)(struct ep_pcie_iatu entries[],
-				u32 num_entries);
-	int (*get_msi_config)(struct ep_pcie_msi_config *cfg);
-	int (*trigger_msi)(u32 idx);
+				u32 num_entries, u32 vf_id);
+	int (*get_msi_config)(struct ep_pcie_msi_config *cfg, u32 vf_id);
+	int (*trigger_msi)(u32 idx, u32 vf_id);
 	int (*wakeup_host)(enum ep_pcie_event event);
 	int (*enable_endpoint)(enum ep_pcie_options opt);
 	int (*disable_endpoint)(void);
 	int (*config_db_routing)(struct ep_pcie_db_config chdb_cfg,
-				struct ep_pcie_db_config erdb_cfg);
+				struct ep_pcie_db_config erdb_cfg,
+				u32 vf_id);
 	int (*mask_irq_event)(enum ep_pcie_irq_event event,
 				bool enable);
 	int (*configure_inactivity_timer)(struct ep_pcie_inactivity *param);
+	int (*get_capability)(struct ep_pcie_cap *ep_cap);
 };
 
 /*
  * ep_pcie_register_drv - register HW driver.
  * @phandle:	PCIe endpoint HW driver handle
- * @dev:	EP PCIe Global Handle
+ *
  * This function registers PCIe HW driver to PCIe endpoint service
  * layer.
  *
  * Return: 0 on success, negative value on error
  */
-int ep_pcie_register_drv(struct ep_pcie_hw *phandle, void *dev);
+int ep_pcie_register_drv(struct ep_pcie_hw *phandle);
 
 /*
  * ep_pcie_deregister_drv - deregister HW driver.
@@ -201,17 +216,6 @@ int ep_pcie_deregister_event(struct ep_pcie_hw *phandle);
 enum ep_pcie_link_status ep_pcie_get_linkstatus(struct ep_pcie_hw *phandle);
 
 /*
- * ep_pcie_qtimer_cap_off - Get qtimer offset in MHI capability.
- * @phandle: PCIe endpoint HW driver handle
- *
- * This function reads PARF register to get qtimer offset in MHI
- * capability
- *
- * Return: Qtimer offset in MHI capability
- */
-u32 ep_pcie_qtimer_cap_off(struct ep_pcie_hw *phandle);
-
-/*
  * ep_pcie_config_outbound_iatu - configure outbound iATU.
  * @entries:	iatu entries
  * @num_entries:	number of iatu entries
@@ -224,7 +228,8 @@ u32 ep_pcie_qtimer_cap_off(struct ep_pcie_hw *phandle);
  */
 int ep_pcie_config_outbound_iatu(struct ep_pcie_hw *phandle,
 				struct ep_pcie_iatu entries[],
-				u32 num_entries);
+				u32 num_entries,
+				u32 vf_id);
 
 /*
  * ep_pcie_get_msi_config - get MSI config info.
@@ -236,7 +241,7 @@ int ep_pcie_config_outbound_iatu(struct ep_pcie_hw *phandle,
  * Return: 0 on success, negative value on error
  */
 int ep_pcie_get_msi_config(struct ep_pcie_hw *phandle,
-				struct ep_pcie_msi_config *cfg);
+				struct ep_pcie_msi_config *cfg, u32 vf_id);
 
 /*
  * ep_pcie_trigger_msi - trigger an MSI.
@@ -248,7 +253,7 @@ int ep_pcie_get_msi_config(struct ep_pcie_hw *phandle,
  *
  * Return: 0 on success, negative value on error
  */
-int ep_pcie_trigger_msi(struct ep_pcie_hw *phandle, u32 idx);
+int ep_pcie_trigger_msi(struct ep_pcie_hw *phandle, u32 idx, u32 vf_id);
 
 /*
  * ep_pcie_wakeup_host - wake up the host.
@@ -296,7 +301,8 @@ int ep_pcie_disable_endpoint(struct ep_pcie_hw *phandle);
  */
 int ep_pcie_config_db_routing(struct ep_pcie_hw *phandle,
 				struct ep_pcie_db_config chdb_cfg,
-				struct ep_pcie_db_config erdb_cfg);
+				struct ep_pcie_db_config erdb_cfg,
+				u32 vf_id);
 
 /*
  * ep_pcie_mask_irq_event - enable and disable IRQ event.
@@ -330,6 +336,24 @@ int ep_pcie_configure_inactivity_timer(struct ep_pcie_hw *phandle,
  * Return: 0 on success, negative value on error
  */
 int ep_pcie_core_l1ss_sleep_config_enable(void);
+
+/*
+ * ep_pcie_core_l1ss_sleep_config_disable - Disable L1ss sleep configuration
+ *		to ungate the CLKREQ#.
+ *
+ * Return: 0 on success, negative value on error
+ */
+int ep_pcie_core_l1ss_sleep_config_disable(void);
+
+/*
+ * ep_pcie_core_get_capability - Exposes EP PCIE capability.
+ * @phandle:    PCIe endpoint HW driver handle
+ * @ep_cap:	Structure member to have capabilities
+ *
+ * Return: 0 on success, negative value on error
+ */
+int ep_pcie_core_get_capability(struct ep_pcie_hw *phandle,
+		struct ep_pcie_cap *ep_cap);
 
 #if IS_ENABLED(CONFIG_QCOM_PCI_EDMA)
 int qcom_edma_init(struct device *dev);

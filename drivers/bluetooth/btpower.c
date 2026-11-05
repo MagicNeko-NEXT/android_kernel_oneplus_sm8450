@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 /*
@@ -16,28 +17,20 @@
 #include <linux/rfkill.h>
 #include <linux/gpio.h>
 #include <linux/of_gpio.h>
+#include <linux/of.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/regulator/consumer.h>
 #include <linux/clk.h>
 #include <linux/uaccess.h>
-#include <linux/btpower.h>
 #include <linux/of_device.h>
-#include <linux/thermal.h>
 #include <soc/qcom/cmd-db.h>
-#ifdef CONFIG_ARCH_NEO
-#if IS_ENABLED(CONFIG_ICNSS2)
-#include <soc/qcom/icnss2.h>
-#endif
-#endif
-
-#if defined CONFIG_BT_SLIM_QCA6390 || \
-	defined CONFIG_BT_SLIM_QCA6490 || \
-	defined CONFIG_BTFM_SLIM_WCN3990  || \
-	defined CONFIG_BTFM_SLIM_WCN7850
+#include "btpower.h"
+#if (defined CONFIG_BT_SLIM)
 #include "btfm_slim.h"
 #endif
 #include <linux/fs.h>
+//#include <linux/cnss_utils.h>
 
 #define PWR_SRC_NOT_AVAILABLE -2
 #define DEFAULT_INVALID_VALUE -1
@@ -45,10 +38,6 @@
 #define BTPOWER_MBOX_MSG_MAX_LEN 64
 #define BTPOWER_MBOX_TIMEOUT_MS 1000
 #define XO_CLK_RETRY_COUNT_MAX 5
-#define BT_EN_MAX_DELAY 500
-#define BT_EN_DEFAULT_DELAY 100
-#define TEMP_THRESHOLD 5000
-
 /**
  * enum btpower_vreg_param: Voltage regulator TCS param
  * @BTPOWER_VREG_VOLTAGE: Provides voltage level to be configured in TCS
@@ -88,6 +77,7 @@ enum power_src_pos {
 	BT_VDD_LDO,
 	BT_VDD_RFA_0p8,
 	BT_VDD_RFACMN,
+	BT_VDD_ANT_LDO,
 	// these indexes GPIOs/regs value are fetched during crash.
 	BT_RESET_GPIO_CURRENT,
 	BT_SW_CTRL_GPIO_CURRENT,
@@ -105,6 +95,7 @@ enum power_src_pos {
 	BT_VDD_RFACMN_CURRENT,
 	BT_VDD_IPA_2p2,
 	BT_VDD_IPA_2p2_CURRENT,
+	BT_VDD_ANT_LDO_CURRENT,
 	/* The below bucks are voted for HW WAR on some platform which supports
 	 * WNC39xx.
 	 */
@@ -114,59 +105,6 @@ enum power_src_pos {
 	 * Its hold the max size of power sources states.
 	 */
 	BT_POWER_SRC_SIZE,
-};
-
-// Regulator structure for QCA6174/QCA9377/QCA9379 BT SoC series
-static struct bt_power_vreg_data bt_vregs_info_qca61x4_937x[] = {
-	{NULL, "qcom,bt-vdd-aon", 928000, 928000, 0, false, false,
-		{BT_VDD_AON_LDO, BT_VDD_AON_LDO_CURRENT}},
-	{NULL, "qcom,bt-vdd-io", 1710000, 3460000, 0, false, false,
-		{BT_VDD_IO_LDO, BT_VDD_IO_LDO_CURRENT}},
-	{NULL, "qcom,bt-vdd-core", 3135000, 3465000, 0, false, false,
-		{BT_VDD_CORE_LDO, BT_VDD_CORE_LDO_CURRENT}},
-};
-
-// Regulator structure for QCA6390,QCA6490 and WCN6750 BT SoC series
-static struct bt_power_vreg_data bt_vregs_info_qca6xx0[] = {
-	{NULL, "qcom,bt-vdd-io",      1800000, 1800000, 0, false, true,
-		{BT_VDD_IO_LDO, BT_VDD_IO_LDO_CURRENT}},
-	{NULL, "qcom,bt-vdd-aon",     966000,  966000,  0, false, true,
-		{BT_VDD_AON_LDO, BT_VDD_AON_LDO_CURRENT}},
-	{NULL, "qcom,bt-vdd-rfacmn",  950000,  950000,  0, false, true,
-		{BT_VDD_RFACMN, BT_VDD_RFACMN_CURRENT}},
-	/* BT_CX_MX */
-	{NULL, "qcom,bt-vdd-dig",      966000,  966000,  0, false, true,
-		{BT_VDD_DIG_LDO, BT_VDD_DIG_LDO_CURRENT}},
-	{NULL, "qcom,bt-vdd-rfa-0p8",  950000,  952000,  0, false, true,
-		{BT_VDD_RFA_0p8, BT_VDD_RFA_0p8_CURRENT}},
-	{NULL, "qcom,bt-vdd-rfa1",     1900000, 1900000, 0, false, true,
-		{BT_VDD_RFA1_LDO, BT_VDD_RFA1_LDO_CURRENT}},
-	{NULL, "qcom,bt-vdd-rfa2",     1900000, 1900000, 0, false, true,
-		{BT_VDD_RFA2_LDO, BT_VDD_RFA2_LDO_CURRENT}},
-	{NULL, "qcom,bt-vdd-asd",      2800000, 2800000, 0, false, true,
-		{BT_VDD_ASD_LDO, BT_VDD_ASD_LDO_CURRENT}},
-	{NULL, "qcom,bt-vdd-ipa-2p2",  2200000, 2210000, 0, false, true,
-		{BT_VDD_IPA_2p2, BT_VDD_IPA_2p2_CURRENT}},
-};
-
-
-// Regulator structure for WCN7850 BT SoC series
-static struct bt_power_vreg_data bt_vregs_info_kiwi[] = {
-	{NULL, "qcom,bt-vdd-io",      1800000, 1800000, 0, false, true,
-		{BT_VDD_IO_LDO, BT_VDD_IO_LDO_CURRENT}},
-	{NULL, "qcom,bt-vdd-aon",     950000,  950000,  0, false, true,
-		{BT_VDD_AON_LDO, BT_VDD_AON_LDO_CURRENT}},
-	{NULL, "qcom,bt-vdd-rfacmn",  950000,  950000,  0, false, true,
-		{BT_VDD_RFACMN, BT_VDD_RFACMN_CURRENT}},
-	/* BT_CX_MX */
-	{NULL, "qcom,bt-vdd-dig",      950000,  950000,  0, false, true,
-		{BT_VDD_DIG_LDO, BT_VDD_DIG_LDO_CURRENT}},
-	{NULL, "qcom,bt-vdd-rfa-0p8",  950000,  952000,  0, false, true,
-		{BT_VDD_RFA_0p8, BT_VDD_RFA_0p8_CURRENT}},
-	{NULL, "qcom,bt-vdd-rfa1",     1900000, 1900000, 0, false, true,
-		{BT_VDD_RFA1_LDO, BT_VDD_RFA1_LDO_CURRENT}},
-	{NULL, "qcom,bt-vdd-rfa2",     1350000, 1350000, 0, false, true,
-		{BT_VDD_RFA2_LDO, BT_VDD_RFA2_LDO_CURRENT}},
 };
 
 // Regulator structure for WCN399x BT SoC series
@@ -187,45 +125,8 @@ static struct bt_power bt_vreg_info_wcn399x = {
 	.num_vregs = 5,
 };
 
-
-static struct bt_power bt_vreg_info_qca6174 = {
-	.compatible = "qcom,qca6174",
-	.vregs = bt_vregs_info_qca61x4_937x,
-	.num_vregs = ARRAY_SIZE(bt_vregs_info_qca61x4_937x),
-};
-
-static struct bt_power bt_vreg_info_qca6390 = {
-	.compatible = "qcom,qca6390",
-	.vregs = bt_vregs_info_qca6xx0,
-	.num_vregs = ARRAY_SIZE(bt_vregs_info_qca6xx0),
-};
-
-static struct bt_power bt_vreg_info_qca6490 = {
-	.compatible = "qcom,qca6490",
-	.vregs = bt_vregs_info_qca6xx0,
-	.num_vregs = ARRAY_SIZE(bt_vregs_info_qca6xx0),
-};
-
-static struct bt_power bt_vreg_info_kiwi = {
-	.compatible = "qcom,kiwi",
-	.vregs = bt_vregs_info_kiwi,
-	.num_vregs = ARRAY_SIZE(bt_vregs_info_kiwi),
-};
-
-
-static struct bt_power bt_vreg_info_wcn6750 = {
-	.compatible = "qcom,wcn6750-bt",
-	.vregs = bt_vregs_info_qca6xx0,
-	.num_vregs = ARRAY_SIZE(bt_vregs_info_qca6xx0),
-};
-
 static const struct of_device_id bt_power_match_table[] = {
-	{	.compatible = "qcom,qca6174", .data = &bt_vreg_info_qca6174},
 	{	.compatible = "qcom,wcn3990", .data = &bt_vreg_info_wcn399x},
-	{	.compatible = "qcom,qca6390", .data = &bt_vreg_info_qca6390},
-	{	.compatible = "qcom,qca6490", .data = &bt_vreg_info_qca6490},
-	{	.compatible = "qcom,kiwi",    .data = &bt_vreg_info_kiwi},
-	{	.compatible = "qcom,wcn6750-bt", .data = &bt_vreg_info_wcn6750},
 	{},
 };
 
@@ -240,30 +141,6 @@ static struct class *bt_class;
 static int bt_major;
 static int soc_id;
 static bool probe_finished;
-
-static int btpower_get_temperature(struct btpower_platform_data *pdata,
-				   int *temp)
-{
-	struct thermal_zone_device *thermal_dev;
-	int ret;
-
-	/* Temperature sensor is not provided in dts */
-	if (!pdata->tsens)
-		return -ENODEV;
-
-	thermal_dev = thermal_zone_get_zone_by_name(pdata->tsens);
-	if (IS_ERR(thermal_dev)) {
-		pr_err("Fail to get thermal zone. ret: %d\n",
-			PTR_ERR(thermal_dev));
-		return PTR_ERR(thermal_dev);
-	}
-
-	ret = thermal_zone_get_temp(thermal_dev, temp);
-	if (ret)
-		pr_err("Fail to get temperature. ret: %d\n", ret);
-
-	return ret;
-}
 
 #ifdef CONFIG_MSM_BT_OOBS
 static void btpower_uart_transport_locked(struct btpower_platform_data *drvdata,
@@ -562,7 +439,6 @@ static int bt_configure_gpios(int on)
 		}
 		bt_power_src_status[BT_RESET_GPIO] =
 			gpio_get_value(bt_reset_gpio);
-
 		msleep(50);
 		pr_info("BTON:Turn Bt OFF post asserting BT_EN to low\n");
 		pr_info("bt-reset-gpio(%d) value(%d)\n", bt_reset_gpio,
@@ -594,8 +470,6 @@ static int bt_configure_gpios(int on)
 			btpower_set_xo_clk_gpio_state(false);
 		}
 		if ((wl_reset_gpio >= 0) && (gpio_get_value(wl_reset_gpio) == 0)) {
-			int temp;
-			int bt_en_delay = BT_EN_DEFAULT_DELAY;
 			if (gpio_get_value(bt_reset_gpio)) {
 				pr_info("BTON: WLAN OFF and BT ON are too close\n");
 				pr_info("reset BT_EN, enable it after delay\n");
@@ -608,16 +482,9 @@ static int bt_configure_gpios(int on)
 				bt_power_src_status[BT_RESET_GPIO] =
 					gpio_get_value(bt_reset_gpio);
 			}
-			/* BT_EN delay will decided based on the current temperature */
-			if (!btpower_get_temperature(bt_power_pdata, &temp)) {
-				if (temp < TEMP_THRESHOLD)
-					bt_en_delay = BT_EN_MAX_DELAY;
-				pr_info("%s: current temperature:%d and bt_en delay %d\n",
-				__func__, temp, bt_en_delay);
-			}
-			pr_info("BTON: WLAN OFF waiting for %d ms delay\n", bt_en_delay);
+			pr_info("BTON: WLAN OFF waiting for 100ms delay\n");
 			pr_info("for AON output to fully discharge\n");
-			msleep(bt_en_delay);
+			msleep(100);
 			pr_info("BTON: WLAN OFF Asserting BT_EN to high\n");
 			btpower_set_xo_clk_gpio_state(true);
 			rc = gpio_direction_output(bt_reset_gpio, 1);
@@ -706,15 +573,9 @@ static int bluetooth_power(int on)
 {
 	int rc = 0;
 
-	pr_err("%s: on: %d\n", __func__, on);
+	pr_debug("%s: on: %d\n", __func__, on);
 
 	if (on == 1) {
-#ifdef CONFIG_ARCH_NEO
-#if IS_ENABLED(CONFIG_ICNSS2)
-		icnss_power_trigger_pinctrl(NULL, ICNSS_PINCTRL_OWNER_BT,
-					    ICNSS_PINCTRL_SEQ_ON);
-#endif
-#endif
 		rc = bt_power_vreg_set(BT_POWER_ENABLE);
 		if (rc < 0) {
 			pr_err("%s: bt_power regulators config failed\n",
@@ -757,12 +618,6 @@ gpio_fail:
 			bt_clk_disable(bt_power_pdata->bt_chip_clk);
 clk_fail:
 regulator_fail:
-#ifdef CONFIG_ARCH_NEO
-#if IS_ENABLED(CONFIG_ICNSS2)
-		icnss_power_trigger_pinctrl(NULL, ICNSS_PINCTRL_OWNER_BT,
-					    ICNSS_PINCTRL_SEQ_OFF);
-#endif
-#endif
 		bt_power_vreg_set(BT_POWER_DISABLE);
 	} else if (on == 2) {
 		/* Retention mode */
@@ -840,8 +695,6 @@ static void btpower_rfkill_remove(struct platform_device *pdev)
 {
 	struct rfkill *rfkill;
 
-	pr_debug("%s\n", __func__);
-
 	rfkill = platform_get_drvdata(pdev);
 	if (rfkill)
 		rfkill_unregister(rfkill);
@@ -903,8 +756,6 @@ static int bt_dt_parse_clk_info(struct device *dev,
 	int ret = -EINVAL;
 	struct bt_power_clk_data *clk = NULL;
 	struct device_node *np = dev->of_node;
-
-	pr_debug("%s\n", __func__);
 
 	*clk_data = NULL;
 	if (of_parse_phandle(np, "clocks", 0)) {
@@ -1025,16 +876,31 @@ static void bt_power_vreg_put(void)
 	}
 }
 
-
 static int bt_power_populate_dt_pinfo(struct platform_device *pdev)
 {
 	int rc;
-
-	pr_debug("%s\n", __func__);
+	struct device_node *child;
 
 	if (!bt_power_pdata)
 		return -ENOMEM;
 
+	if (bt_power_pdata->is_converged_dt) {
+		for_each_available_child_of_node(pdev->dev.of_node, child) {
+/*
+ *			if (bt_power_pdata->bt_device_type == CNSS_HSP_DEVICE_TYPE) {
+ *				if (strcmp(child->name, "bt_qca6490"))
+ *					continue;
+ *				pr_info("%s: bt_qca6490 device node found", __func__);
+ *			} else if (bt_power_pdata->bt_device_type == CNSS_HMT_DEVICE_TYPE) {
+ *				if (strcmp(child->name, "bt_kiwi"))
+ *					continue;
+ *				pr_info("%s: bt_kiwi device node found", __func__);
+ *			}
+ */
+			pdev->dev.of_node = child;
+			break;
+		}
+	}
 	if (pdev->dev.of_node) {
 		rc = bt_power_vreg_get(pdev);
 		if (rc)
@@ -1093,15 +959,6 @@ static int bt_power_populate_dt_pinfo(struct platform_device *pdev)
 			pr_warn("%s: bthostwake_gpio not provided in device tree\n",
 				__func__);
 #endif
-		rc = of_property_read_string(pdev->dev.of_node,
-					      "tsens",
-					      &bt_power_pdata->tsens);
-		if (rc)
-			pr_warn("%s: temperature sensor is not provided in dts\n",
-				__func__);
-		else
-			pr_info("%s: temperature sensor is provided in dts\n",
-				__func__);
 	}
 
 	bt_power_pdata->bt_power_setup = bluetooth_power;
@@ -1109,12 +966,37 @@ static int bt_power_populate_dt_pinfo(struct platform_device *pdev)
 	return 0;
 }
 
+static inline bool bt_is_converged_dt(struct platform_device *plat_dev)
+{
+	return of_property_read_bool(plat_dev->dev.of_node, "qcom,converged-dt");
+}
+
+static void bt_power_pdc_init_params(struct btpower_platform_data *pdata)
+{
+	int ret;
+	struct device *dev = &pdata->pdev->dev;
+
+	pdata->pdc_init_table_len = of_property_count_strings(dev->of_node,
+				"qcom,pdc_init_table");
+	if (pdata->pdc_init_table_len > 0) {
+		pdata->pdc_init_table = kcalloc(pdata->pdc_init_table_len,
+				sizeof(char *), GFP_KERNEL);
+		ret = of_property_read_string_array(dev->of_node, "qcom,pdc_init_table",
+			pdata->pdc_init_table, pdata->pdc_init_table_len);
+		if (ret < 0)
+			pr_err("Failed to get PDC Init Table\n");
+		else
+			pr_info("PDC Init table configured\n");
+	} else {
+		pr_debug("PDC Init Table not configured\n");
+	}
+}
+
 static int bt_power_probe(struct platform_device *pdev)
 {
 	int ret = 0;
+	unsigned int gpio_value;
 	int itr;
-
-	pr_debug("%s\n", __func__);
 
 	/* Fill whole array with -2 i.e NOT_AVAILABLE state by default
 	 * for any GPIO or Reg handle.
@@ -1129,6 +1011,29 @@ static int bt_power_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	bt_power_pdata->pdev = pdev;
+	bt_power_pdata->is_converged_dt = bt_is_converged_dt(pdev);
+	if (bt_power_pdata->is_converged_dt) {
+		if (of_find_property(pdev->dev.of_node, WLAN_SW_CTRL_GPIO, NULL)) {
+			bt_power_pdata->wlan_sw_ctrl_gpio =
+				of_get_named_gpio(pdev->dev.of_node, WLAN_SW_CTRL_GPIO, 0);
+			pr_debug("WLAN Switch control GPIO: %d\n",
+					bt_power_pdata->wlan_sw_ctrl_gpio);
+		} else {
+			bt_power_pdata->wlan_sw_ctrl_gpio = -EINVAL;
+		}
+		gpio_value = gpio_get_value(bt_power_pdata->wlan_sw_ctrl_gpio);
+		pr_info("%s:WLAN_SW_CNTRL_GPIO value= %d\n", __func__, gpio_value);
+/*
+ *		if (gpio_value) {
+ *			//bt_power_pdata->bt_device_type =
+ *				//cnss_utils_update_device_type(CNSS_HSP_DEVICE_TYPE);
+ *		} else {
+ *			//bt_power_pdata->bt_device_type =
+ *				//cnss_utils_update_device_type(CNSS_HMT_DEVICE_TYPE);
+ *		}
+ */
+	}
+
 	if (pdev->dev.of_node) {
 		ret = bt_power_populate_dt_pinfo(pdev);
 		if (ret < 0) {
@@ -1152,10 +1057,9 @@ static int bt_power_probe(struct platform_device *pdev)
 		pr_err("%s: Failed to get platform data\n", __func__);
 		goto free_pdata;
 	}
-
 	if (btpower_rfkill_probe(pdev) < 0)
 		goto free_pdata;
-
+	bt_power_pdc_init_params(bt_power_pdata);
 	btpower_aop_mbox_init(bt_power_pdata);
 
 	probe_finished = true;
@@ -1168,8 +1072,6 @@ free_pdata:
 
 static int bt_power_remove(struct platform_device *pdev)
 {
-	dev_dbg(&pdev->dev, "%s\n", __func__);
-
 	probe_finished = false;
 	btpower_rfkill_remove(pdev);
 	bt_power_vreg_put();
@@ -1181,7 +1083,6 @@ static int bt_power_remove(struct platform_device *pdev)
 
 int btpower_register_slimdev(struct device *dev)
 {
-	pr_debug("%s\n", __func__);
 	if (!bt_power_pdata || (dev == NULL)) {
 		pr_err("%s: Failed to allocate memory\n", __func__);
 		return -EINVAL;
@@ -1189,14 +1090,13 @@ int btpower_register_slimdev(struct device *dev)
 	bt_power_pdata->slim_dev = dev;
 	return 0;
 }
-EXPORT_SYMBOL(btpower_register_slimdev);
+EXPORT_SYMBOL_GPL(btpower_register_slimdev);
 
 int btpower_get_chipset_version(void)
 {
-	pr_debug("%s\n", __func__);
 	return soc_id;
 }
-EXPORT_SYMBOL(btpower_get_chipset_version);
+EXPORT_SYMBOL_GPL(btpower_get_chipset_version);
 
 static void  set_pwr_srcs_status(struct bt_power_vreg_data *handle)
 {
@@ -1294,10 +1194,7 @@ static long bt_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		break;
 #endif
 	case BT_CMD_SLIM_TEST:
-#if (defined CONFIG_BT_SLIM_QCA6390 || \
-	defined CONFIG_BT_SLIM_QCA6490 || \
-	defined CONFIG_BTFM_SLIM_WCN3990 || \
-	defined CONFIG_BTFM_SLIM_WCN7850)
+#if (defined CONFIG_BT_SLIM)
 		if (!bt_power_pdata->slim_dev) {
 			pr_err("%s: slim_dev is null\n", __func__);
 			return -EINVAL;
@@ -1426,7 +1323,7 @@ static int __init btpower_init(void)
 		goto chrdev_err;
 	}
 
-	bt_class = class_create(THIS_MODULE, "bt-dev");
+	bt_class = class_create("bt-dev");
 	if (IS_ERR(bt_class)) {
 		pr_err("%s: coudn't create class\n", __func__);
 		ret = -1;
@@ -1451,11 +1348,56 @@ driver_err:
 	return ret;
 }
 
+/**
+ * bt_aop_send_msg: Sends json message to AOP using QMP
+ * @plat_priv: Pointer to cnss platform data
+ * @msg: String in json format
+ *
+ * AOP accepts JSON message to configure WLAN/BT resources. Format as follows:
+ * To send VReg config: {class: wlan_pdc, ss: <pdc_name>,
+ *                       res: <VReg_name>.<param>, <seq_param>: <value>}
+ * To send PDC Config: {class: wlan_pdc, ss: <pdc_name>, res: pdc,
+ *                      enable: <Value>}
+ * QMP returns timeout error if format not correct or AOP operation fails.
+ *
+ * Return: 0 for success
+ */
+int bt_aop_send_msg(struct btpower_platform_data *plat_priv, char *mbox_msg)
+{
+	struct qmp_pkt pkt;
+	int ret = 0;
+
+	pkt.size = BTPOWER_MBOX_MSG_MAX_LEN;
+	pkt.data = mbox_msg;
+	ret = mbox_send_message(plat_priv->mbox_chan, &pkt);
+	if (ret < 0)
+		pr_err("Failed to send AOP mbox msg: %s\n", mbox_msg);
+	else
+		ret = 0;
+	return ret;
+}
+
+int bt_aop_pdc_reconfig(struct btpower_platform_data *pdata)
+{
+	unsigned int i;
+	int ret = 0;
+
+	if (pdata->pdc_init_table_len <= 0 || !pdata->pdc_init_table)
+		return 0;
+
+	pr_debug("Setting PDC defaults\n");
+	for (i = 0; i < pdata->pdc_init_table_len; i++) {
+		ret = bt_aop_send_msg(pdata, (char *)pdata->pdc_init_table[i]);
+		if (ret < 0)
+			break;
+	}
+	return ret;
+}
+
 int btpower_aop_mbox_init(struct btpower_platform_data *pdata)
 {
 	struct mbox_client *mbox = &pdata->mbox_client_data;
 	struct mbox_chan *chan;
-	struct bt_power_vreg_data *vreg_ipa_info;
 	int ret = 0;
 
 	mbox->dev = &pdata->pdev->dev;
@@ -1476,34 +1418,13 @@ int btpower_aop_mbox_init(struct btpower_platform_data *pdata)
 				      &pdata->vreg_ipa);
 	if (ret)
 		pr_info("%s: vreg for iPA not configured\n", __func__);
-	else {
+	else
 		pr_info("%s: Mbox channel initialized\n", __func__);
-		vreg_ipa_info = devm_kzalloc(&pdata->pdev->dev,
-					sizeof(*vreg_ipa_info),
-					GFP_KERNEL);
-		if (!vreg_ipa_info)
-			return -ENOMEM;
 
-		vreg_ipa_info->name = devm_kzalloc(&pdata->pdev->dev,
-						20,
-						GFP_KERNEL);
-		if (!vreg_ipa_info->name)
-			return -ENOMEM;
+	ret = bt_aop_pdc_reconfig(pdata);
+	if (ret)
+		pr_err("Failed to reconfig BT WLAN PDC, err = %d\n", ret);
 
-		strlcpy((char *)vreg_ipa_info->name, "qcom,vreg_ipa", MAX_PROP_SIZE);
-		vreg_ipa_info->min_vol = 0;
-		vreg_ipa_info->max_vol = 0;
-		vreg_ipa_info->load_curr = 0;
-		ret = bt_dt_parse_vreg_info(&pdata->pdev->dev, vreg_ipa_info);
-		if (!ret && vreg_ipa_info->reg) {
-			pr_info("%s: obtained IPA reg handler\n", __func__);
-			pdata->vreg_ipa_info = vreg_ipa_info;
-		} else {
-			pr_warn("%s: failed to obtain IPA reg handler\n",
-				__func__);
-		}
-		return ret;
-	}
 	return 0;
 }
 
@@ -1516,7 +1437,6 @@ static int btpower_aop_set_vreg_param(struct btpower_platform_data *pdata,
 	char mbox_msg[BTPOWER_MBOX_MSG_MAX_LEN];
 	static const char * const vreg_param_str[] = {"v", "m", "e"};
 	static const char *const tcs_seq_str[] = {"upval", "dwnval", "enable"};
-	struct bt_power_vreg_data *vreg_ipa_info = pdata->vreg_ipa_info;
 	int ret = 0;
 
 	if (param > BTPOWER_VREG_ENABLE || seq > BTPOWER_TCS_ALL_SEQ || !vreg_name)
@@ -1535,16 +1455,6 @@ static int btpower_aop_set_vreg_param(struct btpower_platform_data *pdata,
 		pr_err("%s:Failed to send AOP mbox msg(%s), err(%d)\n",
 					__func__, mbox_msg, ret);
 
-	if (!vreg_ipa_info) {
-		pr_warn("%s: IPA regulator entry is missing in dts\n", __func__);
-		return -EINVAL;
-	}
-
-	if (vreg_ipa_info->reg) {
-		ret = bt_vreg_enable(vreg_ipa_info);
-		if (ret < 0)
-			pr_err("%s: Failed to enable IPA vreg\n", __func__);
-	}
 	return ret;
 }
 
@@ -1579,14 +1489,8 @@ static void __exit btpower_exit(void)
 	platform_driver_unregister(&bt_power_driver);
 }
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("MSM Bluetooth power control driver");
-
-#ifdef CONFIG_ARCH_NEO
-#if IS_ENABLED(CONFIG_ICNSS2)
-MODULE_SOFTDEP("pre: icnss2");
-#endif
-#endif
 
 module_init(btpower_init);
 module_exit(btpower_exit);

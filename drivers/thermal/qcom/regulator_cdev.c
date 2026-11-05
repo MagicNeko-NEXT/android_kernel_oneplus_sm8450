@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2017-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/module.h>
@@ -131,7 +132,7 @@ static int reg_cdev_probe(struct platform_device *pdev)
 	reg_dev->lvl_ct--;
 	reg_dev->cur_state = 0;
 	reg_dev->reg_enable = false;
-	strlcpy(reg_dev->reg_name, np->name, THERMAL_NAME_LENGTH);
+	strscpy(reg_dev->reg_name, np->name, THERMAL_NAME_LENGTH);
 
 	reg_dev->cool_dev = thermal_of_cooling_device_register(
 					np, reg_dev->reg_name, reg_dev,
@@ -158,5 +159,5 @@ static struct platform_driver reg_cdev_driver = {
 	},
 	.probe = reg_cdev_probe,
 };
-builtin_platform_driver(reg_cdev_driver);
-MODULE_LICENSE("GPL v2");
+module_platform_driver(reg_cdev_driver);
+MODULE_LICENSE("GPL");

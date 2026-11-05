@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2021-2023, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #include <linux/module.h>
 #include <linux/thermal.h>
@@ -106,7 +107,7 @@ static int ddr_cdev_probe(struct platform_device *pdev)
 {
 	int ret = 0, opp_ct = 0, bus_width = 1, idx = 0;
 	struct ddr_cdev *ddr_cdev = NULL;
-	struct device_node *np = pdev->dev.of_node, *freq_np = NULL;
+	struct device_node *np = pdev->dev.of_node;
 	struct device *dev = &pdev->dev;
 	uint32_t *freq_table = NULL;
 	char cdev_name[THERMAL_NAME_LENGTH] = DDR_CDEV_NAME;
@@ -122,14 +123,8 @@ static int ddr_cdev_probe(struct platform_device *pdev)
 					ret);
 		return ret;
 	}
-	freq_np = of_parse_phandle(np, "qcom,freq-table", 0);
-	if (!freq_np) {
-		dev_err(dev, "No DDR frequency\n");
-		ret = -ENODEV;
-		goto err_exit;
-	}
 
-	if (!of_find_property(freq_np, "qcom,freq-tbl", &opp_ct)) {
+	if (!of_find_property(np, "qcom,freq-table", &opp_ct)) {
 		dev_err(dev, "No DDR frequency entries\n");
 		ret = -ENODEV;
 		goto err_exit;
@@ -152,8 +147,8 @@ static int ddr_cdev_probe(struct platform_device *pdev)
 	}
 	freq_table[0] = 0;
 
-	ret = of_property_read_u32_array(freq_np, "qcom,freq-tbl",
-			&freq_table[1], opp_ct-1);
+	ret = of_property_read_u32_array(np, "qcom,freq-table",
+			&freq_table[1], opp_ct - 1);
 	if (ret < 0) {
 		dev_err(dev, "DDR frequency read error:%d\n", ret);
 		goto err_exit;
@@ -181,7 +176,8 @@ static int ddr_cdev_probe(struct platform_device *pdev)
 		goto err_exit;
 	}
 
-	ddr_cdev->cdev = thermal_of_cooling_device_register(np, cdev_name,
+	ddr_cdev->cdev = devm_thermal_of_cooling_device_register(
+					dev, np, cdev_name,
 					ddr_cdev, &ddr_cdev_ops);
 	if (IS_ERR(ddr_cdev->cdev)) {
 		ret = PTR_ERR(ddr_cdev->cdev);
@@ -191,12 +187,9 @@ static int ddr_cdev_probe(struct platform_device *pdev)
 	}
 	dev_dbg(dev, "Cooling device [%s] registered.\n", cdev_name);
 	dev_set_drvdata(dev, ddr_cdev);
-	of_node_put(freq_np);
 
 	return 0;
 err_exit:
-	if (freq_np)
-		of_node_put(freq_np);
 	icc_put(ddr_cdev->icc_path);
 
 	return ret;
@@ -207,10 +200,6 @@ static int ddr_cdev_remove(struct platform_device *pdev)
 	struct ddr_cdev *ddr_cdev =
 		(struct ddr_cdev *)dev_get_drvdata(&pdev->dev);
 
-	if (ddr_cdev->cdev) {
-		thermal_cooling_device_unregister(ddr_cdev->cdev);
-		ddr_cdev->cdev = NULL;
-	}
 	if (ddr_cdev->icc_path) {
 		icc_set_bw(ddr_cdev->icc_path, 0, ddr_cdev->freq_table[0]);
 		icc_put(ddr_cdev->icc_path);
@@ -234,4 +223,4 @@ static struct platform_driver ddr_cdev_driver = {
 	},
 };
 module_platform_driver(ddr_cdev_driver);
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

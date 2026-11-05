@@ -3,6 +3,7 @@
  * Copyright (c) 2011, 2013-2021, The Linux Foundation. All rights reserved.
  * Linux Foundation chooses to take subject only to the GPLv2 license terms,
  * and distributes only under these terms.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * This code also borrows from drivers/usb/gadget/u_serial.c, which is
  * Copyright (C) 2000 - 2003 Al Borchers (alborchers@steinerpoint.com)
@@ -157,7 +158,7 @@ static void usb_cser_read_complete(struct usb_ep *ep, struct usb_request *req);
 static int usb_cser_connect(struct f_cdev *port);
 static void usb_cser_disconnect(struct f_cdev *port);
 static struct f_cdev *f_cdev_alloc(char *func_name, int portno);
-static void usb_cser_free_req(struct usb_ep *ep, struct usb_request **req);
+static void usb_cser_free_req(struct usb_ep *ep, struct usb_request *req);
 static void usb_cser_debugfs_exit(struct f_cdev *port);
 
 static struct usb_interface_descriptor cser_interface_desc = {
@@ -715,12 +716,12 @@ static int dun_cser_send_ctrl_bits(struct cserial *cser, int ctrl_bits)
 	return port_notify_serial_state(cser);
 }
 
-static void usb_cser_free_req(struct usb_ep *ep, struct usb_request **req)
+static void usb_cser_free_req(struct usb_ep *ep, struct usb_request *req)
 {
-	if (*req) {
-		kfree((*req)->buf);
-		usb_ep_free_request(ep, *req);
-		*req = NULL;
+	if (req) {
+		kfree(req->buf);
+		usb_ep_free_request(ep, req);
+		req = NULL;
 	}
 }
 
@@ -731,7 +732,7 @@ static void usb_cser_free_requests(struct usb_ep *ep, struct list_head *head)
 	while (!list_empty(head)) {
 		req = list_entry(head->next, struct usb_request, list);
 		list_del_init(&req->list);
-		usb_cser_free_req(ep, &req);
+		usb_cser_free_req(ep, req);
 	}
 }
 
@@ -771,7 +772,6 @@ static int usb_cser_bind(struct usb_configuration *c, struct usb_function *f)
 		if (status < 0)
 			return status;
 		cser_string_defs[0].id = status;
-		cser_interface_desc.iInterface = status;
 	}
 
 	status = usb_interface_id(c, f);
@@ -838,7 +838,7 @@ static int usb_cser_bind(struct usb_configuration *c, struct usb_function *f)
 fail:
 	if (port->port_usb.notify_req)
 		usb_cser_free_req(port->port_usb.notify,
-				&port->port_usb.notify_req);
+				port->port_usb.notify_req);
 
 	if (port->port_usb.notify)
 		port->port_usb.notify->driver_data = NULL;
@@ -882,8 +882,7 @@ static void usb_cser_unbind(struct usb_configuration *c, struct usb_function *f)
 	cser_string_defs[0].id = 0;
 
 	usb_free_all_descriptors(f);
-	/* notify_req is passed by reference to mark it as NULL while freeing */
-	usb_cser_free_req(port->port_usb.notify, &port->port_usb.notify_req);
+	usb_cser_free_req(port->port_usb.notify, port->port_usb.notify_req);
 }
 
 static int usb_cser_alloc_requests(struct usb_ep *ep, struct list_head *head,
@@ -1020,7 +1019,7 @@ static void usb_cser_write_complete(struct usb_ep *ep, struct usb_request *req)
 	switch (req->status) {
 	default:
 		pr_debug("unexpected %s status %d\n", ep->name, req->status);
-		/* FALL THROUGH */
+		fallthrough;
 	case 0:
 		/* normal completion */
 		break;
@@ -1326,7 +1325,7 @@ err_exit:
 		if (port->is_connected)
 			list_add(&req->list, &port->write_pool);
 		else
-			usb_cser_free_req(in, &req);
+			usb_cser_free_req(in, req);
 		spin_unlock_irqrestore(&port->port_lock, flags);
 		return ret;
 	}
@@ -1616,8 +1615,11 @@ static ssize_t cser_rw_write(struct file *file, const char __user *ubuf,
 		gadget = cser->func.config->cdev->gadget;
 		if (gadget->speed >= USB_SPEED_SUPER &&
 			port->func_is_suspended) {
+			ret = -EPERM;
+#ifdef CONFIG_USB_FUNC_WAKEUP_SUPPORTED
 			pr_debug("Calling usb_func_wakeup\n");
 			ret = usb_func_wakeup(func);
+#endif
 		} else {
 			pr_debug("Calling usb_gadget_wakeup\n");
 			ret = usb_gadget_wakeup(gadget);
@@ -1797,7 +1799,7 @@ static int usb_cser_alloc_chardev_region(void)
 	major = MAJOR(dev);
 	minors = NUM_INSTANCE;
 
-	fcdev_classp = class_create(THIS_MODULE, MODULE_NAME);
+	fcdev_classp = class_create(MODULE_NAME);
 	if (IS_ERR(fcdev_classp)) {
 		pr_err("class_create() failed ENOMEM\n");
 		ret = -ENOMEM;
@@ -2023,4 +2025,4 @@ static struct usb_function *cser_alloc(struct usb_function_instance *fi)
 
 DECLARE_USB_FUNCTION_INIT(cser, cser_alloc_inst, cser_alloc);
 MODULE_DESCRIPTION("USB Serial Character Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

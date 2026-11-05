@@ -3,6 +3,8 @@
  * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
+#define pr_fmt(fmt) "%s: " fmt, __func__
+
 #include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
@@ -19,8 +21,8 @@
 #define MAX31760_TC2H_REG		0x54
 #define MAX31760_TC2L_REG		0x55
 
-#define VDD_MAX_UV	3100000
-#define VDD_MIN_UV	3000000
+#define VDD_MAX_UV	3300000
+#define VDD_MIN_UV	3296000
 #define VDD_LOAD_UA	300000
 #define VCCA_MAX_UV	1800000
 #define VCCA_MIN_UV	1800000
@@ -37,9 +39,10 @@ struct max31760_data {
 	struct i2c_client *i2c_client;
 	struct thermal_cooling_device *cdev;
 	struct mutex update_lock;
+	struct regulator *vdd_reg;
+	struct regulator *vcca_reg;
 	u32 fan_num;
 	u32 pwr_en_gpio;
-	u32 driver_en_gpio;
 	unsigned int cur_state;
 	atomic_t in_suspend;
 };
@@ -52,7 +55,7 @@ static int max31760_read_byte(struct max31760_data *pdata, u8 reg, u8 *val)
 
 	ret = i2c_smbus_read_byte_data(client, reg);
 	if (ret < 0)
-		dev_err(pdata->dev, "%s failed read reg 0x%02x failure, ret:%d\n", reg, ret);
+		dev_err(pdata->dev, "failed read reg 0x%02x failure, ret:%d\n", reg, ret);
 
 	*val = (u8)ret;
 
@@ -79,9 +82,7 @@ static int max31760_write_byte(struct max31760_data *pdata, u8 reg, u8 val)
 static void max31760_enable_gpio(struct max31760_data *pdata, int on)
 {
 	gpio_direction_output(pdata->pwr_en_gpio, on);
-	gpio_direction_output(pdata->driver_en_gpio, on);
-	dev_dbg(pdata->dev, "max31760 gpio:%d and gpio:%d set to %d\n", pdata->pwr_en_gpio,
-		pdata->driver_en_gpio, on);
+	dev_dbg(pdata->dev, "max31760 gpio:%d set to %d\n", pdata->pwr_en_gpio, on);
 	usleep_range(20000, 20100);
 }
 
@@ -168,6 +169,9 @@ static ssize_t speed_control_store(struct device *dev,
 
 	if (kstrtoul(buf, 0, &value))
 		return -EINVAL;
+
+	if (value > FAN_SPEED_MAX)
+		value = FAN_SPEED_MAX;
 
 	mutex_lock(&data->update_lock);
 	max31760_set_cur_state_common(data, value);
@@ -352,21 +356,9 @@ static int max31760_parse_dt(struct max31760_data *pdata)
 		return -EINVAL;
 	}
 
-	pdata->driver_en_gpio = of_get_named_gpio(node, "maxim,driver-en-gpio", 0);
-	if (!gpio_is_valid(pdata->driver_en_gpio)) {
-		dev_err(pdata->dev, "enable gpio not specified\n");
-		return -EINVAL;
-	}
-
 	ret = gpio_request(pdata->pwr_en_gpio, "pwr_en_gpio");
 	if (ret) {
-		pr_err("max31760 enable gpio request failed, ret:%d\n", ret);
-		goto error;
-	}
-
-	ret = gpio_request(pdata->driver_en_gpio, "driver_en_gpio");
-	if (ret) {
-		pr_err("max31760 drvr enable gpio request failed, ret:%d\n", ret);
+		pr_err("enable gpio request failed, ret:%d\n", ret);
 		goto error;
 	}
 
@@ -376,7 +368,6 @@ static int max31760_parse_dt(struct max31760_data *pdata)
 
 error:
 	gpio_free(pdata->pwr_en_gpio);
-	gpio_free(pdata->driver_en_gpio);
 	return ret;
 }
 
@@ -384,22 +375,64 @@ static struct attribute_group max31760_attribute_group = {
 	.attrs = max31760_sysfs_attrs,
 };
 
-static int max31760_remove(struct i2c_client *client)
+static int max31760_enable_vregs(struct max31760_data *pdata)
 {
-	struct max31760_data *pdata = i2c_get_clientdata(client);
+	int ret = 0;
 
-	if (!pdata)
-		return 0;
+	pdata->vdd_reg = devm_regulator_get(pdata->dev, "maxim,vdd");
+	if (IS_ERR(pdata->vdd_reg)) {
+		ret = PTR_ERR(pdata->vdd_reg);
+		dev_err(pdata->dev, "couldn't get vdd_reg regulator, ret:%d\n", ret);
+		pdata->vdd_reg = NULL;
+		return ret;
+	}
 
-	thermal_cooling_device_unregister(pdata->cdev);
-	max31760_enable_gpio(pdata, 0);
-	gpio_free(pdata->pwr_en_gpio);
-	gpio_free(pdata->driver_en_gpio);
+	regulator_set_voltage(pdata->vdd_reg, VDD_MIN_UV, VDD_MAX_UV);
+	regulator_set_load(pdata->vdd_reg, VDD_LOAD_UA);
+	ret = regulator_enable(pdata->vdd_reg);
+	if (ret < 0) {
+		dev_err(pdata->dev, "vdd_reg regulator failed, ret:%d\n", ret);
+		regulator_set_voltage(pdata->vdd_reg, 0, VDD_MAX_UV);
+		regulator_set_load(pdata->vdd_reg, 0);
+		return -EINVAL;
+	}
+
+	pdata->vcca_reg = devm_regulator_get(pdata->dev, "maxim,vcca");
+	if (IS_ERR(pdata->vcca_reg)) {
+		ret = PTR_ERR(pdata->vcca_reg);
+		dev_err(pdata->dev, "couldn't get vcca_reg regulator, ret:%d\n", ret);
+		pdata->vcca_reg = NULL;
+		return ret;
+	}
+
+	regulator_set_voltage(pdata->vcca_reg, VCCA_MIN_UV, VCCA_MAX_UV);
+	regulator_set_load(pdata->vcca_reg, VCCA_LOAD_UA);
+	ret = regulator_enable(pdata->vcca_reg);
+	if (ret < 0) {
+		dev_err(pdata->dev, "vcca_reg regulator failed, ret:%d\n", ret);
+		regulator_set_voltage(pdata->vcca_reg, 0, VCCA_MAX_UV);
+		regulator_set_load(pdata->vcca_reg, 0);
+		return -EINVAL;
+	}
 
 	return 0;
 }
 
-static int max31760_probe(struct i2c_client *client, const struct i2c_device_id *id)
+static void max31760_remove(struct i2c_client *client)
+{
+	struct max31760_data *pdata = i2c_get_clientdata(client);
+
+	if (!pdata)
+		return;
+
+	thermal_cooling_device_unregister(pdata->cdev);
+	regulator_disable(pdata->vdd_reg);
+	regulator_disable(pdata->vcca_reg);
+	max31760_enable_gpio(pdata, 0);
+	gpio_free(pdata->pwr_en_gpio);
+}
+
+static int max31760_probe(struct i2c_client *client)
 {
 	int ret = 0;
 	struct max31760_data *pdata;
@@ -430,6 +463,12 @@ static int max31760_probe(struct i2c_client *client, const struct i2c_device_id 
 		goto fail_parse_dt;
 	}
 
+	ret = max31760_enable_vregs(pdata);
+	if (ret) {
+		dev_err(pdata->dev, "failed to enable regulators, ret:%d\n", ret);
+		goto fail_enable_vregs;
+	}
+
 	max31760_hw_init(pdata);
 	ret = max31760_register_cdev(pdata);
 	if (ret) {
@@ -443,11 +482,15 @@ static int max31760_probe(struct i2c_client *client, const struct i2c_device_id 
 		return ret;
 	}
 
+	dev_dbg(pdata->dev, "probe successfully.\n");
 	return ret;
 
 fail_register_cdev:
 	max31760_remove(client);
 	return ret;
+fail_enable_vregs:
+	max31760_enable_gpio(pdata, 0);
+	gpio_free(pdata->pwr_en_gpio);
 fail_parse_dt:
 	i2c_set_clientdata(client, NULL);
 	dev_set_drvdata(&client->dev, NULL);
@@ -469,6 +512,7 @@ static int max31760_suspend(struct device *dev)
 		mutex_lock(&pdata->update_lock);
 		max31760_speed_control(pdata, FAN_SPEED_LEVEL0);
 		max31760_enable_gpio(pdata, 0);
+		regulator_disable(pdata->vdd_reg);
 		mutex_unlock(&pdata->update_lock);
 	}
 
@@ -478,12 +522,18 @@ static int max31760_suspend(struct device *dev)
 static int max31760_resume(struct device *dev)
 {
 	struct max31760_data *pdata = dev_get_drvdata(dev);
+	int ret;
 
 	dev_dbg(dev, "enter resume now\n");
 	if (pdata) {
 		atomic_set(&pdata->in_suspend, 0);
 		mutex_lock(&pdata->update_lock);
 		max31760_enable_gpio(pdata, 1);
+
+		ret = regulator_enable(pdata->vdd_reg);
+		if (ret < 0)
+			dev_err(pdata->dev, "vdd_reg regulator failed, ret:%d\n", ret);
+
 		max31760_write_byte(pdata, MAX31760_CTRL_REG1, 0x19);
 		max31760_write_byte(pdata, MAX31760_CTRL_REG2, 0x11);
 		if (pdata->fan_num == 1)
@@ -524,4 +574,4 @@ static struct i2c_driver max31760_i2c_driver = {
 module_i2c_driver(max31760_i2c_driver);
 MODULE_DEVICE_TABLE(i2c, max31760_i2c_table);
 MODULE_DESCRIPTION("Maxim 31760 Fan Controller");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

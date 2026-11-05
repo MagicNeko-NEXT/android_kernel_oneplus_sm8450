@@ -93,6 +93,7 @@ bool ixgbe_device_supports_autoneg_fc(struct ixgbe_hw *hw)
 		default:
 			break;
 		}
+		break;
 	default:
 		break;
 	}
@@ -683,7 +684,7 @@ void ixgbe_set_lan_id_multi_port_pcie(struct ixgbe_hw *hw)
 	u32 reg;
 
 	reg = IXGBE_READ_REG(hw, IXGBE_STATUS);
-	bus->func = (reg & IXGBE_STATUS_LAN_ID) >> IXGBE_STATUS_LAN_ID_SHIFT;
+	bus->func = FIELD_GET(IXGBE_STATUS_LAN_ID, reg);
 	bus->lan_id = bus->func;
 
 	/* check for a port swap */
@@ -694,8 +695,8 @@ void ixgbe_set_lan_id_multi_port_pcie(struct ixgbe_hw *hw)
 	/* Get MAC instance from EEPROM for configuring CS4227 */
 	if (hw->device_id == IXGBE_DEV_ID_X550EM_A_SFP) {
 		hw->eeprom.ops.read(hw, IXGBE_EEPROM_CTRL_4, &ee_ctrl_4);
-		bus->instance_id = (ee_ctrl_4 & IXGBE_EE_CTRL_4_INST_ID) >>
-				   IXGBE_EE_CTRL_4_INST_ID_SHIFT;
+		bus->instance_id = FIELD_GET(IXGBE_EE_CTRL_4_INST_ID,
+					     ee_ctrl_4);
 	}
 }
 
@@ -869,10 +870,9 @@ s32 ixgbe_init_eeprom_params_generic(struct ixgbe_hw *hw)
 			 * SPI EEPROM is assumed here.  This code would need to
 			 * change if a future EEPROM is not SPI.
 			 */
-			eeprom_size = (u16)((eec & IXGBE_EEC_SIZE) >>
-					    IXGBE_EEC_SIZE_SHIFT);
+			eeprom_size = FIELD_GET(IXGBE_EEC_SIZE, eec);
 			eeprom->word_size = BIT(eeprom_size +
-						 IXGBE_EEPROM_WORD_SIZE_SHIFT);
+						IXGBE_EEPROM_WORD_SIZE_SHIFT);
 		}
 
 		if (eec & IXGBE_EEC_ADDR_SIZE)
@@ -2695,7 +2695,7 @@ s32 ixgbe_disable_rx_buff_generic(struct ixgbe_hw *hw)
 }
 
 /**
- *  ixgbe_enable_rx_buff - Enables the receive data path
+ *  ixgbe_enable_rx_buff_generic - Enables the receive data path
  *  @hw: pointer to hardware structure
  *
  *  Enables the receive data path
@@ -3017,14 +3017,14 @@ s32 ixgbe_set_vmdq_generic(struct ixgbe_hw *hw, u32 rar, u32 vmdq)
 }
 
 /**
+ *  ixgbe_set_vmdq_san_mac_generic - Associate VMDq pool index with a rx address
+ *  @hw: pointer to hardware struct
+ *  @vmdq: VMDq pool index
+ *
  *  This function should only be involved in the IOV mode.
  *  In IOV mode, Default pool is next pool after the number of
  *  VFs advertized and not 0.
  *  MPSAR table needs to be updated for SAN_MAC RAR [hw->mac.san_mac_rar_index]
- *
- *  ixgbe_set_vmdq_san_mac - Associate default VMDq pool index with a rx address
- *  @hw: pointer to hardware struct
- *  @vmdq: VMDq pool index
  **/
 s32 ixgbe_set_vmdq_san_mac_generic(struct ixgbe_hw *hw, u32 vmdq)
 {
@@ -3224,7 +3224,7 @@ vfta_update:
  *  ixgbe_clear_vfta_generic - Clear VLAN filter table
  *  @hw: pointer to hardware structure
  *
- *  Clears the VLAN filer table, and the VMDq index associated with the filter
+ *  Clears the VLAN filter table, and the VMDq index associated with the filter
  **/
 s32 ixgbe_clear_vfta_generic(struct ixgbe_hw *hw)
 {
@@ -3279,13 +3279,14 @@ static bool ixgbe_need_crosstalk_fix(struct ixgbe_hw *hw)
 s32 ixgbe_check_mac_link_generic(struct ixgbe_hw *hw, ixgbe_link_speed *speed,
 				 bool *link_up, bool link_up_wait_to_complete)
 {
+	bool crosstalk_fix_active = ixgbe_need_crosstalk_fix(hw);
 	u32 links_reg, links_orig;
 	u32 i;
 
 	/* If Crosstalk fix enabled do the sanity check of making sure
 	 * the SFP+ cage is full.
 	 */
-	if (ixgbe_need_crosstalk_fix(hw)) {
+	if (crosstalk_fix_active) {
 		u32 sfp_cage_full;
 
 		switch (hw->mac.type) {
@@ -3333,10 +3334,24 @@ s32 ixgbe_check_mac_link_generic(struct ixgbe_hw *hw, ixgbe_link_speed *speed,
 			links_reg = IXGBE_READ_REG(hw, IXGBE_LINKS);
 		}
 	} else {
-		if (links_reg & IXGBE_LINKS_UP)
+		if (links_reg & IXGBE_LINKS_UP) {
+			if (crosstalk_fix_active) {
+				/* Check the link state again after a delay
+				 * to filter out spurious link up
+				 * notifications.
+				 */
+				mdelay(5);
+				links_reg = IXGBE_READ_REG(hw, IXGBE_LINKS);
+				if (!(links_reg & IXGBE_LINKS_UP)) {
+					*link_up = false;
+					*speed = IXGBE_LINK_SPEED_UNKNOWN;
+					return 0;
+				}
+			}
 			*link_up = true;
-		else
+		} else {
 			*link_up = false;
+		}
 	}
 
 	switch (links_reg & IXGBE_LINKS_SPEED_82599) {
@@ -3666,10 +3681,8 @@ s32 ixgbe_host_interface_command(struct ixgbe_hw *hw, void *buffer,
 				 bool return_data)
 {
 	u32 hdr_size = sizeof(struct ixgbe_hic_hdr);
-	union {
-		struct ixgbe_hic_hdr hdr;
-		u32 u32arr[1];
-	} *bp = buffer;
+	struct ixgbe_hic_hdr *hdr = buffer;
+	u32 *u32arr = buffer;
 	u16 buf_len, dword_len;
 	s32 status;
 	u32 bi;
@@ -3695,12 +3708,12 @@ s32 ixgbe_host_interface_command(struct ixgbe_hw *hw, void *buffer,
 
 	/* first pull in the header so we know the buffer length */
 	for (bi = 0; bi < dword_len; bi++) {
-		bp->u32arr[bi] = IXGBE_READ_REG_ARRAY(hw, IXGBE_FLEX_MNG, bi);
-		le32_to_cpus(&bp->u32arr[bi]);
+		u32arr[bi] = IXGBE_READ_REG_ARRAY(hw, IXGBE_FLEX_MNG, bi);
+		le32_to_cpus(&u32arr[bi]);
 	}
 
 	/* If there is any thing in data position pull it in */
-	buf_len = bp->hdr.buf_len;
+	buf_len = hdr->buf_len;
 	if (!buf_len)
 		goto rel_out;
 
@@ -3715,8 +3728,8 @@ s32 ixgbe_host_interface_command(struct ixgbe_hw *hw, void *buffer,
 
 	/* Pull in the rest of the buffer (bi is where we left off) */
 	for (; bi <= dword_len; bi++) {
-		bp->u32arr[bi] = IXGBE_READ_REG_ARRAY(hw, IXGBE_FLEX_MNG, bi);
-		le32_to_cpus(&bp->u32arr[bi]);
+		u32arr[bi] = IXGBE_READ_REG_ARRAY(hw, IXGBE_FLEX_MNG, bi);
+		le32_to_cpus(&u32arr[bi]);
 	}
 
 rel_out:
@@ -3885,7 +3898,7 @@ static s32 ixgbe_get_ets_data(struct ixgbe_hw *hw, u16 *ets_cfg,
 }
 
 /**
- *  ixgbe_get_thermal_sensor_data - Gathers thermal sensor data
+ *  ixgbe_get_thermal_sensor_data_generic - Gathers thermal sensor data
  *  @hw: pointer to hardware structure
  *
  *  Returns the thermal sensor data structure
@@ -3921,10 +3934,10 @@ s32 ixgbe_get_thermal_sensor_data_generic(struct ixgbe_hw *hw)
 		if (status)
 			return status;
 
-		sensor_index = ((ets_sensor & IXGBE_ETS_DATA_INDEX_MASK) >>
-				IXGBE_ETS_DATA_INDEX_SHIFT);
-		sensor_location = ((ets_sensor & IXGBE_ETS_DATA_LOC_MASK) >>
-				   IXGBE_ETS_DATA_LOC_SHIFT);
+		sensor_index = FIELD_GET(IXGBE_ETS_DATA_INDEX_MASK,
+					 ets_sensor);
+		sensor_location = FIELD_GET(IXGBE_ETS_DATA_LOC_MASK,
+					    ets_sensor);
 
 		if (sensor_location != 0) {
 			status = hw->phy.ops.read_i2c_byte(hw,
@@ -3968,8 +3981,7 @@ s32 ixgbe_init_thermal_sensor_thresh_generic(struct ixgbe_hw *hw)
 	if (status)
 		return status;
 
-	low_thresh_delta = ((ets_cfg & IXGBE_ETS_LTHRES_DELTA_MASK) >>
-			     IXGBE_ETS_LTHRES_DELTA_SHIFT);
+	low_thresh_delta = FIELD_GET(IXGBE_ETS_LTHRES_DELTA_MASK, ets_cfg);
 	num_sensors = (ets_cfg & IXGBE_ETS_NUM_SENSORS_MASK);
 	if (num_sensors > IXGBE_MAX_SENSORS)
 		num_sensors = IXGBE_MAX_SENSORS;
@@ -3983,10 +3995,10 @@ s32 ixgbe_init_thermal_sensor_thresh_generic(struct ixgbe_hw *hw)
 			       ets_offset + 1 + i);
 			continue;
 		}
-		sensor_index = ((ets_sensor & IXGBE_ETS_DATA_INDEX_MASK) >>
-				IXGBE_ETS_DATA_INDEX_SHIFT);
-		sensor_location = ((ets_sensor & IXGBE_ETS_DATA_LOC_MASK) >>
-				   IXGBE_ETS_DATA_LOC_SHIFT);
+		sensor_index = FIELD_GET(IXGBE_ETS_DATA_INDEX_MASK,
+					 ets_sensor);
+		sensor_location = FIELD_GET(IXGBE_ETS_DATA_LOC_MASK,
+					    ets_sensor);
 		therm_limit = ets_sensor & IXGBE_ETS_DATA_HTHRESH_MASK;
 
 		hw->phy.ops.write_i2c_byte(hw,
@@ -4043,8 +4055,7 @@ void ixgbe_get_orom_version(struct ixgbe_hw *hw,
 }
 
 /**
- *  ixgbe_get_oem_prod_version Etrack ID from EEPROM
- *
+ *  ixgbe_get_oem_prod_version - Etrack ID from EEPROM
  *  @hw: pointer to hardware structure
  *  @nvm_ver: pointer to output structure
  *

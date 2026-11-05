@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #ifndef _TME_HWKM_MASTER_H_
 #define _TME_HWKM_MASTER_H_
@@ -117,4 +117,3 @@ uint32_t tme_hwkm_master_broadcast_transportkey(
 		struct tme_ext_err_info *err_info);
 
 #endif /* _TME_HWKM_MASTER_H_ */
-

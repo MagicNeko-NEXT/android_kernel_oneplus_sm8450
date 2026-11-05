@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2019-2020, The Linux Foundation. All rights reserved.*/
+/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. */
 
-#include <linux/async.h>
 #include <linux/device.h>
 #include <linux/dma-direction.h>
 #include <linux/dma-mapping.h>
@@ -16,53 +15,57 @@
 #include <linux/uaccess.h>
 #include <linux/wait.h>
 #include <linux/mhi.h>
+#include <linux/mhi_misc.h>
 
 #define MHI_SAT_DRIVER_NAME "mhi_satellite"
 
 /* logging macros */
 #define IPC_LOG_PAGES (10)
-#define IPC_LOG_LVL (MHI_MSG_LVL_INFO)
-#define KLOG_LVL (MHI_MSG_LVL_ERROR)
 
-#define MHI_SUBSYS_LOG(fmt, ...) do { \
+#ifdef CONFIG_MHI_BUS_DEBUG
+#define MHI_SAT_LOG_LVL MHI_MSG_LVL_VERBOSE
+#else
+#define MHI_SAT_LOG_LVL MHI_MSG_LVL_ERROR
+#endif
+
+#define MSG_SUBSYS_LOG(fmt, ...) do { \
 	if (!subsys) \
 		break; \
-	if (mhi_sat_driver.klog_lvl <= MHI_MSG_LVL_INFO) \
-		printk("%s[I][%s][%s] " fmt, KERN_INFO, __func__, \
-				subsys->name, ##__VA_ARGS__); \
 	if (mhi_sat_driver.ipc_log_lvl <= MHI_MSG_LVL_INFO) \
 		ipc_log_string(subsys->ipc_log, "%s[I][%s] " fmt, \
 				"", __func__, ##__VA_ARGS__); \
 } while (0)
 
-#define MHI_SAT_LOG(fmt, ...) do { \
+#define MSG_LOG(fmt, ...) do { \
 	if (!subsys || !sat_cntrl) \
 		break; \
-	if (mhi_sat_driver.klog_lvl <= MHI_MSG_LVL_INFO) \
-		printk("%s[I][%s][%s][%x] " fmt, KERN_INFO, __func__, \
-			subsys->name, sat_cntrl->dev_id, ##__VA_ARGS__); \
 	if (mhi_sat_driver.ipc_log_lvl <= MHI_MSG_LVL_INFO) \
 		ipc_log_string(subsys->ipc_log, "%s[I][%s][%x] " fmt, \
 				"", __func__, sat_cntrl->dev_id, \
 				##__VA_ARGS__); \
 } while (0)
 
-#define MHI_SAT_ERR(fmt, ...) do { \
+#define MSG_ERR(fmt, ...) do { \
 	if (!subsys || !sat_cntrl) \
 		break; \
-	if (mhi_sat_driver.klog_lvl <= MHI_MSG_LVL_ERROR) \
-		printk("%s[E][%s][%s][%x] " fmt, KERN_INFO, __func__, \
-			subsys->name, sat_cntrl->dev_id, ##__VA_ARGS__); \
+	pr_err("[E][%s][%s][%x] " fmt, __func__, subsys->name, \
+	       sat_cntrl->dev_id, ##__VA_ARGS__);\
 	if (mhi_sat_driver.ipc_log_lvl <= MHI_MSG_LVL_ERROR) \
 		ipc_log_string(subsys->ipc_log, "%s[E][%s][%x] " fmt, \
 				"", __func__, sat_cntrl->dev_id, \
 				##__VA_ARGS__); \
 } while (0)
 
-#define MHI_SAT_ASSERT(cond, msg) do { \
-	if (cond) \
-		panic(msg); \
-} while (0)
+static const char * const mhi_log_level_str[MHI_MSG_LVL_MAX] = {
+	[MHI_MSG_LVL_VERBOSE] = "Verbose",
+	[MHI_MSG_LVL_INFO] = "Info",
+	[MHI_MSG_LVL_ERROR] = "Error",
+	[MHI_MSG_LVL_CRITICAL] = "Critical",
+	[MHI_MSG_LVL_MASK_ALL] = "Mask all",
+};
+#define MSG_LOG_LEVEL_STR(level) ((level >= MHI_MSG_LVL_MAX || \
+				      !mhi_log_level_str[level]) ? \
+				      "Mask all" : mhi_log_level_str[level])
 
 /* mhi sys error command */
 #define MHI_TRE_CMD_SYS_ERR_PTR (0)
@@ -96,11 +99,7 @@
 #define MHI_TRE_GET_ID(tre) (((tre)->dword[1] >> 24) & 0xFF)
 #define MHI_TRE_GET_TYPE(tre) (((tre)->dword[1] >> 16) & 0xFF)
 #define MHI_TRE_IS_ER_CTXT_TYPE(tre) (((tre)->dword[1]) & 0x1)
-
-/* creates unique device ID based on connection topology */
-#define MHI_SAT_CREATE_DEVICE_ID(dev, domain, bus, slot) \
-	((dev & 0xFFFF) << 16 | (domain & 0xF) << 12 | (bus & 0xFF) << 4 | \
-	(slot & 0xF))
+#define MHI_TRE_IS_IO_ADDR_TYPE(tre) (((tre)->dword[1]) & 0x1)
 
 /* mhi core definitions */
 #define MHI_CTXT_TYPE_GENERIC (0xA)
@@ -144,12 +143,14 @@ enum mhi_ev_ccs {
 /* satellite subsystem definitions */
 enum subsys_id {
 	SUBSYS_ADSP,
+	SUBSYS_CDSP,
 	SUBSYS_SLPI,
 	SUBSYS_MAX,
 };
 
 static const char * const subsys_names[SUBSYS_MAX] = {
 	[SUBSYS_ADSP] = "adsp",
+	[SUBSYS_CDSP] = "cdsp",
 	[SUBSYS_SLPI] = "slpi",
 };
 
@@ -237,6 +238,7 @@ enum mhi_sat_state {
 	SAT_DISABLED, /* no further processing: wait for device removal */
 };
 
+#define MHI_SAT_MAX_DEVICES 4
 #define MHI_SAT_ACTIVE(cntrl) (cntrl->state == SAT_RUNNING)
 #define MHI_SAT_IN_ERROR_STATE(cntrl) (cntrl->state >= SAT_FATAL_DETECT)
 #define MHI_SAT_ALLOW_CONNECTION(cntrl) (cntrl->state == SAT_READY || \
@@ -259,7 +261,7 @@ struct mhi_sat_cntrl {
 
 	struct work_struct connect_work; /* subsystem connection worker */
 	struct work_struct process_work; /* incoming packets processor */
-	async_cookie_t error_cookie; /* synchronize device error handling */
+	struct work_struct error_work; /* error handling processor */
 
 	/* mhi core/controller configurations */
 	u32 dev_id; /* unique device ID with BDF as per connection topology */
@@ -292,7 +294,6 @@ struct mhi_sat_device {
 
 struct mhi_sat_driver {
 	enum MHI_DEBUG_LEVEL ipc_log_lvl; /* IPC log level */
-	enum MHI_DEBUG_LEVEL klog_lvl; /* klog/dmesg levels */
 
 	struct mhi_sat_subsys *subsys; /* pointer to subsystem array */
 	unsigned int num_subsys;
@@ -357,7 +358,8 @@ static struct mhi_sat_device *find_sat_dev_by_id(
 static bool mhi_sat_isvalid_header(struct sat_header *hdr, int len)
 {
 	/* validate payload size */
-	if (len < sizeof(*hdr) || len != hdr->payload_size + sizeof(*hdr))
+	if ((len < sizeof(*hdr)) ||
+		(len >= sizeof(*hdr) && (len != hdr->payload_size + sizeof(*hdr))))
 		return false;
 
 	/* validate SAT IPC version */
@@ -375,23 +377,25 @@ static bool mhi_sat_isvalid_header(struct sat_header *hdr, int len)
 static int mhi_sat_wait_cmd_completion(struct mhi_sat_cntrl *sat_cntrl)
 {
 	struct mhi_sat_subsys *subsys = sat_cntrl->subsys;
-	int ret;
+	int ret = 0;
 
-	reinit_completion(&sat_cntrl->completion);
-
-	MHI_SAT_LOG("Wait for command completion\n");
+	MSG_LOG("Wait for command completion\n");
 	ret = wait_for_completion_timeout(&sat_cntrl->completion,
 		msecs_to_jiffies(sat_cntrl->mhi_cntrl->timeout_ms));
 	if (!ret || sat_cntrl->last_cmd_ccs != MHI_EV_CC_SUCCESS) {
-		MHI_SAT_ERR("Command completion failure:seq:%u:ret:%d:ccs:%d\n",
+		MSG_ERR("Command completion failure:seq:%u:ret:%d:ccs:%d\n",
 			sat_cntrl->last_cmd_seq, ret, sat_cntrl->last_cmd_ccs);
-		return -EIO;
+		ret = -EIO;
+		goto reinit_comp;
 	}
 
-	MHI_SAT_LOG("Command completion successful for seq:%u\n",
+	MSG_LOG("Command completion successful for seq:%u\n",
 		    sat_cntrl->last_cmd_seq);
 
-	return 0;
+reinit_comp:
+	reinit_completion(&sat_cntrl->completion);
+
+	return ret;
 }
 
 static int mhi_sat_send_msg(struct mhi_sat_cntrl *sat_cntrl,
@@ -434,9 +438,11 @@ static void mhi_sat_process_cmds(struct mhi_sat_cntrl *sat_cntrl,
 		switch (MHI_TRE_GET_TYPE(pkt)) {
 		case MHI_PKT_TYPE_IOMMU_MAP_CMD:
 		{
-			struct mhi_buf *buf;
+			struct mhi_buf_extended *buf;
 			struct mhi_controller *mhi_cntrl = sat_cntrl->mhi_cntrl;
 			dma_addr_t iova = DMA_MAPPING_ERROR;
+			struct device *parent_dev =
+					mhi_cntrl->mhi_dev->dev.parent;
 
 			buf = kmalloc(sizeof(*buf), GFP_ATOMIC);
 			if (!buf)
@@ -444,10 +450,25 @@ static void mhi_sat_process_cmds(struct mhi_sat_cntrl *sat_cntrl,
 
 			buf->phys_addr = MHI_TRE_GET_PTR(pkt);
 			buf->len = MHI_TRE_GET_SIZE(pkt);
+			buf->is_io = MHI_TRE_IS_IO_ADDR_TYPE(pkt);
 
-			iova = dma_map_resource(mhi_cntrl->dev, buf->phys_addr,
-						buf->len, DMA_BIDIRECTIONAL, 0);
-			if (dma_mapping_error(mhi_cntrl->dev, iova)) {
+			if (buf->is_io) {
+				iova = dma_map_resource(parent_dev,
+							buf->phys_addr, buf->len,
+							DMA_BIDIRECTIONAL, 0);
+			} else {
+				/*
+				 * DMA_ATTR_SKIP_CPU_SYNC used due to assumption
+				 * CPU does not read/write this memory, and addr
+				 * & size may not be aligned per CMO requirement
+				 */
+				iova = dma_map_single_attrs(parent_dev,
+							    phys_to_virt(buf->phys_addr),
+							    buf->len, DMA_BIDIRECTIONAL,
+							    DMA_ATTR_SKIP_CPU_SYNC);
+			}
+
+			if (dma_mapping_error(parent_dev, iova)) {
 				kfree(buf);
 				goto iommu_map_cmd_completion;
 			}
@@ -462,7 +483,7 @@ static void mhi_sat_process_cmds(struct mhi_sat_cntrl *sat_cntrl,
 			code = MHI_EV_CC_SUCCESS;
 
 iommu_map_cmd_completion:
-			MHI_SAT_LOG("IOMMU MAP 0x%llx len:%d CMD %s:%llx\n",
+			MSG_LOG("IOMMU MAP 0x%llx len:%d CMD %s:%llx\n",
 				    MHI_TRE_GET_PTR(pkt), MHI_TRE_GET_SIZE(pkt),
 				    (code == MHI_EV_CC_SUCCESS) ? "successful" :
 				    "failed", iova);
@@ -484,8 +505,11 @@ iommu_map_cmd_completion:
 							 sat_cntrl, id, evt);
 			int ret;
 
-			MHI_SAT_ASSERT(!sat_dev,
-				      "No device with given chan/evt ID");
+			if (!sat_dev) {
+				MSG_LOG("Failed to find the satellite device with id : %d\n", id);
+				WARN_ON(!sat_dev);
+				return;
+			}
 
 			memset(&gen_ctxt, 0, sizeof(gen_ctxt));
 			memset(&buf, 0, sizeof(buf));
@@ -503,7 +527,7 @@ iommu_map_cmd_completion:
 			if (!ret)
 				code = MHI_EV_CC_SUCCESS;
 
-			MHI_SAT_LOG("CTXT UPDATE CMD %s:%d %s\n", buf.name, id,
+			MSG_LOG("CTXT UPDATE CMD %s:%d %s\n", buf.name, id,
 				    (code == MHI_EV_CC_SUCCESS) ? "successful" :
 				    "failed");
 
@@ -520,11 +544,13 @@ iommu_map_cmd_completion:
 							 SAT_CTXT_TYPE_CHAN);
 			int ret;
 
-			MHI_SAT_ASSERT(!sat_dev,
-				      "No device with given channel ID\n");
+			if (!sat_dev) {
+				MSG_LOG("Failed to find the satellite device with id : %d\n", id);
+				WARN_ON(!sat_dev);
+				return;
+			}
 
-			MHI_SAT_ASSERT(sat_dev->chan_started,
-				       "Channel already started!");
+			WARN_ON(sat_dev->chan_started);
 
 			ret = mhi_prepare_for_transfer(sat_dev->mhi_dev);
 			if (!ret) {
@@ -532,7 +558,7 @@ iommu_map_cmd_completion:
 				code = MHI_EV_CC_SUCCESS;
 			}
 
-			MHI_SAT_LOG("START CHANNEL %d CMD %s\n", id,
+			MSG_LOG("START CHANNEL %d CMD %s\n", id,
 				    (code == MHI_EV_CC_SUCCESS) ? "successful" :
 				    "failure");
 
@@ -548,16 +574,18 @@ iommu_map_cmd_completion:
 				find_sat_dev_by_id(sat_cntrl, id,
 						   SAT_CTXT_TYPE_CHAN);
 
-			MHI_SAT_ASSERT(!sat_dev,
-					"No device with given channel ID\n");
+			if (!sat_dev) {
+				MSG_LOG("Failed to find the satellite device with id : %d\n", id);
+				WARN_ON(!sat_dev);
+				return;
+			}
 
-			MHI_SAT_ASSERT(!sat_dev->chan_started,
-					"Resetting unstarted channel!");
+			WARN_ON(!sat_dev->chan_started);
 
 			mhi_unprepare_from_transfer(sat_dev->mhi_dev);
 			sat_dev->chan_started = false;
 
-			MHI_SAT_LOG("RESET CHANNEL %d CMD successful\n", id);
+			MSG_LOG("RESET CHANNEL %d CMD successful\n", id);
 
 			pkt->ptr = MHI_TRE_EVT_CMD_COMPLETION_PTR(0);
 			pkt->dword[0] = MHI_TRE_EVT_CMD_COMPLETION_D0(
@@ -566,7 +594,7 @@ iommu_map_cmd_completion:
 			break;
 		}
 		default:
-			MHI_SAT_ASSERT(1, "Unhandled command!");
+			MSG_ERR("Unhandled MHI satellite command!");
 			break;
 		}
 	}
@@ -585,10 +613,10 @@ static void mhi_sat_send_sys_err(struct mhi_sat_cntrl *sat_cntrl)
 	flush_work(&sat_cntrl->process_work);
 
 	msg = kmalloc(SAT_MSG_SIZE(1), GFP_KERNEL);
-
-	MHI_SAT_ASSERT(!msg, "Unable to malloc for SYS_ERR message!\n");
-	if (!msg)
+	if (!msg) {
+		MSG_ERR("Unable to malloc for SYS_ERR message!\n");
 		return;
+	}
 
 	pkt = SAT_TRE_OFFSET(msg);
 	pkt->ptr = MHI_TRE_CMD_SYS_ERR_PTR;
@@ -602,12 +630,12 @@ static void mhi_sat_send_sys_err(struct mhi_sat_cntrl *sat_cntrl)
 			       SAT_MSG_SIZE(1));
 	kfree(msg);
 	if (ret) {
-		MHI_SAT_ERR("Failed to notify SYS_ERR cmd\n");
+		MSG_ERR("Failed to notify SYS_ERR cmd\n");
 		mutex_unlock(&sat_cntrl->cmd_wait_mutex);
 		return;
 	}
 
-	MHI_SAT_LOG("SYS_ERR command sent\n");
+	MSG_LOG("SYS_ERR command sent\n");
 
 	/* blocking call to wait for command completion event */
 	mhi_sat_wait_cmd_completion(sat_cntrl);
@@ -615,25 +643,26 @@ static void mhi_sat_send_sys_err(struct mhi_sat_cntrl *sat_cntrl)
 	mutex_unlock(&sat_cntrl->cmd_wait_mutex);
 }
 
-static void mhi_sat_error_worker(void *data, async_cookie_t cookie)
+static void mhi_sat_error_worker(struct work_struct *work)
 {
-	struct mhi_sat_cntrl *sat_cntrl = data;
+	struct mhi_sat_cntrl *sat_cntrl = container_of(work,
+					struct mhi_sat_cntrl, error_work);
 	struct mhi_sat_subsys *subsys = sat_cntrl->subsys;
 	struct sat_tre *pkt;
 	void *msg;
 	int ret;
 
-	MHI_SAT_LOG("Entered\n");
+	MSG_LOG("Entered\n");
 
 	/* flush all pending work */
 	flush_work(&sat_cntrl->connect_work);
 	flush_work(&sat_cntrl->process_work);
 
 	msg = kmalloc(SAT_MSG_SIZE(1), GFP_KERNEL);
-
-	MHI_SAT_ASSERT(!msg, "Unable to malloc for SYS_ERR message!\n");
-	if (!msg)
+	if (!msg) {
+		MSG_ERR("Unable to malloc for SYS_ERR message!\n");
 		return;
+	}
 
 	pkt = SAT_TRE_OFFSET(msg);
 	pkt->ptr = MHI_TRE_EVT_MHI_STATE_PTR;
@@ -645,7 +674,7 @@ static void mhi_sat_error_worker(void *data, async_cookie_t cookie)
 			       SAT_MSG_SIZE(1));
 	kfree(msg);
 
-	MHI_SAT_LOG("SYS_ERROR state change event send %s!\n", ret ? "failure" :
+	MSG_LOG("SYS_ERROR state change event send %s!\n", ret ? "failure" :
 		    "success");
 }
 
@@ -659,7 +688,7 @@ static void mhi_sat_process_worker(struct work_struct *work)
 	struct sat_tre *pkt;
 	LIST_HEAD(head);
 
-	MHI_SAT_LOG("Entered\n");
+	MSG_LOG("Entered\n");
 
 	spin_lock_irq(&sat_cntrl->pkt_lock);
 	list_splice_tail_init(&sat_cntrl->packet_list, &head);
@@ -686,7 +715,7 @@ process_next:
 		kfree(packet);
 	}
 
-	MHI_SAT_LOG("Exited\n");
+	MSG_LOG("Exited\n");
 }
 
 static void mhi_sat_connect_worker(struct work_struct *work)
@@ -694,6 +723,7 @@ static void mhi_sat_connect_worker(struct work_struct *work)
 	struct mhi_sat_cntrl *sat_cntrl = container_of(work,
 					struct mhi_sat_cntrl, connect_work);
 	struct mhi_sat_subsys *subsys = sat_cntrl->subsys;
+	phys_addr_t base_addr;
 	enum mhi_sat_state prev_state;
 	struct sat_tre *pkt;
 	void *msg;
@@ -709,7 +739,13 @@ static void mhi_sat_connect_worker(struct work_struct *work)
 	sat_cntrl->state = SAT_RUNNING;
 	spin_unlock_irq(&sat_cntrl->state_lock);
 
-	MHI_SAT_LOG("Entered\n");
+	MSG_LOG("Entered\n");
+
+	ret = mhi_controller_get_base(sat_cntrl->mhi_cntrl, &base_addr);
+	if (ret) {
+		MSG_ERR("Could not get controller base address\n");
+		goto error_connect_work;
+	}
 
 	msg = kmalloc(SAT_MSG_SIZE(3), GFP_ATOMIC);
 	if (!msg)
@@ -718,7 +754,7 @@ static void mhi_sat_connect_worker(struct work_struct *work)
 	pkt = SAT_TRE_OFFSET(msg);
 
 	/* prepare #1 MHI_CFG HELLO event */
-	pkt->ptr = MHI_TRE_EVT_CFG_PTR(sat_cntrl->mhi_cntrl->base_addr);
+	pkt->ptr = MHI_TRE_EVT_CFG_PTR(base_addr);
 	pkt->dword[0] = MHI_TRE_EVT_CFG_D0(sat_cntrl->er_base,
 					   sat_cntrl->num_er);
 	pkt->dword[1] = MHI_TRE_EVT_CFG_D1;
@@ -739,11 +775,11 @@ static void mhi_sat_connect_worker(struct work_struct *work)
 			       msg, SAT_MSG_SIZE(3));
 	kfree(msg);
 	if (ret) {
-		MHI_SAT_ERR("Failed to send hello packet:%d\n", ret);
+		MSG_ERR("Failed to send hello packet:%d\n", ret);
 		goto error_connect_work;
 	}
 
-	MHI_SAT_LOG("Device 0x%x sent hello packet\n", sat_cntrl->dev_id);
+	MSG_LOG("Device 0x%x sent hello packet\n", sat_cntrl->dev_id);
 
 	return;
 
@@ -782,12 +818,12 @@ static int mhi_sat_rpmsg_cb(struct rpmsg_device *rpdev, void *data, int len,
 	struct mhi_sat_packet *packet;
 	unsigned long flags;
 
-	MHI_SAT_ASSERT(!mhi_sat_isvalid_header(hdr, len), "Invalid header!\n");
+	WARN_ON(!mhi_sat_isvalid_header(hdr, len));
 
 	/* find controller packet was sent for */
 	sat_cntrl = find_sat_cntrl_by_id(subsys, hdr->dev_id);
 	if (!sat_cntrl) {
-		MHI_SAT_ERR("Message for unknown device!\n");
+		MSG_ERR("Message for unknown device!\n");
 		return 0;
 	}
 
@@ -799,7 +835,7 @@ static int mhi_sat_rpmsg_cb(struct rpmsg_device *rpdev, void *data, int len,
 
 	/* Inactive controller cannot process incoming commands */
 	if (unlikely(!MHI_SAT_ACTIVE(sat_cntrl))) {
-		MHI_SAT_ERR("Message for inactive controller!\n");
+		MSG_ERR("Message for inactive controller!\n");
 		return 0;
 	}
 
@@ -826,14 +862,14 @@ static void mhi_sat_rpmsg_remove(struct rpmsg_device *rpdev)
 	struct mhi_sat_subsys *subsys = dev_get_drvdata(&rpdev->dev);
 	struct mhi_sat_cntrl *sat_cntrl;
 	struct mhi_sat_device *sat_dev;
-	struct mhi_buf *buf, *tmp;
+	struct mhi_buf_extended *buf, *tmp;
 
-	MHI_SUBSYS_LOG("Enter\n");
+	MSG_SUBSYS_LOG("Enter\n");
 
 	/* unprepare each controller/device from transfer */
 	mutex_lock(&subsys->cntrl_mutex);
 	list_for_each_entry(sat_cntrl, &subsys->cntrl_list, node) {
-		async_synchronize_cookie(sat_cntrl->error_cookie + 1);
+		flush_work(&sat_cntrl->error_work);
 
 		spin_lock_irq(&sat_cntrl->state_lock);
 		/*
@@ -862,15 +898,24 @@ static void mhi_sat_rpmsg_remove(struct rpmsg_device *rpdev)
 
 		list_for_each_entry_safe(buf, tmp, &sat_cntrl->addr_map_list,
 					 node) {
-			dma_unmap_resource(sat_cntrl->mhi_cntrl->dev,
-					   buf->dma_addr, buf->len,
-					   DMA_BIDIRECTIONAL, 0);
+			struct device *parent_dev =
+				sat_cntrl->mhi_cntrl->mhi_dev->dev.parent;
+			if (buf->is_io) {
+				dma_unmap_resource(parent_dev, buf->dma_addr,
+						   buf->len,
+						   DMA_BIDIRECTIONAL, 0);
+			} else {
+				dma_unmap_single_attrs(parent_dev,
+						       buf->dma_addr, buf->len,
+						       DMA_BIDIRECTIONAL,
+						       DMA_ATTR_SKIP_CPU_SYNC);
+			}
 			list_del(&buf->node);
 			kfree(buf);
 		}
 		mutex_unlock(&sat_cntrl->list_mutex);
 
-		MHI_SAT_LOG("Removed RPMSG link\n");
+		MSG_LOG("Removed RPMSG link\n");
 	}
 	subsys->rpdev = NULL;
 	mutex_unlock(&subsys->cntrl_mutex);
@@ -895,7 +940,7 @@ static int mhi_sat_rpmsg_probe(struct rpmsg_device *rpdev)
 
 	mutex_lock(&subsys->cntrl_mutex);
 
-	MHI_SUBSYS_LOG("Received RPMSG probe\n");
+	MSG_SUBSYS_LOG("Received RPMSG probe\n");
 
 	dev_set_drvdata(&rpdev->dev, subsys);
 
@@ -928,9 +973,9 @@ static struct rpmsg_driver mhi_sat_rpmsg_driver = {
 };
 
 static void mhi_sat_dev_status_cb(struct mhi_device *mhi_dev,
-				  enum MHI_CB mhi_cb)
+				  enum mhi_callback mhi_cb)
 {
-	struct mhi_sat_device *sat_dev = mhi_device_get_devdata(mhi_dev);
+	struct mhi_sat_device *sat_dev = dev_get_drvdata(&mhi_dev->dev);
 	struct mhi_sat_cntrl *sat_cntrl = sat_dev->cntrl;
 	struct mhi_sat_subsys *subsys = sat_cntrl->subsys;
 	unsigned long flags;
@@ -938,15 +983,11 @@ static void mhi_sat_dev_status_cb(struct mhi_device *mhi_dev,
 	if (mhi_cb != MHI_CB_FATAL_ERROR)
 		return;
 
-	MHI_SAT_LOG("Device fatal error detected\n");
+	MSG_LOG("Device fatal error detected\n");
 	spin_lock_irqsave(&sat_cntrl->state_lock, flags);
 	if (MHI_SAT_ACTIVE(sat_cntrl)) {
-		sat_cntrl->error_cookie = async_schedule(mhi_sat_error_worker,
-							 sat_cntrl);
+		schedule_work(&sat_cntrl->error_work);
 		sat_cntrl->state = SAT_FATAL_DETECT;
-	} else {
-		/* rpmsg link down or HELLO not sent or an error occurred */
-		sat_cntrl->state = SAT_DISABLED;
 	}
 
 	spin_unlock_irqrestore(&sat_cntrl->state_lock, flags);
@@ -954,10 +995,10 @@ static void mhi_sat_dev_status_cb(struct mhi_device *mhi_dev,
 
 static void mhi_sat_dev_remove(struct mhi_device *mhi_dev)
 {
-	struct mhi_sat_device *sat_dev = mhi_device_get_devdata(mhi_dev);
+	struct mhi_sat_device *sat_dev = dev_get_drvdata(&mhi_dev->dev);
 	struct mhi_sat_cntrl *sat_cntrl = sat_dev->cntrl;
 	struct mhi_sat_subsys *subsys = sat_cntrl->subsys;
-	struct mhi_buf *buf, *tmp;
+	struct mhi_buf_extended *buf, *tmp;
 	bool send_sys_err = false;
 
 	/* remove device node from probed list */
@@ -969,7 +1010,7 @@ static void mhi_sat_dev_remove(struct mhi_device *mhi_dev)
 
 	mutex_lock(&subsys->cntrl_mutex);
 
-	async_synchronize_cookie(sat_cntrl->error_cookie + 1);
+	cancel_work_sync(&sat_cntrl->error_work);
 
 	/* send sys_err if first device is removed */
 	spin_lock_irq(&sat_cntrl->state_lock);
@@ -997,8 +1038,17 @@ static void mhi_sat_dev_remove(struct mhi_device *mhi_dev)
 	/* remove address mappings */
 	mutex_lock(&sat_cntrl->list_mutex);
 	list_for_each_entry_safe(buf, tmp, &sat_cntrl->addr_map_list, node) {
-		dma_unmap_resource(sat_cntrl->mhi_cntrl->dev, buf->dma_addr,
-				   buf->len, DMA_BIDIRECTIONAL, 0);
+		struct device *parent_dev =
+				sat_cntrl->mhi_cntrl->mhi_dev->dev.parent;
+		if (buf->is_io) {
+			dma_unmap_resource(parent_dev, buf->dma_addr, buf->len,
+					   DMA_BIDIRECTIONAL, 0);
+		} else {
+			dma_unmap_single_attrs(parent_dev, buf->dma_addr,
+					       buf->len, DMA_BIDIRECTIONAL,
+					       DMA_ATTR_SKIP_CPU_SYNC);
+		}
+
 		list_del(&buf->node);
 		kfree(buf);
 	}
@@ -1011,7 +1061,7 @@ static void mhi_sat_dev_remove(struct mhi_device *mhi_dev)
 
 	mutex_destroy(&sat_cntrl->cmd_wait_mutex);
 	mutex_destroy(&sat_cntrl->list_mutex);
-	MHI_SAT_LOG("Satellite controller node removed\n");
+	MSG_LOG("Satellite controller node removed\n");
 	kfree(sat_cntrl);
 
 	mutex_unlock(&subsys->cntrl_mutex);
@@ -1022,11 +1072,13 @@ static int mhi_sat_dev_probe(struct mhi_device *mhi_dev,
 {
 	struct mhi_sat_device *sat_dev;
 	struct mhi_sat_cntrl *sat_cntrl;
-	struct device_node *of_node = mhi_dev->dev.of_node;
 	struct mhi_sat_subsys *subsys = &mhi_sat_driver.subsys[id->driver_data];
-	u32 dev_id = MHI_SAT_CREATE_DEVICE_ID(mhi_dev->dev_id, mhi_dev->domain,
-					      mhi_dev->bus, mhi_dev->slot);
-	int ret;
+	u32 dev_id = mhi_controller_get_numeric_id(mhi_dev->mhi_cntrl);
+
+	if (!dev_id) {
+		pr_err("Satellite numeric ID not set by controller\n");
+		return -EINVAL;
+	}
 
 	/* find controller with unique device ID based on topology */
 	sat_cntrl = find_sat_cntrl_by_id(subsys, dev_id);
@@ -1036,7 +1088,7 @@ static int mhi_sat_dev_probe(struct mhi_device *mhi_dev,
 			return -ENOMEM;
 
 		/*
-		 * max_devices will be read from device tree node. Set it to
+		 * max_devices will be set once per device. Set it to
 		 * -1 before it is populated to avoid false positive when
 		 * RPMSG probe schedules connect worker but no device has
 		 * probed in which case num_devices and max_devices are both
@@ -1055,6 +1107,7 @@ static int mhi_sat_dev_probe(struct mhi_device *mhi_dev,
 		spin_lock_init(&sat_cntrl->state_lock);
 		INIT_WORK(&sat_cntrl->connect_work, mhi_sat_connect_worker);
 		INIT_WORK(&sat_cntrl->process_work, mhi_sat_process_worker);
+		INIT_WORK(&sat_cntrl->error_work, mhi_sat_error_worker);
 		INIT_LIST_HEAD(&sat_cntrl->dev_list);
 		INIT_LIST_HEAD(&sat_cntrl->addr_map_list);
 		INIT_LIST_HEAD(&sat_cntrl->packet_list);
@@ -1065,18 +1118,11 @@ static int mhi_sat_dev_probe(struct mhi_device *mhi_dev,
 		spin_unlock_irq(&subsys->cntrl_lock);
 		mutex_unlock(&subsys->cntrl_mutex);
 
-		MHI_SAT_LOG("Controller allocated for 0x%x\n", dev_id);
+		MSG_LOG("Controller allocated for 0x%x\n", dev_id);
 	}
 
 	/* set maximum devices for subsystem from device tree */
-	if (of_node) {
-		ret = of_property_read_u32(of_node, "mhi,max-devices",
-					   &sat_cntrl->max_devices);
-		if (ret) {
-			MHI_SAT_ERR("Could not find max-devices in DT node\n");
-			return -EINVAL;
-		}
-	}
+	sat_cntrl->max_devices = MHI_SAT_MAX_DEVICES;
 
 	/* get event ring base and max indexes */
 	sat_cntrl->er_base = min(sat_cntrl->er_base, mhi_dev->dl_event_id);
@@ -1093,7 +1139,7 @@ static int mhi_sat_dev_probe(struct mhi_device *mhi_dev,
 	list_add(&sat_dev->node, &sat_cntrl->dev_list);
 	mutex_unlock(&sat_cntrl->list_mutex);
 
-	mhi_device_set_devdata(mhi_dev, sat_dev);
+	dev_set_drvdata(&mhi_dev->dev, sat_dev);
 
 	sat_cntrl->num_devices++;
 
@@ -1102,7 +1148,7 @@ static int mhi_sat_dev_probe(struct mhi_device *mhi_dev,
 		/* number of event rings is 1 more than difference in IDs */
 		sat_cntrl->num_er = (sat_cntrl->er_max - sat_cntrl->er_base) +
 				     1;
-		MHI_SAT_LOG("All satellite channels probed!\n");
+		MSG_LOG("All satellite channels probed!\n");
 		schedule_work(&sat_cntrl->connect_work);
 	}
 
@@ -1111,28 +1157,10 @@ static int mhi_sat_dev_probe(struct mhi_device *mhi_dev,
 
 /* .driver_data stores subsys id */
 static const struct mhi_device_id mhi_sat_dev_match_table[] = {
-	/* ADSP */
 	{ .chan = "ADSP_0", .driver_data = SUBSYS_ADSP },
 	{ .chan = "ADSP_1", .driver_data = SUBSYS_ADSP },
 	{ .chan = "ADSP_2", .driver_data = SUBSYS_ADSP },
 	{ .chan = "ADSP_3", .driver_data = SUBSYS_ADSP },
-	{ .chan = "ADSP_4", .driver_data = SUBSYS_ADSP },
-	{ .chan = "ADSP_5", .driver_data = SUBSYS_ADSP },
-	{ .chan = "ADSP_6", .driver_data = SUBSYS_ADSP },
-	{ .chan = "ADSP_7", .driver_data = SUBSYS_ADSP },
-	{ .chan = "ADSP_8", .driver_data = SUBSYS_ADSP },
-	{ .chan = "ADSP_9", .driver_data = SUBSYS_ADSP },
-	/* SLPI */
-	{ .chan = "SLPI_0", .driver_data = SUBSYS_SLPI },
-	{ .chan = "SLPI_1", .driver_data = SUBSYS_SLPI },
-	{ .chan = "SLPI_2", .driver_data = SUBSYS_SLPI },
-	{ .chan = "SLPI_3", .driver_data = SUBSYS_SLPI },
-	{ .chan = "SLPI_4", .driver_data = SUBSYS_SLPI },
-	{ .chan = "SLPI_5", .driver_data = SUBSYS_SLPI },
-	{ .chan = "SLPI_6", .driver_data = SUBSYS_SLPI },
-	{ .chan = "SLPI_7", .driver_data = SUBSYS_SLPI },
-	{ .chan = "SLPI_8", .driver_data = SUBSYS_SLPI },
-	{ .chan = "SLPI_9", .driver_data = SUBSYS_SLPI },
 	{},
 };
 
@@ -1158,8 +1186,6 @@ static int mhi_sat_init(void)
 
 	mhi_sat_driver.subsys = subsys;
 	mhi_sat_driver.num_subsys = SUBSYS_MAX;
-	mhi_sat_driver.klog_lvl = KLOG_LVL;
-	mhi_sat_driver.ipc_log_lvl = IPC_LOG_LVL;
 
 	for (i = 0; i < mhi_sat_driver.num_subsys; i++, subsys++) {
 		char log[32];
@@ -1215,6 +1241,6 @@ static void __exit mhi_sat_exit(void)
 }
 module_exit(mhi_sat_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_ALIAS("MHI_SATELLITE");
 MODULE_DESCRIPTION("MHI SATELLITE DRIVER");

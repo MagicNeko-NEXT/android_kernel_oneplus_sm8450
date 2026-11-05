@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2016-2018, 2020 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/module.h>
@@ -18,6 +18,7 @@
 #include <linux/seq_file.h>
 #include <linux/sched.h>
 #include <linux/wait.h>
+
 #include "usbpd.h"
 
 #define USB_PDPHY_MAX_DATA_OBJ_LEN	28
@@ -338,7 +339,7 @@ int pd_phy_update_roles(enum data_role dr, enum power_role pr)
 		((dr == DR_DFP ? MSG_CONFIG_PORT_DATA_ROLE : 0) |
 		 (pr == PR_SRC ? MSG_CONFIG_PORT_POWER_ROLE : 0)));
 }
-EXPORT_SYMBOL(pd_phy_update_roles);
+EXPORT_SYMBOL_GPL(pd_phy_update_roles);
 
 int pd_phy_update_frame_filter(u8 frame_filter_val)
 {
@@ -346,7 +347,7 @@ int pd_phy_update_frame_filter(u8 frame_filter_val)
 
 	return pdphy_reg_write(pdphy, USB_PDPHY_FRAME_FILTER, frame_filter_val);
 }
-EXPORT_SYMBOL(pd_phy_update_frame_filter);
+EXPORT_SYMBOL_GPL(pd_phy_update_frame_filter);
 
 int pd_phy_open(struct pd_phy_params *params)
 {
@@ -412,7 +413,7 @@ int pd_phy_open(struct pd_phy_params *params)
 
 	return ret;
 }
-EXPORT_SYMBOL(pd_phy_open);
+EXPORT_SYMBOL_GPL(pd_phy_open);
 
 int pd_phy_signal(enum pd_sig_type sig)
 {
@@ -466,7 +467,7 @@ int pd_phy_signal(enum pd_sig_type sig)
 
 	return 0;
 }
-EXPORT_SYMBOL(pd_phy_signal);
+EXPORT_SYMBOL_GPL(pd_phy_signal);
 
 int pd_phy_write(u16 hdr, const u8 *data, size_t data_len, enum pd_sop_type sop)
 {
@@ -562,7 +563,7 @@ int pd_phy_write(u16 hdr, const u8 *data, size_t data_len, enum pd_sop_type sop)
 
 	return pdphy->tx_status ? pdphy->tx_status : 0;
 }
-EXPORT_SYMBOL(pd_phy_write);
+EXPORT_SYMBOL_GPL(pd_phy_write);
 
 void pd_phy_close(void)
 {
@@ -599,7 +600,7 @@ void pd_phy_close(void)
 
 	pdphy_enable_power(pdphy, false);
 }
-EXPORT_SYMBOL(pd_phy_close);
+EXPORT_SYMBOL_GPL(pd_phy_close);
 
 struct pd_phy_ops pdphy_ops = {
 	.open			= pd_phy_open,
@@ -934,5 +935,5 @@ static struct platform_driver pdphy_driver = {
 module_platform_driver(pdphy_driver);
 
 MODULE_DESCRIPTION("QPNP PD PHY Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_ALIAS("platform:qpnp-pdphy");

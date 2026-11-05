@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/kernel.h>
@@ -24,26 +25,29 @@
 #include <linux/clk.h>
 #include <linux/workqueue.h>
 #include <linux/power_supply.h>
-#include <linux/qcom_scm.h>
+#include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/delay.h>
 
 #define EUD_ENABLE_CMD 1
 #define EUD_DISABLE_CMD 0
 
-#define EUD_REG_COM_TX_ID	0x0000
-#define EUD_REG_COM_TX_LEN	0x0004
-#define EUD_REG_COM_TX_DAT	0x0008
-#define EUD_REG_COM_RX_ID	0x000C
-#define EUD_REG_COM_RX_LEN	0x0010
-#define EUD_REG_COM_RX_DAT	0x0014
-#define EUD_REG_EUD_EN2		0x0000
-#define EUD_REG_INT1_EN_MASK	0x0024
-#define EUD_REG_INT_STATUS_1	0x0044
-#define EUD_REG_CTL_OUT_1	0x0074
-#define EUD_REG_VBUS_INT_CLR	0x0080
-#define EUD_REG_CHGR_INT_CLR	0x0084
-#define EUD_REG_CSR_EUD_EN	0x1014
-#define EUD_REG_SW_ATTACH_DET	0x1018
+#define EUD_REG_COM_TX_ID		0x0000
+#define EUD_REG_COM_TX_LEN		0x0004
+#define EUD_REG_COM_TX_DAT		0x0008
+#define EUD_REG_COM_RX_ID		0x000C
+#define EUD_REG_COM_RX_LEN		0x0010
+#define EUD_REG_COM_RX_DAT		0x0014
+#define EUD_REG_EUD_EN2			0x0000
+#define EUD_REG_INT1_EN_MASK		0x0024
+#define EUD_REG_INT_STATUS_1		0x0044
+#define EUD_REG_CTL_OUT_1		0x0074
+#define EUD_REG_VBUS_INT_CLR		0x0080
+#define EUD_REG_CHGR_INT_CLR		0x0084
+#define EUD_REG_CSR_EUD_EN		0x1014
+#define EUD_REG_SW_ATTACH_DET		0x1018
+#define EUD_REG_UTMI_DELAY_LSB		0x1030
+#define EUD_REG_UTMI_DELAY_MSB		0x1034
+#define EUD_CHIKNBIT_EN_DEL_CNTR	0x118C
 
 #define EUD_INT_RX		BIT(0)
 #define EUD_INT_TX		BIT(1)
@@ -58,6 +62,8 @@
 #define EUD_CONSOLE		NULL
 #define UART_ID			0x90
 #define MAX_FIFO_SIZE		14
+#define EUD_UTMI_DELAY_MASK	0xff
+#define EUD_UTMI_DELAY_MIN	28
 
 #define PORT_EUD_UART		300
 
@@ -81,6 +87,8 @@ struct eud_chip {
 	struct clk			*eud_ahb2phy_clk;
 	struct clk			*eud_clkref_clk;
 	bool				eud_clkref_enabled;
+	bool				eud_enabled;
+	u16				utmi_switch_delay;
 };
 
 static const unsigned int eud_extcon_cable[] = {
@@ -118,11 +126,13 @@ static int msm_eud_clkref_en(struct eud_chip *chip, bool enable)
 	return 0;
 }
 
-static inline void msm_eud_enable_irqs(struct eud_chip *chip)
+static void msm_eud_enable_irqs(struct eud_chip *chip)
 {
 	/* Enable vbus, chgr & safe mode warning interrupts */
 	writel_relaxed(EUD_INT_VBUS | EUD_INT_CHGR | EUD_INT_SAFE_MODE,
 			chip->eud_reg_base + EUD_REG_INT1_EN_MASK);
+	/* Ensure Register Writes Complete */
+	wmb();
 }
 
 static int msm_eud_hw_is_enabled(struct platform_device *pdev)
@@ -146,6 +156,20 @@ static int msm_eud_hw_is_enabled(struct platform_device *pdev)
 	return readl_relaxed(chip->eud_reg_base + EUD_REG_CSR_EUD_EN) & BIT(0);
 }
 
+static int set_eud_utmi_switch_delay(struct eud_chip *chip)
+{
+	u8 val;
+
+	if (chip->utmi_switch_delay) {
+		val = (chip->utmi_switch_delay >> 8) & EUD_UTMI_DELAY_MASK;
+		writew_relaxed(val, chip->eud_reg_base + EUD_REG_UTMI_DELAY_MSB);
+		val = chip->utmi_switch_delay & EUD_UTMI_DELAY_MASK;
+		writew_relaxed(val, chip->eud_reg_base + EUD_REG_UTMI_DELAY_LSB);
+	}
+
+	return 0;
+}
+
 static int check_eud_mode_mgr2(struct eud_chip *chip)
 {
 	u32 val;
@@ -159,6 +183,10 @@ static void enable_eud(struct platform_device *pdev)
 	struct eud_chip *priv = platform_get_drvdata(pdev);
 	int ret;
 
+	/* No need to notify USB and modify EUD CSR if already enabled */
+	if (priv->eud_enabled)
+		return;
+
 	/*
 	 * Set the default cable state to usb connect and charger
 	 * enable
@@ -170,7 +198,7 @@ static void enable_eud(struct platform_device *pdev)
 	extcon_set_state_sync(priv->extcon, EXTCON_USB, false);
 
 	msm_eud_clkref_en(priv, true);
-
+	set_eud_utmi_switch_delay(priv);
 	/* write into CSR to enable EUD */
 	writel_relaxed(BIT(0), priv->eud_reg_base + EUD_REG_CSR_EUD_EN);
 
@@ -192,6 +220,8 @@ static void enable_eud(struct platform_device *pdev)
 	/* perform spoof connect as recommended */
 	extcon_set_state_sync(priv->extcon, EXTCON_USB, true);
 	extcon_set_state_sync(priv->extcon, EXTCON_CHG_USB_SDP, true);
+	priv->eud_enabled = true;
+
 	dev_dbg(&pdev->dev, "%s: EUD is Enabled\n", __func__);
 }
 
@@ -199,6 +229,9 @@ static void disable_eud(struct platform_device *pdev)
 {
 	struct eud_chip *priv = platform_get_drvdata(pdev);
 	int ret;
+
+	if (!priv->eud_enabled)
+		return;
 
 	/* indicate that the eud enable is due to the module param */
 	extcon_set_state(priv->extcon, EXTCON_JIG, false);
@@ -223,6 +256,8 @@ static void disable_eud(struct platform_device *pdev)
 	usleep_range(50, 100);
 	/* perform spoof connect as recommended */
 	extcon_set_state_sync(priv->extcon, EXTCON_USB, true);
+	priv->eud_enabled = false;
+
 	dev_dbg(&pdev->dev, "%s: EUD Disabled!\n", __func__);
 }
 
@@ -386,7 +421,7 @@ static unsigned int eud_get_mctrl(struct uart_port *port)
 }
 
 static void eud_set_termios(struct uart_port *port, struct ktermios *new,
-				struct ktermios *old)
+				const struct ktermios *old)
 {
 	/* Nothing to do here, but to satisfy the serial core */
 }
@@ -394,7 +429,7 @@ static void eud_set_termios(struct uart_port *port, struct ktermios *new,
 static void eud_stop_tx(struct uart_port *port)
 {
 	/* Disable Tx interrupt */
-	writel_relaxed(~EUD_INT_TX, port->membase + EUD_REG_INT_STATUS_1);
+	writel_relaxed((__force u32)~EUD_INT_TX, port->membase + EUD_REG_INT_STATUS_1);
 	/* Ensure Register Writes Complete */
 	wmb();
 }
@@ -410,7 +445,7 @@ static void eud_start_tx(struct uart_port *port)
 static void eud_stop_rx(struct uart_port *port)
 {
 	/* Disable Rx interrupt */
-	writel_relaxed(~EUD_INT_RX, port->membase + EUD_REG_INT_STATUS_1);
+	writel_relaxed((__force u32)~EUD_INT_RX, port->membase + EUD_REG_INT_STATUS_1);
 	/* Ensure Register Writes Complete */
 	wmb();
 }
@@ -427,7 +462,7 @@ static int eud_startup(struct uart_port *port)
 static void eud_shutdown(struct uart_port *port)
 {
 	/* Disable both Tx & Rx interrupts */
-	writel_relaxed(~EUD_INT_TX | ~EUD_INT_RX,
+	writel_relaxed((__force u32)(~EUD_INT_TX | ~EUD_INT_RX),
 			port->membase + EUD_REG_INT_STATUS_1);
 	/* Ensure Register Writes Complete */
 	wmb();
@@ -453,7 +488,7 @@ static void eud_config_port(struct uart_port *port, int flags)
 {
 	/* set port type, clear Tx and Rx interrupts */
 	port->type = PORT_EUD_UART;
-	writel_relaxed(~EUD_INT_TX | ~EUD_INT_RX,
+	writel_relaxed((__force u32)(~EUD_INT_TX | ~EUD_INT_RX),
 			port->membase + EUD_REG_INT_STATUS_1);
 	/* Ensure Register Writes Complete */
 	wmb();
@@ -714,6 +749,16 @@ static int msm_eud_probe(struct platform_device *pdev)
 		goto error;
 	}
 
+	ret = of_property_read_u16(pdev->dev.of_node, "qcom,eud-utmi-delay",
+					&chip->utmi_switch_delay);
+	if (ret || (chip->utmi_switch_delay < EUD_UTMI_DELAY_MIN))
+		/*
+		 * Leave default POR value if not defined.  According to
+		 * EUD team, a zero value written to the UTMI SWITCH delay
+		 * register is not valid.  Requires a minimum value of 28.
+		 */
+		chip->utmi_switch_delay = 0;
+
 	device_init_wakeup(&pdev->dev, true);
 	enable_irq_wake(chip->eud_irq);
 
@@ -769,6 +814,14 @@ static int msm_eud_probe(struct platform_device *pdev)
 	eud_private = pdev;
 	eud_ready = true;
 
+	/*
+	 * Set the chicken bit register to delay EUD enablement.
+	 * REVISIT: Need more understanding about this register.
+	 */
+	writel_relaxed(1, chip->eud_reg_base + EUD_CHIKNBIT_EN_DEL_CNTR);
+	/* Ensure Register Writes Complete */
+	wmb();
+
 	/* Proceed enable other EUD elements if bootloader has enabled it */
 	if (msm_eud_hw_is_enabled(pdev)) {
 		/*
@@ -777,6 +830,8 @@ static int msm_eud_probe(struct platform_device *pdev)
 		 * count if we disable EUD from the module param.
 		 */
 		msm_eud_clkref_en(chip, true);
+
+		set_eud_utmi_switch_delay(chip);
 
 		msm_eud_enable_irqs(chip);
 
@@ -796,6 +851,7 @@ static int msm_eud_probe(struct platform_device *pdev)
 				"Failed to set EXTCON_CHG_USB_SDP (%d)\n", ret);
 
 		enable = EUD_ENABLE_CMD;
+		chip->eud_enabled = true;
 	}
 
 	return 0;
@@ -874,4 +930,4 @@ static void __exit msm_eud_exit(void)
 module_exit(msm_eud_exit);
 
 MODULE_DESCRIPTION("QTI EUD driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2017-2018, 2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt)	"PBS: %s: " fmt, __func__
@@ -369,6 +369,7 @@ static const struct of_device_id qpnp_pbs_match_table[] = {
 	{ .compatible = QPNP_PBS_DEV_NAME },
 	{}
 };
+MODULE_DEVICE_TABLE(of, qpnp_pbs_match_table);
 
 static struct platform_driver qpnp_pbs_driver = {
 	.driver	= {
@@ -377,19 +378,8 @@ static struct platform_driver qpnp_pbs_driver = {
 	},
 	.probe	= qpnp_pbs_probe,
 };
-
-static int __init qpnp_pbs_init(void)
-{
-	return platform_driver_register(&qpnp_pbs_driver);
-}
-arch_initcall(qpnp_pbs_init);
-
-static void __exit qpnp_pbs_exit(void)
-{
-	return platform_driver_unregister(&qpnp_pbs_driver);
-}
-module_exit(qpnp_pbs_exit);
+module_platform_driver(qpnp_pbs_driver);
 
 MODULE_DESCRIPTION("QPNP PBS DRIVER");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_ALIAS("platform:" QPNP_PBS_DEV_NAME);

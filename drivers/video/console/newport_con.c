@@ -324,7 +324,7 @@ out_unmap:
 	return NULL;
 }
 
-static void newport_init(struct vc_data *vc, int init)
+static void newport_init(struct vc_data *vc, bool init)
 {
 	int cols, rows;
 
@@ -346,12 +346,12 @@ static void newport_deinit(struct vc_data *c)
 	}
 }
 
-static void newport_clear(struct vc_data *vc, int sy, int sx, int height,
-			  int width)
+static void newport_clear(struct vc_data *vc, unsigned int sy, unsigned int sx,
+			  unsigned int width)
 {
 	int xend = ((sx + width) << 3) - 1;
 	int ystart = ((sy << 4) + topscan) & 0x3ff;
-	int yend = (((sy + height) << 4) + topscan - 1) & 0x3ff;
+	int yend = (((sy + 1) << 4) + topscan - 1) & 0x3ff;
 
 	if (logo_active)
 		return;
@@ -462,7 +462,7 @@ static void newport_cursor(struct vc_data *vc, int mode)
 	}
 }
 
-static int newport_switch(struct vc_data *vc)
+static bool newport_switch(struct vc_data *vc)
 {
 	static int logo_drawn = 0;
 
@@ -476,7 +476,7 @@ static int newport_switch(struct vc_data *vc)
 		}
 	}
 
-	return 1;
+	return true;
 }
 
 static int newport_blank(struct vc_data *c, int blank, int mode_switch)
@@ -497,7 +497,7 @@ static int newport_blank(struct vc_data *c, int blank, int mode_switch)
 	return 1;
 }
 
-static int newport_set_font(int unit, struct console_font *op)
+static int newport_set_font(int unit, struct console_font *op, unsigned int vpitch)
 {
 	int w = op->width;
 	int h = op->height;
@@ -507,7 +507,7 @@ static int newport_set_font(int unit, struct console_font *op)
 
 	/* ladis: when I grow up, there will be a day... and more sizes will
 	 * be supported ;-) */
-	if ((w != 8) || (h != 16)
+	if ((w != 8) || (h != 16) || (vpitch != 32)
 	    || (op->charcount != 256 && op->charcount != 512))
 		return -EINVAL;
 
@@ -569,9 +569,10 @@ static int newport_font_default(struct vc_data *vc, struct console_font *op, cha
 	return newport_set_def_font(vc->vc_num, op);
 }
 
-static int newport_font_set(struct vc_data *vc, struct console_font *font, unsigned flags)
+static int newport_font_set(struct vc_data *vc, struct console_font *font,
+			    unsigned int vpitch, unsigned int flags)
 {
-	return newport_set_font(vc->vc_num, font);
+	return newport_set_font(vc->vc_num, font, vpitch);
 }
 
 static bool newport_scroll(struct vc_data *vc, unsigned int t, unsigned int b,
