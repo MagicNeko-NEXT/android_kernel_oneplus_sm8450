@@ -25,6 +25,7 @@ override c_flags = $(UAPI_CFLAGS) -Wp,-MMD,$(depfile) -I $(obj) -I $(srctree)/us
 # Sorted alphabetically.
 no-header-test += asm/ucontext.h
 no-header-test += drm/vmwgfx_drm.h
+no-header-test += display/media/msm_sde_rotator.h
 no-header-test += linux/am437x-vpfe.h
 no-header-test += linux/coda.h
 no-header-test += linux/cyclades.h
