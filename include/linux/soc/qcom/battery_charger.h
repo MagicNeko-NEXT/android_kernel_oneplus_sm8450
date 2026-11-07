@@ -34,12 +34,18 @@ qti_battery_charger_get_prop(const char *name,
 	return -EINVAL;
 }
 
+#if IS_ENABLED(CONFIG_OPLUS_SM8450_CHARGER)
+/* The OPlus charger driver provides this when it replaces the QTI one. */
+int qti_battery_charger_set_prop(const char *name,
+				enum battery_charger_prop prop_id, int val);
+#else
 static inline int
 qti_battery_charger_set_prop(const char *name,
 				enum battery_charger_prop prop_id, int val)
 {
 	return -EINVAL;
 }
+#endif
 
 static inline int register_hboost_event_notifier(struct notifier_block *nb)
 {
