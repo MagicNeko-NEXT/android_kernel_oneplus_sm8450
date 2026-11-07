@@ -1,49 +1,13 @@
 # SPDX-License-Identifier: GPL-2.0-only
-config OPLUS_BRINGUP_SPLASH_MARKERS
-	bool "Draw boot-stage colour markers into the bootloader splash framebuffer"
+config OPLUS_BRINGUP_STAGE_RESET
+	bool "Reboot at a configurable kernel boot stage for bring-up bisection"
 	depends on ARM64
-	select ARCH_USE_MEMREMAP_PROT
 	default n
 	help
-	  Paint horizontal colour bands and a stage record directly into the
-	  bootloader's contiguous splash framebuffer at seven kernel boot
-	  stages. Each stage draws its own band without clearing earlier
-	  bands, showing how far the kernel gets on devices without UART or
-	  working display drivers.
-
-if OPLUS_BRINGUP_SPLASH_MARKERS
-
-config OPLUS_BRINGUP_SPLASH_PHYS_ADDR
-	hex "Splash framebuffer physical base address"
-	default 0xb8000000
-	help
-	  Physical base address of the bootloader splash region. Must be
-	  marked no-map in the device tree so arm64 ioremap_wc() permits
-	  mapping it outside the linear map.
-
-config OPLUS_BRINGUP_SPLASH_SIZE
-	hex "Splash framebuffer reserved size in bytes"
-	default 0x02b00000
-	help
-	  Total reserved size of the splash region in bytes.
-
-config OPLUS_BRINGUP_SPLASH_WIDTH
-	int "Splash framebuffer width in pixels"
-	default 1080
-	help
-	  Active horizontal resolution of the splash framebuffer in pixels.
-
-config OPLUS_BRINGUP_SPLASH_HEIGHT
-	int "Splash framebuffer height in pixels"
-	default 2412
-	help
-	  Active vertical resolution of the splash framebuffer in pixels.
-
-config OPLUS_BRINGUP_SPLASH_STRIDE
-	int "Splash framebuffer row stride in bytes"
-	default 4320
-	help
-	  Number of bytes per scanline in the splash framebuffer (4 bytes per
-	  a8r8g8b8 pixel).
-
-endif # OPLUS_BRINGUP_SPLASH_MARKERS
+	  Trigger an immediate warm PSCI system reset when the kernel reaches
+	  the boot stage selected by the "bringup.reset_at=<N>" early kernel
+	  command-line parameter (1..9; 0 or omitted disables the reset).
+	  Each stage reached is also logged at KERN_EMERG for pstore/ramoops
+	  capture. Use this on command-mode DSI panels without UART or working
+	  USB to bisect early boot hangs by observing whether the device
+	  reboots.

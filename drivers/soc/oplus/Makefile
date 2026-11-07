@@ -22,4 +22,4 @@ obj-y += dft/
 obj-$(CONFIG_OPLUS_FEATURE_MDMFEATURE)     += mdmfeature/
 #endif /*OPLUS_FEATURE_MDMFEATURE*/
 
-obj-$(CONFIG_OPLUS_BRINGUP_SPLASH_MARKERS) += bringup/
+obj-$(CONFIG_OPLUS_BRINGUP_STAGE_RESET) += bringup/

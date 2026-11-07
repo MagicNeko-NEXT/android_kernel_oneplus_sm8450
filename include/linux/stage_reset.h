@@ -1,0 +1,26 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+#ifndef _LINUX_STAGE_RESET_H
+#define _LINUX_STAGE_RESET_H
+
+enum oplus_bringup_stage {
+	OPLUS_BRINGUP_STAGE_EARLY_PARAM = 1,
+	OPLUS_BRINGUP_STAGE_POST_PSCI = 2,
+	OPLUS_BRINGUP_STAGE_SETUP_ARCH_DONE = 3,
+	OPLUS_BRINGUP_STAGE_MM_CORE_DONE = 4,
+	OPLUS_BRINGUP_STAGE_IRQ_TIME_READY = 5,
+	OPLUS_BRINGUP_STAGE_REST_INIT = 6,
+	OPLUS_BRINGUP_STAGE_PRE_BASIC_SETUP = 7,
+	OPLUS_BRINGUP_STAGE_POST_BASIC_SETUP = 8,
+	OPLUS_BRINGUP_STAGE_PRE_INIT_PROC = 9,
+	OPLUS_BRINGUP_STAGE_MAX = OPLUS_BRINGUP_STAGE_PRE_INIT_PROC,
+};
+
+#ifdef CONFIG_OPLUS_BRINGUP_STAGE_RESET
+void oplus_bringup_stage_reset(enum oplus_bringup_stage stage);
+#else
+static inline void oplus_bringup_stage_reset(enum oplus_bringup_stage stage)
+{
+}
+#endif
+
+#endif /* _LINUX_STAGE_RESET_H */
