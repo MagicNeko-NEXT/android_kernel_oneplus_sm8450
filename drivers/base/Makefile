@@ -35,3 +35,4 @@ ccflags-$(CONFIG_DEBUG_DRIVER) := -DDEBUG
 CFLAGS_trace.o		:= -I$(src)
 obj-$(CONFIG_TRACING)	+= trace.o
 obj-$(CONFIG_TOUCHPANEL_NOTIFY) += touchpanel_notify/
+obj-$(CONFIG_OPLUS_FW_UPDATE) += kernelFwUpdate/

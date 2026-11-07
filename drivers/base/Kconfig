@@ -244,4 +244,6 @@ config FW_DEVLINK_SYNC_STATE_TIMEOUT
 
 source "drivers/base/touchpanel_notify/Kconfig"
 
+source "drivers/base/kernelFwUpdate/Kconfig"
+
 endmenu
