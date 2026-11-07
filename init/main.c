@@ -101,6 +101,7 @@
 #include <linux/init_syscalls.h>
 #include <linux/stackdepot.h>
 #include <linux/randomize_kstack.h>
+#include <linux/splash_markers.h>
 #include <net/net_namespace.h>
 
 #include <asm/io.h>
@@ -701,6 +702,7 @@ noinline void __ref __noreturn rest_init(void)
 	struct task_struct *tsk;
 	int pid;
 
+	oplus_splash_mark_stage(OPLUS_SPLASH_STAGE_REST_INIT);
 	rcu_scheduler_starting();
 	/*
 	 * We need to spawn init first so that it obtains pid 1, however
@@ -1068,6 +1070,7 @@ void start_kernel(void)
 	sort_main_extable();
 	trap_init();
 	mm_core_init();
+	oplus_splash_mark_stage(OPLUS_SPLASH_STAGE_MM_CORE_DONE);
 	poking_init();
 	ftrace_init();
 
@@ -1602,6 +1605,7 @@ static int __ref kernel_init(void *unused)
 
 	do_sysctl_args();
 
+	oplus_splash_mark_stage(OPLUS_SPLASH_STAGE_PRE_INIT_PROC);
 	if (ramdisk_execute_command) {
 		ret = run_init_process(ramdisk_execute_command);
 		if (!ret)
@@ -1687,7 +1691,9 @@ static noinline void __init kernel_init_freeable(void)
 	padata_init();
 	page_alloc_init_late();
 
+	oplus_splash_mark_stage(OPLUS_SPLASH_STAGE_PRE_BASIC_SETUP);
 	do_basic_setup();
+	oplus_splash_mark_stage(OPLUS_SPLASH_STAGE_POST_BASIC_SETUP);
 
 	kunit_run_all_tests();
 

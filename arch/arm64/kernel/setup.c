@@ -32,6 +32,7 @@
 #include <linux/sched/task.h>
 #include <linux/scs.h>
 #include <linux/mm.h>
+#include <linux/splash_markers.h>
 
 #include <asm/acpi.h>
 #include <asm/fixmap.h>
@@ -314,6 +315,7 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 
 	early_fixmap_init();
 	early_ioremap_init();
+	oplus_splash_mark_stage(OPLUS_SPLASH_STAGE_EARLY_IOREMAP);
 
 	setup_machine_fdt(__fdt_pointer);
 
@@ -393,6 +395,7 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 			"This indicates a broken bootloader or old kernel\n",
 			boot_args[1], boot_args[2], boot_args[3]);
 	}
+	oplus_splash_mark_stage(OPLUS_SPLASH_STAGE_SETUP_ARCH_DONE);
 }
 
 static inline bool cpu_can_disable(unsigned int cpu)

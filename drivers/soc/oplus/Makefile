@@ -21,3 +21,5 @@ obj-y += dft/
 #ifdef OPLUS_FEATURE_MDMFEATURE
 obj-$(CONFIG_OPLUS_FEATURE_MDMFEATURE)     += mdmfeature/
 #endif /*OPLUS_FEATURE_MDMFEATURE*/
+
+obj-$(CONFIG_OPLUS_BRINGUP_SPLASH_MARKERS) += bringup/
