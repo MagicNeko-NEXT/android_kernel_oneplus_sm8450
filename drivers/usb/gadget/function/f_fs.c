@@ -362,7 +362,7 @@ static ssize_t ffs_ep0_write(struct file *file, const char __user *buf,
 
 		/* Handle data */
 		if (ffs->state == FFS_READ_DESCRIPTORS) {
-			pr_info("read descriptors\n");
+			pr_debug("read descriptors\n");
 			ret = __ffs_data_got_descs(ffs, data, len);
 			if (ret < 0)
 				break;
@@ -370,7 +370,7 @@ static ssize_t ffs_ep0_write(struct file *file, const char __user *buf,
 			ffs->state = FFS_READ_STRINGS;
 			ret = len;
 		} else {
-			pr_info("read strings\n");
+			pr_debug("read strings\n");
 			ret = __ffs_data_got_strings(ffs, data, len);
 			if (ret < 0)
 				break;
@@ -2234,7 +2234,7 @@ static int __ffs_do_os_desc_header(enum ffs_os_desc_type *next_type,
 	u16 w_index = le16_to_cpu(desc->wIndex);
 
 	if (bcd_version == 0x1) {
-		pr_warn("bcdVersion must be 0x0100, stored in Little Endian order. "
+		pr_debug("bcdVersion must be 0x0100, stored in Little Endian order. "
 			"Userspace driver should be fixed, accepting 0x0001 for compatibility.\n");
 	} else if (bcd_version != 0x100) {
 		pr_vdebug("unsupported os descriptors version: 0x%x\n",
