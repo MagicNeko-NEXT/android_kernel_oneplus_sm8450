@@ -4,6 +4,7 @@
  */
 
 #include <linux/debugfs.h>
+#include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/i2c.h>
 #include <linux/gpio/consumer.h>
@@ -92,12 +93,17 @@ static const struct regmap_config eusb2_i2c_regmap = {
 
 static int eusb2_i2c_read_reg(struct eusb2_repeater *er, u8 reg, u8 *val)
 {
-	int ret;
+	int ret, retry;
 	unsigned int reg_val;
 
-	ret = regmap_read(er->regmap, reg, &reg_val);
+	for (retry = 0; retry < 5; retry++) {
+		ret = regmap_read(er->regmap, reg, &reg_val);
+		if (!ret)
+			break;
+		usleep_range(2000, 5000);
+	}
 	if (ret < 0) {
-		dev_err(er->dev, "Failed to read reg:0x%02x ret=%d\n", reg, ret);
+		dev_warn(er->dev, "Failed to read reg:0x%02x ret=%d\n", reg, ret);
 		return ret;
 	}
 
@@ -109,9 +115,14 @@ static int eusb2_i2c_read_reg(struct eusb2_repeater *er, u8 reg, u8 *val)
 
 static int eusb2_i2c_write_reg(struct eusb2_repeater *er, u8 reg, u8 val)
 {
-	int ret;
+	int ret, retry;
 
-	ret = regmap_write(er->regmap, reg, val);
+	for (retry = 0; retry < 5; retry++) {
+		ret = regmap_write(er->regmap, reg, val);
+		if (!ret)
+			break;
+		usleep_range(2000, 5000);
+	}
 	if (ret < 0) {
 		dev_err(er->dev, "failed to write 0x%02x to reg: 0x%02x ret=%d\n", val, reg, ret);
 		return ret;
@@ -164,6 +175,7 @@ static int eusb2_repeater_power(struct eusb2_repeater *er, bool on)
 	}
 
 	er->power_enabled = true;
+	usleep_range(2000, 5000);
 	pr_debug("%s(): eUSB2 repeater egulators are turned ON.\n", __func__);
 	return ret;
 }
@@ -173,13 +185,16 @@ static int eusb2_repeater_init(struct usb_repeater *ur)
 	struct eusb2_repeater *er =
 			container_of(ur, struct eusb2_repeater, ur);
 	const struct i2c_repeater_chip *chip = er->chip;
-	u8 reg_val;
+	u8 reg_val = 0;
+	int ret;
+
+	usleep_range(2000, 5000);
 
 	switch (chip->repeater_type) {
 	case TI_REPEATER:
-		eusb2_i2c_read_reg(er, REV_ID, &reg_val);
+		ret = eusb2_i2c_read_reg(er, REV_ID, &reg_val);
 		/* If the repeater revision is B1 disable auto-resume WA */
-		if (reg_val == 0x03)
+		if (!ret && reg_val == 0x03)
 			ur->flags |= UR_AUTO_RESUME_SUPPORTED;
 		break;
 	case NXP_REPEATER:
@@ -190,14 +205,14 @@ static int eusb2_repeater_init(struct usb_repeater *ur)
 		return -EINVAL;
 	}
 
-	dev_dbg(er->ur.dev, "eUSB2 repeater version = 0x%x ur->flags:0x%x\n", reg_val, ur->flags);
+	dev_info(er->ur.dev, "eUSB2 repeater version = 0x%x ur->flags:0x%x\n", reg_val, ur->flags);
 
 	/* override init sequence using devicetree based values */
 	if (er->param_override_seq_cnt)
 		eusb2_repeater_update_seq(er, er->param_override_seq,
 					er->param_override_seq_cnt);
 
-	dev_dbg(er->ur.dev, "eUSB2 repeater init\n");
+	dev_info(er->ur.dev, "eUSB2 repeater init\n");
 
 	return 0;
 }
@@ -209,7 +224,14 @@ static int eusb2_repeater_reset(struct usb_repeater *ur, bool bring_out_of_reset
 
 	dev_dbg(ur->dev, "reset gpio:%s\n",
 			bring_out_of_reset ? "assert" : "deassert");
-	gpiod_set_value_cansleep(er->reset_gpiod, bring_out_of_reset);
+	if (bring_out_of_reset) {
+		gpiod_set_value_cansleep(er->reset_gpiod, 0);
+		usleep_range(2000, 3000);
+		gpiod_set_value_cansleep(er->reset_gpiod, 1);
+		usleep_range(5000, 10000);
+	} else {
+		gpiod_set_value_cansleep(er->reset_gpiod, 0);
+	}
 	return 0;
 }
 
