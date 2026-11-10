@@ -1059,6 +1059,11 @@ static int adc5_get_fw_channel_data(struct adc5_chip *adc,
 			adc->data->adc_chans[prop->channel].prescale_index;
 	}
 
+	prop->scale_fn_type = -EINVAL;
+	ret = fwnode_property_read_u32(fwnode, "qcom,scale-fn-type", &value);
+	if (!ret && value < SCALE_HW_CALIB_INVALID)
+		prop->scale_fn_type = value;
+
 	ret = fwnode_property_read_u32(fwnode, "qcom,hw-settle-time", &value);
 	if (!ret) {
 		u8 dig_version[2];
@@ -1258,8 +1263,9 @@ static int adc5_get_fw_data(struct adc5_chip *adc)
 			return ret;
 		}
 
-		prop.scale_fn_type =
-			adc->data->adc_chans[prop.channel].scale_fn_type;
+		if (prop.scale_fn_type == -EINVAL)
+			prop.scale_fn_type =
+				adc->data->adc_chans[prop.channel].scale_fn_type;
 		*chan_props = prop;
 		adc_chan = &adc->data->adc_chans[prop.channel];
 
