@@ -1907,6 +1907,7 @@ static int qti_flash_led_remove(struct platform_device *pdev)
 
 static const struct of_device_id qti_flash_led_match_table[] = {
 	{ .compatible = "qcom,qti-pm8350c-flash-led", .data = (void *)4, },
+	{ .compatible = "qcom,pm8350c-flash-led", .data = (void *)4, },
 	{ },
 };
 
